@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.8.1"
+#define SPEH_VERSION "0.8.2"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -734,12 +734,20 @@ static NSString *SPEHOpenInAppJS(void)
 			 "if(nm==='apple-itunes-app'||nm==='smartbanner'){try{n.parentNode.removeChild(n);r.m++;}catch(q){}}}}});"
 			 "mo.observe(document.documentElement||document,{childList:true,subtree:true});}catch(o){}"
 			 // ① 拦 itms / itunes scheme 的点击（网页跳 App Store 最常见的一条）
-			 "var bad=function(h){return /^(itms|itunes)/i.test(String(h||''));};"
+			 // 「要唤起 App」判定：itms* 直接算；其余非 http/https/tel/mailto/sms 的自定义 scheme 也算
+			 // （Bing 那种「继续搜索 / 打开 App」卡片就是网页 JS 导航到 ms-bing:// 这类 scheme 触发的）
+			 "var bad=function(h){h=String(h||'');if(!h)return false;if(/^(itms|itunes)/i.test(h))return true;"
+			 "var m=/^([a-z][a-z0-9+.\\-]*):/i.exec(h);if(!m)return false;"
+			 "var sc=m[1].toLowerCase();"
+			 "if(sc==='http'||sc==='https'||sc==='tel'||sc==='mailto'||sc==='sms')return false;return true;};"
 			 "document.addEventListener('click',function(e){try{var t=e.target;"
 			 "while(t&&t.tagName!=='A'){t=t.parentNode;}if(!t)return;"
 			 "if(bad(t.getAttribute&&t.getAttribute('href'))){e.preventDefault();e.stopPropagation();r.i++;}}catch(x){}},true);"
 			 // ② 拦 window.open
 			 "try{var _o=window.open;window.open=function(u){if(bad(u)){r.i++;return null;}return _o.apply(window,arguments);};}catch(x2){}"
+			 // location.assign / replace 也包一层；location.href 直接赋值拦不住，交给原生导航决策兜底
+			 "try{var _as=location.assign;location.assign=function(u){if(bad(u)){r.i++;return;}return _as.call(location,u);};}catch(x3){}"
+			 "try{var _rp=location.replace;location.replace=function(u){if(bad(u)){r.i++;return;}return _rp.call(location,u);};}catch(x4){}"
 			 "var kws=['App 内打开','App内打开','在App内打开','在 App 内打开','打开App','打开 App'];"
 			 "var els=document.querySelectorAll('body *');"
 			 "for(var j=0;j<els.length;j++){var el=els[j];if(!el.parentNode)continue;"
@@ -1275,6 +1283,126 @@ static void SPEHInstallAppLinkHooks(void)
 			hit.count ? [hit componentsJoinedByString:@" | "] : @"(未命中任何方法)");
 }
 
+// MARK: - 网页唤起 App 拦截（自定义 scheme）
+//
+// 老板实测订正：Bing 那个「继续搜索 / 微软必应 APP 打开 / 浏览器 继续」的底部卡片
+// 不是 Safari 主动弹的，是必应网页自己的 JS 去导航到 ms-bing:// 这类自定义 scheme，
+// Safari 收到「未知 scheme 想唤起 App」才弹这张卡。
+// 所以除了 AppLink 那层，还得堵住「网页 -> 自定义 scheme」这条路：
+//   ① WebKit 导航决策里，凡是非白名单 scheme 一律 Cancel（网页根本发不出去）；
+//   ② JS 侧兜底：window.open / location.assign / location.replace / a[href] 点击 也拦一道。
+// 白名单只放行正常浏览与系统安全 scheme，其余（itms*、ms-bing、alipays、weixin …）全拦。
+
+static IMP gOrigSchemePolicy4 = NULL;
+static IMP gOrigSchemePolicy3 = NULL;
+static int gSchemeLogCount = 0;
+static int gSchemeHooked = 0;
+
+static BOOL SPEHSchemeBlockEnabled(void) { return SPEHBoolPref(@"blockCustomScheme", YES); }
+
+static BOOL SPEHShouldBlockSchemeURL(NSURL *url)
+{
+	if (!url) return NO;
+	NSString *scheme = url.scheme.lowercaseString;
+	if (!scheme.length) return NO;
+
+	static NSSet *allow = nil;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		allow = [NSSet setWithArray:@[ @"http", @"https", @"about", @"data", @"blob",
+										@"file", @"javascript", @"tel", @"mailto", @"sms", @"facetime" ]];
+	});
+	return ![allow containsObject:scheme];
+}
+
+static NSURL *SPEHNavActionURL(id action)
+{
+	if (!action) return nil;
+	NSURL *u = nil;
+	@try {
+		id req = [action valueForKey:@"request"];
+		if (req) u = [req valueForKey:@"URL"];
+		if (!u) u = [action valueForKey:@"URL"];
+	} @catch (NSException *e) { }
+	return [u isKindOfClass:[NSURL class]] ? u : nil;
+}
+
+static void SPEHSchemePolicy4Hook(id self, SEL _cmd, id webView, id action, id prefs, id handler)
+{
+	if (SPEHSchemeBlockEnabled()) {
+		NSURL *u = SPEHNavActionURL(action);
+		if (SPEHShouldBlockSchemeURL(u)) {
+			if (SPEHProbeEnabled() && gSchemeLogCount < 30) {
+				gSchemeLogCount++;
+				SPEHLog(@"[scheme] 拦下网页唤起 App：%@", u.absoluteString);
+			}
+			if (handler) { void (^h)(NSInteger) = handler; @try { h(1); } @catch (NSException *e) { } }  // Cancel
+			return;
+		}
+	}
+	if (gOrigSchemePolicy4) ((void (*)(id, SEL, id, id, id, id))gOrigSchemePolicy4)(self, _cmd, webView, action, prefs, handler);
+}
+
+static void SPEHSchemePolicy3Hook(id self, SEL _cmd, id webView, id action, id handler)
+{
+	if (SPEHSchemeBlockEnabled()) {
+		NSURL *u = SPEHNavActionURL(action);
+		if (SPEHShouldBlockSchemeURL(u)) {
+			if (SPEHProbeEnabled() && gSchemeLogCount < 30) {
+				gSchemeLogCount++;
+				SPEHLog(@"[scheme] 拦下网页唤起 App：%@", u.absoluteString);
+			}
+			if (handler) { void (^h)(NSInteger) = handler; @try { h(1); } @catch (NSException *e) { } }
+			return;
+		}
+	}
+	if (gOrigSchemePolicy3) ((void (*)(id, SEL, id, id, id))gOrigSchemePolicy3)(self, _cmd, webView, action, handler);
+}
+
+static void SPEHInstallSchemeBlockHooks(void)
+{
+	if (!SPEHSchemeBlockEnabled()) { SPEHLog(@"[scheme] disabled by prefs"); return; }
+
+	// 0.6.0 教训：同一个 selector 在父类/子类各 hook 一次，orig 会被后一次覆盖，
+	// 转发到错误的 IMP 直接爆栈。所以只 hook「自己声明了这个方法」的那个类，每个 selector 只一次。
+	NSArray *classes = @[ @"TabDocument", @"_SFTabDocument", @"BrowserController", @"_SFWebView", @"SFWebView" ];
+	NSArray *sels = @[ @"_webView:decidePolicyForNavigationAction:preferences:decisionHandler:",
+					   @"webView:decidePolicyForNavigationAction:preferences:decisionHandler:",
+					   @"_webView:decidePolicyForNavigationAction:decisionHandler:",
+					   @"webView:decidePolicyForNavigationAction:decisionHandler:" ];
+	NSMutableArray *hit = [NSMutableArray array];
+
+	for (NSString *sn in sels) {
+		SEL sel = NSSelectorFromString(sn);
+		Class owner = Nil;
+		for (NSString *cn in classes) {
+			Class c = NSClassFromString(cn);
+			if (!c) continue;
+			unsigned int n = 0;
+			Method *ms = class_copyMethodList(c, &n);
+			BOOL declared = NO;
+			for (unsigned int i = 0; i < n; i++) {
+				if (method_getName(ms[i]) == sel) { declared = YES; break; }
+			}
+			free(ms);
+			if (declared) { owner = c; break; }
+		}
+		if (!owner) { continue; }
+
+		BOOL is4 = ([sn rangeOfString:@"preferences"].location != NSNotFound);
+		if (is4) {
+			MSHookMessageEx(owner, sel, (IMP)SPEHSchemePolicy4Hook, &gOrigSchemePolicy4);
+		} else {
+			MSHookMessageEx(owner, sel, (IMP)SPEHSchemePolicy3Hook, &gOrigSchemePolicy3);
+		}
+		gSchemeHooked++;
+		[hit addObject:[NSString stringWithFormat:@"%@ -%@", NSStringFromClass(owner), sn]];
+	}
+
+	SPEHLog(@"[scheme] hook 导航决策 %d 条: %@（非白名单 scheme 一律 Cancel）", gSchemeHooked,
+			hit.count ? [hit componentsJoinedByString:@" | "] : @"(未命中)");
+}
+
 // MARK: - 返回后滚动恢复
 //
 // 老板实测：返回上一页后，页面前几次上/下滑完全不响应，加载完也要滑几下才生效。
@@ -1613,6 +1741,7 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 		SPEHInstallOpenInAppHooks();
 		SPEHInstallBackScrollHooks();
 		SPEHInstallAppLinkHooks();
+		SPEHInstallSchemeBlockHooks();
 		SPEHInstallURLBarSwipeHooks();
 		SPEHScheduleSearchEngineHookInstall();
 	}

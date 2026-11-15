@@ -74,6 +74,8 @@ jobs:
             'killAppLinkPrompt' \
             'appLinkWithURL' \
             'appBanner' \
+            'blockCustomScheme' \
+            'decidePolicyForNavigationAction' \
             'killURLBarSwipe' \
             'WKProcessPool' \
             'Documents' ; do

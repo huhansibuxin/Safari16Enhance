@@ -81,11 +81,18 @@
 		{
 			cell = PSGroupCell;
 			label = "在 App 中打开";
-			footerText = "用 Bing 搜索时底部会弹「继续搜索 / 微软必应 APP 打开 / 浏览器 继续」，这是 iOS 的 App Link 提示（Safari 发现页面能被某个 App 接住就弹）。开启后让 Safari 认为没有可打开的 App，只会在 Safari 里继续，不再弹这个卡片。";
+			footerText = "Bing 搜索时底部弹的「继续搜索 / 微软必应 APP 打开 / 浏览器 继续」是网页自己的 JS 去唤起自定义 scheme（如 ms-bing://），Safari 收到未知 scheme 才弹这张卡。开启后：网页发起的非 http/https/tel/mailto/sms scheme 一律在导航决策处 Cancel，同时让 Safari 拿不到 AppLink，「打开」这个选项不会再出现。";
 		},
 		{
 			cell = PSSwitchCell;
-			label = "不弹「打开 App / 继续」提示";
+			label = "拦截网页唤起 App（自定义 scheme）";
+			defaults = "com.huhansibuxin.safari16enhance";
+			key = "blockCustomScheme";
+			default = YES;
+		},
+		{
+			cell = PSSwitchCell;
+			label = "不弹「打开 App / 继续」卡片";
 			defaults = "com.huhansibuxin.safari16enhance";
 			key = "killAppLinkPrompt";
 			default = YES;
@@ -148,7 +155,8 @@
 		{
 			cell = PSGroupCell;
 			label = "功能说明";
-			footerText = "1. 搜索引擎：把内置 Ecosia 的搜索地址换成元宝（https://so.qq.com/isearch?query=…）。设置里选 Ecosia＝元宝，选别的引擎照常，可自由切换。\n2. 弹窗拦截：只保留精准命中，Safari 自绘的 SFDialogView 按文本拆除，网页自己的 JS 对话框不受影响。\n3. 推广横幅：JS 清网页自绘「App 内打开」浮层 + 用 MutationObserver 见到 apple-itunes-app meta 就删 + 吞掉 TabDocument / BrowserController 的 App Banner 链路。\n4. 阅读器：白名单精准命中已实测确认的可用性判定，压成 NO。\n5. 返回：后退窗口内吞掉多余 reload + JS 复位页面滚动锁。\n6. 在 App 中打开：让 Safari 拿不到 WBSAppLink（返回 nil），「微软必应 APP 打开 / 浏览器 继续」这类卡片不再出现。\n7. 地址栏手势：禁用底部地址栏上的左右滑动切页，防误触。\n\n日志：容器 Documents/Safari16Enhance.log（超 2MB 轮转为 .1）。";
+			footerText = "1. 搜索引擎：把内置 Ecosia 的搜索地址换成元宝（https://so.qq.com/isearch?query=…）。设置里选 Ecosia＝元宝，选别的引擎照常，可自由切换。\n2. 弹窗拦截：只保留精准命中，Safari 自绘的 SFDialogView 按文本拆除，网页自己的 JS 对话框不受影响。\n3. 推广横幅：JS 清网页自绘「App 内打开」浮层 + 用 MutationObserver 见到 apple-itunes-app meta 就删 + 吞掉 TabDocument / BrowserController 的 App Banner 链路。\n4. 阅读器：白名单精准命中已实测确认的可用性判定，压成 NO。\n5. 返回：后退窗口内吞掉多余 reload + JS 复位页面滚动锁。\n6. 在 App 中打开：网页 JS 唤起自定义 scheme（ms-bing:// 等）在 WebKit 导航决策处一律 Cancel，同时让 Safari 拿不到 WBSAppLink，「微软必应 APP 打开 / 浏览器 继续」这类卡片不再出现。
+   （本插件不修改 WKWebView 的 configuration / processPool，避免影响第三方扩展的脚本注入。）\n7. 地址栏手势：禁用底部地址栏上的左右滑动切页，防误触。\n\n日志：容器 Documents/Safari16Enhance.log（超 2MB 轮转为 .1）。";
 		}
 	);
 }
