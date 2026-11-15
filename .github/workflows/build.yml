@@ -67,7 +67,6 @@ jobs:
             '_populateSearchEngines' \
             'defaultSearchEngineIfPopulated' \
             'SFDialogView' \
-            'smartbanner' \
             'killOpenInApp' \
             'fixBackScroll' \
             'blockAppStore' \
