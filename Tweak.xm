@@ -24,8 +24,9 @@
 #import <objc/message.h>
 #import <substrate.h>
 #import <unistd.h>
+#import <math.h>
 
-#define SPEH_VERSION "0.6.1"
+#define SPEH_VERSION "0.6.2"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -659,10 +660,52 @@ static void SPEHInstallSmartAppBannerProbe(void)
 	SPEHLog(@"[smartbanner] 原生 hook 已移除（0.6.0 曾因父子类重复 hook 自递归崩溃）");
 }
 
+// 0.6.1 探针拿到的真名（TabDocument）：
+//   setAppBanner: / didFindAppBannerWithContent: / appBanner / setStoreBannersAreDisabled:
+//   BrowserController: removeAppBannerFromTabDocument:animated: / setAppBannerPinnedToTop:forTabDocument:
+// 精准做法：banner 一到 TabDocument 就吞掉，从源头不让它存在 —— 单类单选方法 hook，
+// 不涉及父子类通扫，不会有 0.6.0 那类自递归风险。
+
+static IMP gOrigSetAppBanner = NULL;
+static IMP gOrigSetStoreBannersDisabled = NULL;
+
+static void SPEHSetAppBannerHook(id self, SEL _cmd, id banner)
+{
+	if (banner && SPEHProbeEnabled()) {
+		SPEHLog(@"[smartbanner] 拦截 setAppBanner: 丢弃 %@", NSStringFromClass(object_getClass(banner)));
+	}
+	// 不转发：banner 永远进不了 TabDocument
+}
+
+static void SPEHSetStoreBannersDisabledHook(id self, SEL _cmd, BOOL value)
+{
+	// 无论 Safari 传什么，一律 YES（全局禁用商店横幅）
+	if (gOrigSetStoreBannersDisabled) {
+		((void (*)(id, SEL, BOOL))gOrigSetStoreBannersDisabled)(self, _cmd, YES);
+	}
+}
+
+static void SPEHInstallSmartAppBannerPreciseHooks(void)
+{
+	Class tabCls = NSClassFromString(@"TabDocument");
+	if (!tabCls) { SPEHLog(@"[smartbanner] TabDocument 未加载"); return; }
+
+	SPEHPatchInstanceMethod(tabCls, NSSelectorFromString(@"setAppBanner:"),
+		(IMP)SPEHSetAppBannerHook, &gOrigSetAppBanner);
+	SPEHPatchInstanceMethod(tabCls, NSSelectorFromString(@"setStoreBannersAreDisabled:"),
+		(IMP)SPEHSetStoreBannersDisabledHook, &gOrigSetStoreBannersDisabled);
+
+	SPEHLog(@"[smartbanner] 精准 hook setAppBanner=%s setStoreBannersAreDisabled=%s",
+			gOrigSetAppBanner ? "ok" : "missing",
+			gOrigSetStoreBannersDisabled ? "ok" : "missing");
+}
+
 static IMP gOrigWVDidMoveToWindow = NULL;
 
 // 定义在后文的返回缓存模块里，这里先声明
 static void SPEHApplyProcessPoolCache(id webView);
+// 定义在地址栏手势模块里
+static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag);
 
 static void SPEHWVDidMoveToWindowHook(UIView *self, SEL _cmd)
 {
@@ -678,6 +721,10 @@ static void SPEHWVDidMoveToWindowHook(UIView *self, SEL _cmd)
 	if (first) {
 		// 原生接口 / 探针只在每个 webView 首次挂载时跑一次，不参与日常滚动
 		SPEHApplyProcessPoolCache(self);
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+			dispatch_get_main_queue(), ^{
+				SPEHNeutralizeURLBarSwipe(weakSelf, @"首次挂载");
+			});
 		if (SPEHProbeEnabled()) {
 			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
 				dispatch_get_main_queue(), ^{
@@ -704,7 +751,7 @@ static void SPEHInstallOpenInAppHooks(void)
 	SPEHPatchInstanceMethod(wkCls, @selector(didMoveToWindow), (IMP)SPEHWVDidMoveToWindowHook, &gOrigWVDidMoveToWindow);
 	SPEHLog(@"[openinapp] hook didMoveToWindow=%s", gOrigWVDidMoveToWindow ? "ok" : "FAILED");
 
-	SPEHInstallSmartAppBannerProbe();
+	SPEHInstallSmartAppBannerPreciseHooks();
 }
 
 // MARK: - 拦截跳转 App Store
@@ -777,6 +824,35 @@ static BOOL SPEHLSWorkspaceOpenHook(id self, SEL _cmd, NSURL *url, NSDictionary 
 	return NO;
 }
 
+// 0.6.1 日志实证：两参 openURL:withOptions: hook 成功但零命中，
+// 说明 Safari 走的是三参版本（或 openSensitiveURL:）。这两条必须一起补上。
+static IMP gOrigLSOpen3 = NULL;
+static IMP gOrigLSOpenSensitive = NULL;
+
+static BOOL SPEHLSOpen3Hook(id self, SEL _cmd, NSURL *url, NSDictionary *options, NSError **error)
+{
+	if (SPEHAppStoreKillEnabled() && SPEHURLTargetsAppStore(url)) {
+		SPEHLog(@"[appstore] 拦截 LaunchServices(3参) %@", url.absoluteString);
+		return NO;
+	}
+	if (gOrigLSOpen3) {
+		return ((BOOL (*)(id, SEL, NSURL *, NSDictionary *, NSError **))gOrigLSOpen3)(self, _cmd, url, options, error);
+	}
+	return NO;
+}
+
+static BOOL SPEHLSOpenSensitiveHook(id self, SEL _cmd, NSURL *url, NSDictionary *options)
+{
+	if (SPEHAppStoreKillEnabled() && SPEHURLTargetsAppStore(url)) {
+		SPEHLog(@"[appstore] 拦截 LaunchServices(sensitive) %@", url.absoluteString);
+		return NO;
+	}
+	if (gOrigLSOpenSensitive) {
+		return ((BOOL (*)(id, SEL, NSURL *, NSDictionary *))gOrigLSOpenSensitive)(self, _cmd, url, options);
+	}
+	return NO;
+}
+
 static void SPEHInstallAppStoreHooks(void)
 {
 	if (!SPEHAppStoreKillEnabled()) { SPEHLog(@"[appstore] disabled by prefs"); return; }
@@ -792,12 +868,18 @@ static void SPEHInstallAppStoreHooks(void)
 	if (lsCls) {
 		SPEHPatchInstanceMethod(lsCls, NSSelectorFromString(@"openURL:withOptions:"),
 			(IMP)SPEHLSWorkspaceOpenHook, &gOrigLSWorkspaceOpen);
+		SPEHPatchInstanceMethod(lsCls, NSSelectorFromString(@"openURL:withOptions:error:"),
+			(IMP)SPEHLSOpen3Hook, &gOrigLSOpen3);
+		SPEHPatchInstanceMethod(lsCls, NSSelectorFromString(@"openSensitiveURL:withOptions:"),
+			(IMP)SPEHLSOpenSensitiveHook, &gOrigLSOpenSensitive);
 	}
 
-	SPEHLog(@"[appstore] hooks optionsHandler=%s legacyOpenURL=%s launchservices=%s",
+	SPEHLog(@"[appstore] hooks optionsHandler=%s legacyOpenURL=%s ls2=%s ls3=%s lssensitive=%s",
 			gOrigOpenURLOptions ? "ok" : "FAILED",
 			gOrigOpenURL ? "ok" : "FAILED",
-			gOrigLSWorkspaceOpen ? "ok" : "missing");
+			gOrigLSWorkspaceOpen ? "ok" : "missing",
+			gOrigLSOpen3 ? "ok" : "missing",
+			gOrigLSOpenSensitive ? "ok" : "missing");
 }
 
 // MARK: - 返回缓存：WKProcessPool 原生接口探针
@@ -834,9 +916,10 @@ static int SPEHTryProcessPoolCacheSetters(id pool)
 {
 	if (!pool) return 0;
 	NSArray *names = @[
-		@"_setBackForwardCacheEnabled:", @"_setUsesBackForwardCache:",
-		@"_setPageCacheEnabled:", @"_setUsesPageCache:",
-		@"_setBackForwardCacheCapacity:", @"_setPageCacheCapacity:", @"_setBackForwardCapacity:"
+		// 0.6.1 日志实证：_WKProcessPoolConfiguration 上确实存在 setPageCacheEnabled:
+		@"setPageCacheEnabled:", @"_setPageCacheEnabled:",
+		@"_setProcessCacheCapacity:", @"_setBackForwardCacheEnabled:", @"_setUsesBackForwardCache:",
+		@"_setUsesPageCache:", @"_setBackForwardCacheCapacity:", @"_setPageCacheCapacity:"
 	];
 	int applied = 0;
 	for (NSString *nm in names) {
@@ -867,8 +950,14 @@ static void SPEHApplyProcessPoolCache(id webView)
 		objc_setAssociatedObject(pool, &kDone, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
 		int n = SPEHTryProcessPoolCacheSetters(pool);
+
+		// 真正有 setPageCacheEnabled: 的是 _WKProcessPoolConfiguration，一并试
+		id cfgObj = nil;
+		@try { cfgObj = [pool valueForKey:@"_configuration"]; } @catch (NSException *e) { }
+		if (cfgObj) n += SPEHTryProcessPoolCacheSetters(cfgObj);
+
 		SPEHDumpProcessPoolCacheSpis();
-		SPEHLog(@"[bfcache] processPool 原生接口命中 %d 条（0=确认不存在）", n);
+		SPEHLog(@"[bfcache] processPool/config 原生接口命中 %d 条（0=确认不存在）", n);
 	} @catch (NSException *e) { }
 }
 
@@ -896,30 +985,6 @@ static BOOL SPEHInBackWindow(id webView)
 	return [NSDate timeIntervalSinceReferenceDate] <= gSuppressUntil;
 }
 
-static NSString *SPEHBackTouchJS(void)
-{
-	static NSString *js = nil;
-	static dispatch_once_t once;
-	dispatch_once(&once, ^{
-		js = @"(function(){try{var d=document,de=d.documentElement,b=d.body,n=0,u=0;"
-			 "function fix(e){if(!e)return;var cs=getComputedStyle(e);"
-			 "if(cs.overflow==='hidden'){e.style.overflow='';n++;}"
-			 "if(cs.touchAction==='none'){e.style.touchAction='';n++;}"
-			 "if(cs.webkitOverflowScrolling==='auto'){}"
-			 "}"
-			 "fix(de);fix(b);"
-			 "var kids=d.querySelectorAll('body > div, body > section');"
-			 "for(var i=0;i<kids.length&&i<80;i++){var e=kids[i];var cs=getComputedStyle(e);"
-			 "if(cs.position!=='fixed')continue;"
-			 "var h=parseFloat(cs.height)||0,w=parseFloat(cs.width)||0;"
-			 "if(h>=window.innerHeight*0.9&&w>=window.innerWidth*0.9&&parseFloat(cs.opacity)<0.2)"
-			 "{e.style.display='none';u++;}}"
-			 "try{window.scrollBy(0,1);window.scrollBy(0,-1);}catch(e2){}"
-			 "return 'unlock='+n+' covered='+u;}catch(err){return 'ERR';}})()";
-	});
-	return js;
-}
-
 static void SPEHResetScroll(id webView, NSString *tag)
 {
 	if (!webView || !SPEHBackScrollFixEnabled()) return;
@@ -942,20 +1007,6 @@ static void SPEHResetScroll(id webView, NSString *tag)
 	} @catch (NSException *e) { }
 }
 
-static void SPEHApplyBackTouchJS(id webView, NSString *tag)
-{
-	if (!webView || !SPEHBackScrollFixEnabled()) return;
-	@try {
-		[(id<SPEHWebViewJS>)webView evaluateJavaScript:SPEHBackTouchJS()
-			completionHandler:^(id result, NSError *error) {
-				if (error) return;
-				NSString *r = [result isKindOfClass:[NSString class]] ? (NSString *)result : nil;
-				if (!r || [r isEqualToString:@"unlock=0 covered=0"]) return;
-				SPEHLog(@"[backscroll] %@ 页面滚动锁复位 %@", tag, r);
-			}];
-	} @catch (NSException *e) { }
-}
-
 static void SPEHWKGoBackHook(id self, SEL _cmd)
 {
 	if (gOrigWKGoBack) ((void (*)(id, SEL))gOrigWKGoBack)(self, _cmd);
@@ -967,18 +1018,12 @@ static void SPEHWKGoBackHook(id self, SEL _cmd)
 
 	__weak id weakSelf = self;
 	NSArray *delays = @[ @0.30, @0.90, @1.80 ];
-	NSArray *jsDelays = @[ @0.35, @1.10 ];
 	for (NSNumber *d in delays) {
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 			SPEHResetScroll(weakSelf, [NSString stringWithFormat:@"goBack+%@s", d]);
 		});
 	}
-	for (NSNumber *d in jsDelays) {
-		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-			SPEHApplyBackTouchJS(weakSelf, [NSString stringWithFormat:@"goBack+%@s", d]);
-		});
-	}
-	if (SPEHProbeEnabled()) SPEHLog(@"[backnav] goBack 打开 2.5s 后退窗口（吞 reload + 复位滚动锁）");
+	if (SPEHProbeEnabled()) SPEHLog(@"[backnav] goBack 打开 2.5s 后退窗口（吞 reload）");
 }
 
 static void SPEHWKGoForwardHook(id self, SEL _cmd)
@@ -1081,6 +1126,20 @@ static BOOL SPEHHostLooksLikeURLBar(NSString *cls)
 
 static IMP gOrigAddGesture = NULL;
 
+// 胶囊栏 pan 标记 + 横向分量清零（保留纵向）
+static char kCapsulePanTag = 0;
+static IMP gOrigPanSetTranslation = NULL;
+
+static void SPEHPanSetTranslationHook(UIPanGestureRecognizer *self, SEL _cmd, CGPoint t, UIView *view)
+{
+	if (SPEHURLBarSwipeKillEnabled() && objc_getAssociatedObject(self, &kCapsulePanTag)) {
+		if (fabs(t.x) > fabs(t.y)) t.x = 0.0;
+	}
+	if (gOrigPanSetTranslation) {
+		((void (*)(id, SEL, CGPoint, UIView *))gOrigPanSetTranslation)(self, _cmd, t, view);
+	}
+}
+
 static void SPEHEnhanceAddGestureHook(UIView *self, SEL _cmd, UIGestureRecognizer *gr)
 {
 	// 先按手势类型快速过滤（绝大多数调用在这里就返回，开销可忽略），
@@ -1128,7 +1187,67 @@ static void SPEHInstallURLBarSwipeHooks(void)
 
 	SPEHPatchInstanceMethod([UIView class], NSSelectorFromString(@"addGestureRecognizer:"),
 		(IMP)SPEHEnhanceAddGestureHook, &gOrigAddGesture);
-	SPEHLog(@"[urlswipe] hook addGestureRecognizer=%s", gOrigAddGesture ? "ok" : "FAILED");
+
+	// 0.6.1 日志实证：底部地址栏的真实结构是 SFCapsuleNavigationBar / SFCapsuleCollectionView，
+	// 横滑切页不是 UISwipeGestureRecognizer，而是这个胶囊横向滚动视图的 pan。
+	// 所以按类名含 URL/Bar 去拦手势永远拦不到 —— 必须直接对胶囊视图动手。
+	SPEHPatchInstanceMethod([UIPanGestureRecognizer class], NSSelectorFromString(@"setTranslation:inView:"),
+		(IMP)SPEHPanSetTranslationHook, &gOrigPanSetTranslation);
+
+	SPEHLog(@"[urlswipe] hook addGestureRecognizer=%s panSetTranslation=%s",
+			gOrigAddGesture ? "ok" : "FAILED", gOrigPanSetTranslation ? "ok" : "FAILED");
+}
+
+// 找到胶囊栏，把它所有 pan 打上标记；之后 setTranslation 里只吃掉横向分量，
+// 纵向（上拉展开标签页网格）不受影响。
+
+static int SPEHTagCapsulePans(UIView *v, int depth, int found)
+{
+	if (!v || depth > 6) return found;
+
+	NSString *cls = NSStringFromClass(object_getClass(v));
+	BOOL hit = ([cls rangeOfString:@"SFCapsule"].location != NSNotFound ||
+				[cls rangeOfString:@"SFUnifiedBar"].location != NSNotFound);
+	if (hit) {
+		found++;
+		if (SPEHBoolPref(@"urlBarSwipeHardMode", NO) && [v respondsToSelector:@selector(setScrollEnabled:)]) {
+			@try { [(id)v setScrollEnabled:NO]; } @catch (NSException *e) { }
+		}
+		@try {
+			if ([v respondsToSelector:@selector(panGestureRecognizer)]) {
+				id pan = [(id)v panGestureRecognizer];
+				if (pan) objc_setAssociatedObject(pan, &kCapsulePanTag, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+			}
+			if ([v respondsToSelector:@selector(gestureRecognizers)]) {
+				for (UIGestureRecognizer *g in [(id)v gestureRecognizers]) {
+					if ([g isKindOfClass:[UIPanGestureRecognizer class]]) {
+						objc_setAssociatedObject(g, &kCapsulePanTag, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+					}
+				}
+			}
+		} @catch (NSException *e) { }
+	}
+
+	for (UIView *s in [v subviews]) found = SPEHTagCapsulePans(s, depth + 1, found);
+	return found;
+}
+
+static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
+{
+	if (!anchor || !SPEHURLBarSwipeKillEnabled()) return;
+	UIView *root = anchor.window ?: anchor;
+	@try {
+		int n = SPEHTagCapsulePans(root, 0, 0);
+		static NSMutableSet *seen = nil;
+		static dispatch_once_t once;
+		dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
+		NSString *key = [NSString stringWithFormat:@"%@|%d", tag, n];
+		if (SPEHProbeEnabled() && ![seen containsObject:key]) {
+			[seen addObject:key];
+			SPEHLog(@"[urlswipe] %@ 标记胶囊 pan %d 个（hardMode=%d）", tag, n,
+					SPEHBoolPref(@"urlBarSwipeHardMode", NO));
+		}
+	} @catch (NSException *e) { }
 }
 
 // MARK: - 入口

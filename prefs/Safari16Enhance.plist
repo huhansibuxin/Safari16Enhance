@@ -85,7 +85,7 @@
 		{
 			cell = PSGroupCell;
 			label = "地址栏手势";
-			footerText = "底部输入网址/搜索的地址栏上左右滑动会切到上一页/下一页，很容易误触。开启后地址栏的左右滑动被彻底禁用，网页本身的滚动与左右滑动不受影响。";
+			footerText = "底部地址栏的真实结构是胶囊标签栏（SFCapsuleNavigationBar / SFCapsuleCollectionView），横滑切页靠它的横向滚动实现。默认模式只吃掉横向分量，纵向手势与其他交互保留。若仍会切页，再打开「硬模式」。";
 		},
 		{
 			cell = PSSwitchCell;
@@ -93,6 +93,13 @@
 			defaults = "com.huhansibuxin.safari16enhance";
 			key = "killURLBarSwipe";
 			default = YES;
+		},
+		{
+			cell = PSSwitchCell;
+			label = "硬模式（彻底禁用胶囊滚动）";
+			defaults = "com.huhansibuxin.safari16enhance";
+			key = "urlBarSwipeHardMode";
+			default = NO;
 		},
 		{
 			cell = PSGroupCell;
