@@ -1,0 +1,79 @@
+{
+	title = "Safari 16 增强";
+	items = (
+		{
+			cell = PSGroupCell;
+			label = "总开关";
+			footerText = "基于独立实现（非 SafariPlus / 非 SafariX）。仅在 MobileSafari 进程内生效，不注入其它 App。";
+		},
+		{
+			cell = PSSwitchCell;
+			label = "启用插件";
+			defaults = "com.huhansibuxin.safari16enhance";
+			key = "enabled";
+			default = YES;
+		},
+		{
+			cell = PSGroupCell;
+			label = "自定义搜索引擎";
+			footerText = "开启后 Safari 地址栏搜索改用下方引擎。搜索 URL 必须包含 {searchTerms}。改动后请结束 Safari 进程（上滑杀掉）再打开。";
+		},
+		{
+			cell = PSSwitchCell;
+			label = "启用自定义搜索引擎";
+			defaults = "com.huhansibuxin.safari16enhance";
+			key = "customEngineEnabled";
+			default = YES;
+		},
+		{
+			cell = PSTextFieldCell;
+			label = "引擎名称";
+			defaults = "com.huhansibuxin.safari16enhance";
+			key = "customEngineName";
+			default = "元宝搜索";
+			placeholder = "元宝搜索";
+		},
+		{
+			cell = PSTextFieldCell;
+			label = "搜索 URL";
+			defaults = "com.huhansibuxin.safari16enhance";
+			key = "customEngineURL";
+			default = "https://so.qq.com/isearch?query={searchTerms}";
+			placeholder = "https://so.qq.com/isearch?query={searchTerms}";
+		},
+		{
+			cell = PSGroupCell;
+			label = "常用模板（直接复制）";
+			footerText = "元宝　https://so.qq.com/isearch?query={searchTerms}\n百度　https://www.baidu.com/s?wd={searchTerms}\nGoogle　https://www.google.com/search?q={searchTerms}\nBing　https://www.bing.com/search?q={searchTerms}";
+		},
+		{
+			cell = PSGroupCell;
+			label = "错误弹窗";
+			footerText = "Safari 打不开网页时会强制弹「打不开该网页」对话框，必须点「好」才继续。开启后拦截该弹窗，改为底部 toast 轻提示（约 2 秒自动消失，不阻断操作）。";
+		},
+		{
+			cell = PSSwitchCell;
+			label = "拦截「打不开该网页」弹窗";
+			defaults = "com.huhansibuxin.safari16enhance";
+			key = "suppressErrorAlert";
+			default = YES;
+		},
+		{
+			cell = PSGroupCell;
+			label = "诊断探针";
+			footerText = "日志固定写入 Safari 自身容器：\n<容器>/Documents/Safari16Enhance.log\n启动时会打印实际路径。功能确认正常后可关闭以省资源。";
+		},
+		{
+			cell = PSSwitchCell;
+			label = "启用运行时探针";
+			defaults = "com.huhansibuxin.safari16enhance";
+			key = "probeEnabled";
+			default = YES;
+		},
+		{
+			cell = PSGroupCell;
+			label = "功能说明";
+			footerText = "1. 自定义搜索引擎：注入自建 SearchEngineInfo 并强制作为 Safari 默认引擎（默认元宝搜索 so.qq.com，免登录可用）。\n2. 弹窗拦截：hook presentViewController，命中「打不开该网页」类文案即拦截，改为 toast，不再阻断。\n3. 运行时探针：dump 搜索引擎相关类/方法、记录每次弹窗的文案与发起类，用于 iOS 版本适配。\n\n日志位置：Safari 容器 Documents/Safari16Enhance.log（超 2MB 自动轮转为 .1）。";
+		}
+	);
+}
