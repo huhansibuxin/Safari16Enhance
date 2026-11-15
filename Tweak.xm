@@ -579,6 +579,14 @@ static void SPEHApplyOpenInAppJS(id webView)
 	} @catch (NSException *e) { }
 }
 
+@protocol SPEHUserScript <NSObject>
+- (id)initWithSource:(NSString *)src injectionTime:(NSInteger)time forMainFrameOnly:(BOOL)mainOnly;
+@end
+
+@protocol SPEHUserContentController <NSObject>
+- (void)addUserScript:(id)script;
+@end
+
 // 文档开始阶段就执行同一段 JS：Safari 是「解析 HTML 时」读 apple-itunes-app 的，
 // 0.8s 后才跑等于晚了一步（GitHub 横幅就是这么漏的）。文档开始注入才拦得住。
 static void SPEHAddDocumentStartScript(id webView)
@@ -595,11 +603,11 @@ static void SPEHAddDocumentStartScript(id webView)
 		id ucc = [cfg valueForKey:@"userContentController"];
 		if (!ucc) return;
 
-		id script = [[usCls alloc] initWithSource:SPEHOpenInAppJS()
-									 injectionTime:0            // WKUserScriptInjectionTimeAtDocumentStart
-								  forMainFrameOnly:NO];
+		id script = [(id<SPEHUserScript>)[usCls alloc] initWithSource:SPEHOpenInAppJS()
+														  injectionTime:0            // AtDocumentStart
+													   forMainFrameOnly:NO];
 		if (!script) return;
-		[ucc addUserScript:script];
+		[(id<SPEHUserContentController>)ucc addUserScript:script];
 		SPEHLog(@"[openinapp] 已注入文档开始脚本");
 	} @catch (NSException *e) {
 		SPEHLog(@"[openinapp] 文档开始脚本注入失败 %@", e.reason);
