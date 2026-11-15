@@ -654,12 +654,6 @@ static void SPEHDumpBannerCandidates(UIView *anchor)
 // 结论：这种「按类名通扫 + 循环 hook 同一 selector」的做法本身不可靠，整体移除。
 // 顶部横幅改由「JS 删 apple-itunes-app meta」从源头断掉，原生侧只保留只读探针。
 
-static void SPEHInstallSmartAppBannerProbe(void)
-{
-	// 不做任何 hook，只记录当前策略，避免再次踩同一个坑
-	SPEHLog(@"[smartbanner] 原生 hook 已移除（0.6.0 曾因父子类重复 hook 自递归崩溃）");
-}
-
 // 0.6.1 探针拿到的真名（TabDocument）：
 //   setAppBanner: / didFindAppBannerWithContent: / appBanner / setStoreBannersAreDisabled:
 //   BrowserController: removeAppBannerFromTabDocument:animated: / setAppBannerPinnedToTop:forTabDocument:
