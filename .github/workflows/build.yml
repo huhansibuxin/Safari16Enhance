@@ -72,7 +72,7 @@ jobs:
             'killOpenInApp' \
             'fixBackScroll' \
             'killAppLinkPrompt' \
-            'appLinkWithURL' \
+            'AppLinkWithURL' \
             'appBanner' \
             'blockCustomScheme' \
             'decidePolicyForNavigationAction' \
