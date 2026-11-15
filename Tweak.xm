@@ -1,31 +1,36 @@
-// Safari16Enhance - iOS 16 Safari 双功能增强
+// Safari16Enhance 0.2.0 - iOS 16 Safari 增强
 //
-// 功能：
-//   1. 自定义搜索引擎注入（默认元宝搜索 so.qq.com），并强制作为默认引擎
-//   2. 抑制「Safari 打不开该网页」强制弹窗，降级为底部 toast 轻提示
-//   3. 运行时探针：dump 搜索引擎相关类/方法、记录所有被 present 的 Alert 与 alert 级 window
+// 0.1.0 实测事实：
+//   - 引擎注入成功：controller = _SFSearchEngineController，_populateSearchEngines 已 hook，引擎数组 10 个
+//   - 但「打不开该网页」弹窗没有走 -[UIViewController presentViewController:animated:completion:]，
+//     日志零命中，也没有 alert 级 window → 必须换探测点（UIAlertController 生命周期 + 工厂方法）
 //
-// 设计原则：
-//   - 所有 hook 前先做类/方法存在性检查，不存在则静默跳过并记日志，绝不崩溃
-//   - 探针在后台队列执行，不阻塞主线程、不常驻轮询
-//   - 日志强制写入 Safari 自身沙盒容器 Documents（注入 App 的插件只能在此处落盘），
-//     多级路径兜底 + 真实写入校验，绝不出现「装了但看不到日志」
-//   - 单个功能可通过 preference plist 独立开关
+// 0.2.0 变更：
+//   1. 弹窗：present 链路 + UIAlertController viewWillAppear/viewDidAppear + 工厂方法（带调用栈）+ 全窗口监听，
+//      命中后尽力 dismiss 并 toast
+//   2. 阅读器：运行时按类名扫描所有 *Reader* 类，把「是否可用」判定一律压成 NO，
+//      地址栏「阅读器可用」提示自然不再出现
+//   3. 返回缓存：运行时在 WKPreferences 类层次上找 *BackForward*Enabled: 这类 SPI 并打开，
+//      让「从下一页返回」走 bfcache 恢复而不是重新拉网络
+//
+// 原则：所有 hook 先检查类/方法存在性，BOOLEAN 返回类型校验，全部 @try 包裹，绝不让 Safari 崩
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <substrate.h>
+#import <unistd.h>
 
-// CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏，NSString 侧另建常量
+#define SPEH_VERSION "0.2.0"
+
+// CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
 #define SPEH_PREF_DOMAIN SPEH_PREF_DOMAIN_CSTR
 #define SPEH_LOG_NAME    @"Safari16Enhance.log"
 
 // MARK: - 日志（写入 Safari 容器 Documents）
 
-// 确保目录存在，并设置：可被 root 读取、不进 iCloud 备份、锁屏后仍可写
 static BOOL SPEHPrepareDirectory(NSString *dir)
 {
 	if (dir.length == 0) return NO;
@@ -33,47 +38,34 @@ static BOOL SPEHPrepareDirectory(NSString *dir)
 	NSFileManager *fm = [NSFileManager defaultManager];
 	BOOL isDir = NO;
 	if (![fm fileExistsAtPath:dir isDirectory:&isDir]) {
-		NSDictionary *attrs = @{
-			NSFileProtectionKey : NSFileProtectionCompleteUntilFirstUserAuthentication,
-		};
-		if (![fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:attrs error:nil]) {
-			return NO;
-		}
+		NSDictionary *attrs = @{ NSFileProtectionKey : NSFileProtectionCompleteUntilFirstUserAuthentication };
+		if (![fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:attrs error:nil]) return NO;
 	} else if (!isDir) {
 		return NO;
 	}
 
-	// 目录级：锁定后仍可写 + 不进备份
 	[fm setAttributes:@{ NSFileProtectionKey : NSFileProtectionCompleteUntilFirstUserAuthentication }
-			 ofItemAtPath:dir error:nil];
+		   ofItemAtPath:dir error:nil];
 	[[NSURL fileURLWithPath:dir] setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:nil];
 
-	// 真实写入校验：只判断目录存在不算数，必须能落一个字节
+	// 真实写入校验：只判断目录存在不算数
 	NSString *probe = [dir stringByAppendingPathComponent:@".speh_write_test"];
-	BOOL ok = [[NSData data] writeToFile:probe atomically:NO] || [[@"1" dataUsingEncoding:NSUTF8StringEncoding] writeToFile:probe atomically:NO];
+	BOOL ok = [[@"1" dataUsingEncoding:NSUTF8StringEncoding] writeToFile:probe atomically:NO];
 	if (ok) [fm removeItemAtPath:probe error:nil];
 	return ok;
 }
 
-// 解析日志目录：优先 Safari 容器 Documents，多级兜底
 static NSString *SPEHLogDirectory(void)
 {
 	static NSString *dir = nil;
 	static dispatch_once_t once;
 	dispatch_once(&once, ^{
 		NSMutableArray *candidates = [NSMutableArray array];
-
-		// ① 注入 App 后的 NSHomeDirectory() 就是 Safari 的数据容器根
 		NSString *home = NSHomeDirectory();
-		if (home.length) {
-			[candidates addObject:[home stringByAppendingPathComponent:@"Documents"]];
-		}
-		// ② 沙盒目录 API（正常情况下与①同值，防①被越狱环境改写）
+		if (home.length) [candidates addObject:[home stringByAppendingPathComponent:@"Documents"]];
 		NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
 		if (docs.count) [candidates addObject:docs.firstObject];
-		// ③ 容器内 Library/Caches
 		if (home.length) [candidates addObject:[home stringByAppendingPathComponent:@"Library/Caches"]];
-		// ④ 容器 tmp（最后兜底，保证有日志可看）
 		if (home.length) [candidates addObject:[home stringByAppendingPathComponent:@"tmp"]];
 
 		for (NSString *cand in candidates) {
@@ -120,7 +112,6 @@ static void SPEHLog(NSString *fmt, ...)
 		NSString *path = SPEHLogPath();
 		NSFileManager *fm = [NSFileManager defaultManager];
 
-		// 限流：每 200 条检查一次，超过 2MB 轮转，避免日志吃满容器（探针会写很多行）
 		writeCount++;
 		if (writeCount % 200 == 0) {
 			NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
@@ -169,13 +160,14 @@ static NSString *SPEHStringPref(NSString *key, NSString *def)
 	return r;
 }
 
-// 默认搜索引擎模板：元宝搜索
 static NSString *const SPEHDefaultEngineName = @"元宝搜索";
 static NSString *const SPEHDefaultEngineURL  = @"https://so.qq.com/isearch?query={searchTerms}";
 
 static BOOL SPEHEnabled(void)              { return SPEHBoolPref(@"enabled", YES); }
 static BOOL SPEHEngineEnabled(void)        { return SPEHBoolPref(@"customEngineEnabled", YES); }
 static BOOL SPEHAlertSuppressEnabled(void) { return SPEHBoolPref(@"suppressErrorAlert", YES); }
+static BOOL SPEHReaderKillEnabled(void)    { return SPEHBoolPref(@"killReader", YES); }
+static BOOL SPEHBFCacheEnabled(void)       { return SPEHBoolPref(@"backForwardCache", YES); }
 static BOOL SPEHProbeEnabled(void)         { return SPEHBoolPref(@"probeEnabled", YES); }
 
 static NSString *SPEHEngineName(void)      { return SPEHStringPref(@"customEngineName", SPEHDefaultEngineName); }
@@ -195,7 +187,6 @@ static UIWindow *SPEHKeyWindow(void)
 	return [UIApplication sharedApplication].keyWindow;
 }
 
-// 轻量 toast：不新建 window、不抢 key window，仅临时加一层 label
 static void SPEHShowToast(NSString *text)
 {
 	if (text.length == 0) return;
@@ -234,65 +225,44 @@ static void SPEHShowToast(NSString *text)
 	});
 }
 
-static void SPEHPatchInstanceMethod(Class cls, SEL sel, IMP newImp, IMP *outOld)
+static BOOL SPEHMethodReturnsBool(Method m)
 {
-	if (!cls) { SPEHLog(@"[hook] class nil for %@", NSStringFromSelector(sel)); return; }
-	Method m = class_getInstanceMethod(cls, sel);
-	if (!m) { SPEHLog(@"[hook] missing -[%@ %@]", NSStringFromClass(cls), NSStringFromSelector(sel)); return; }
-	MSHookMessageEx(cls, sel, newImp, outOld);
-	SPEHLog(@"[hook] ok -[%@ %@]", NSStringFromClass(cls), NSStringFromSelector(sel));
+	if (!m) return NO;
+	const char *t = method_getTypeEncoding(m);
+	if (!t) return NO;
+	return (t[0] == 'B' || t[0] == 'c');
 }
 
-// MARK: - 探针
+static void SPEHPatchInstanceMethod(Class cls, SEL sel, IMP newImp, IMP *outOld)
+{
+	if (!cls) return;
+	Method m = class_getInstanceMethod(cls, sel);
+	if (!m) return;
+	MSHookMessageEx(cls, sel, newImp, outOld);
+}
 
-static void SPEHDumpMethodList(Class cls, NSUInteger limit)
+static void SPEHPatchClassMethod(Class cls, SEL sel, IMP newImp, IMP *outOld)
+{
+	if (!cls) return;
+	Method m = class_getClassMethod(cls, sel);
+	if (!m) return;
+	MSHookMessageEx(object_getClass(cls), sel, newImp, outOld);
+}
+
+static void SPEHDumpMethodList(Class cls, NSUInteger limit, NSString *tag)
 {
 	if (!cls) return;
 	unsigned int count = 0;
 	Method *methods = class_copyMethodList(cls, &count);
-	SPEHLog(@"[probe] class %@ (%u methods)", NSStringFromClass(cls), count);
+	SPEHLog(@"[probe-%@] class %@ (%u methods)", tag, NSStringFromClass(cls), count);
 	for (unsigned int i = 0; i < count && i < limit; i++) {
-		SPEHLog(@"[probe]    - %@  types=%s", NSStringFromSelector(method_getName(methods[i])), method_getTypeEncoding(methods[i]));
+		SPEHLog(@"[probe-%@]    - %@  types=%s", tag, NSStringFromSelector(method_getName(methods[i])), method_getTypeEncoding(methods[i]));
 	}
 	free(methods);
 }
 
-// 在后台队列扫描一遍所有类名，找出包含关键字的类并 dump
-static void SPEHProbeScanClasses(void)
-{
-	dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-		NSArray *needles = @[ @"SearchEngine", @"SearchProvider", @"StartPage" ];
-		unsigned int count = 0;
-		Class *classes = objc_copyClassList(&count);
-		NSMutableDictionary *hits = [NSMutableDictionary dictionary];
+// MARK: - 搜索引擎注入（0.1.0 已验证可用）
 
-		for (unsigned int i = 0; i < count; i++) {
-			const char *name = class_getName(classes[i]);
-			if (!name) continue;
-			NSString *className = [NSString stringWithUTF8String:name];
-			if (!className) continue;
-			for (NSString *needle in needles) {
-				if ([className rangeOfString:needle].location != NSNotFound) {
-					hits[className] = needle;
-					break;
-				}
-			}
-		}
-		free(classes);
-
-		SPEHLog(@"[probe] ===== search-engine related classes: %lu =====", (unsigned long)hits.count);
-		for (NSString *className in [hits.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
-			Class cls = NSClassFromString(className);
-			SPEHLog(@"[probe] %@%@", className, cls ? @"" : @" (not resolvable)");
-			if (cls) SPEHDumpMethodList(cls, 40);
-		}
-		SPEHLog(@"[probe] ===== end =====");
-	});
-}
-
-// MARK: - 搜索引擎注入
-
-// 仅用于向编译器声明初始化签名，真实实现由 Safari 私有类在运行时提供
 @protocol SPEHEngineInfoInit <NSObject>
 - (id)initWithDictionary:(NSDictionary *)dict usingContext:(id)context;
 @end
@@ -314,12 +284,8 @@ static id SPEHCreateCustomSearchEngine(id controller)
 		SPEHLog(@"[engine] custom URL 模板缺少 {searchTerms}，放弃注入");
 		return nil;
 	}
-
 	Class infoCls = gSearchEngineInfoClass;
-	if (!infoCls) {
-		SPEHLog(@"[engine] SearchEngineInfo 类不存在，无法构造引擎");
-		return nil;
-	}
+	if (!infoCls) return nil;
 
 	NSDictionary *dict = @{
 		@"SearchEngineIdentifier" : @"com.huhansibuxin.speh.custom",
@@ -335,47 +301,34 @@ static id SPEHCreateCustomSearchEngine(id controller)
 	SEL legacySel = NSSelectorFromString(@"engineFromDictionary:withController:");
 
 	if ([infoCls instancesRespondToSelector:modernSel]) {
-		// 用协议声明让 ARC 正确识别 init 族的所有权语义（+1 返回）
 		engine = [(id<SPEHEngineInfoInit>)[infoCls alloc] initWithDictionary:dict usingContext:controller];
 	} else if ([infoCls respondsToSelector:legacySel]) {
 		typedef id (*LegacyFn)(id, SEL, id, id);
 		engine = ((LegacyFn)objc_msgSend)(infoCls, legacySel, dict, controller);
 	}
 
-	SPEHLog(@"[engine] built engine=%@ name=%@ url=%@", engine, SPEHEngineName(), urlTemplate);
+	SPEHLog(@"[engine] built engine=%@ name=%@", engine, SPEHEngineName());
 	return engine;
 }
 
 static void SPEHPopulateSearchEnginesHook(id self, SEL _cmd)
 {
-	if (gOrigPopulateSearchEngines) {
-		((void (*)(id, SEL))gOrigPopulateSearchEngines)(self, _cmd);
-	}
-
+	if (gOrigPopulateSearchEngines) ((void (*)(id, SEL))gOrigPopulateSearchEngines)(self, _cmd);
 	if (!SPEHEngineEnabled()) return;
 
-	if (!gCustomSearchEngine) {
-		gCustomSearchEngine = SPEHCreateCustomSearchEngine(self);
-	}
+	if (!gCustomSearchEngine) gCustomSearchEngine = SPEHCreateCustomSearchEngine(self);
 	if (!gCustomSearchEngine) return;
 
-	// 兼容两种存储方式：KVC 取 _searchEngines / engines
 	@try {
 		id engines = nil;
 		@try { engines = [self valueForKey:@"_searchEngines"]; } @catch (NSException *e) { }
-		if (!engines) {
-			@try { engines = [self valueForKey:@"engines"]; } @catch (NSException *e) { }
-		}
+		if (!engines) { @try { engines = [self valueForKey:@"engines"]; } @catch (NSException *e) { } }
 
 		if ([engines isKindOfClass:[NSMutableArray class]]) {
 			NSMutableArray *arr = (NSMutableArray *)engines;
-			BOOL exists = NO;
-			for (id e in arr) {
-				if (e == gCustomSearchEngine) { exists = YES; break; }
-			}
-			if (!exists) {
+			if (![arr containsObject:gCustomSearchEngine]) {
 				[arr addObject:gCustomSearchEngine];
-				SPEHLog(@"[engine] appended to mutable array, total=%lu", (unsigned long)arr.count);
+				SPEHLog(@"[engine] appended, total=%lu", (unsigned long)arr.count);
 			}
 		} else if ([engines isKindOfClass:[NSArray class]]) {
 			NSArray *arr = (NSArray *)engines;
@@ -385,8 +338,6 @@ static void SPEHPopulateSearchEnginesHook(id self, SEL _cmd)
 				@try { [self setValue:newArr forKey:@"engines"]; } @catch (NSException *e) { }
 				SPEHLog(@"[engine] replaced immutable array, total=%lu", (unsigned long)newArr.count);
 			}
-		} else {
-			SPEHLog(@"[engine] 未找到引擎数组，engines=%@", engines);
 		}
 	} @catch (NSException *e) {
 		SPEHLog(@"[engine] populate exception: %@", e);
@@ -395,23 +346,15 @@ static void SPEHPopulateSearchEnginesHook(id self, SEL _cmd)
 
 static id SPEHDefaultSearchEngineHook(id self, SEL _cmd)
 {
-	if (SPEHEngineEnabled() && gCustomSearchEngine) {
-		return gCustomSearchEngine;
-	}
-	if (gOrigDefaultSearchEngine) {
-		return ((id (*)(id, SEL))gOrigDefaultSearchEngine)(self, _cmd);
-	}
+	if (SPEHEngineEnabled() && gCustomSearchEngine) return gCustomSearchEngine;
+	if (gOrigDefaultSearchEngine) return ((id (*)(id, SEL))gOrigDefaultSearchEngine)(self, _cmd);
 	return nil;
 }
 
 static id SPEHDefaultSearchEngineIfPopulatedHook(id self, SEL _cmd)
 {
-	if (SPEHEngineEnabled() && gCustomSearchEngine) {
-		return gCustomSearchEngine;
-	}
-	if (gOrigDefaultSearchEngineIfPopulated) {
-		return ((id (*)(id, SEL))gOrigDefaultSearchEngineIfPopulated)(self, _cmd);
-	}
+	if (SPEHEngineEnabled() && gCustomSearchEngine) return gCustomSearchEngine;
+	if (gOrigDefaultSearchEngineIfPopulated) return ((id (*)(id, SEL))gOrigDefaultSearchEngineIfPopulated)(self, _cmd);
 	return nil;
 }
 
@@ -419,18 +362,12 @@ static void SPEHInstallSearchEngineHooks(void)
 {
 	gSearchEngineControllerClass = NSClassFromString(@"SearchEngineController") ?: NSClassFromString(@"_SFSearchEngineController");
 	gSearchEngineInfoClass = NSClassFromString(@"SearchEngineInfo") ?: NSClassFromString(@"_SFSearchEngineInfo");
-
-	if (!gSearchEngineControllerClass) {
-		SPEHLog(@"[engine] SearchEngineController 未加载，重试第 %d 次", gEngineRetryCount);
-		return;
-	}
+	if (!gSearchEngineControllerClass) return;
 
 	SPEHLog(@"[engine] controller=%@ info=%@", NSStringFromClass(gSearchEngineControllerClass), NSStringFromClass(gSearchEngineInfoClass));
 
-	// populate 方法名在不同版本可能不同，逐个尝试
-	NSArray *populateNames = @[ @"_populateSearchEngines", @"populateSearchEngines", @"_updateSearchEngines" ];
 	BOOL hookedPopulate = NO;
-	for (NSString *name in populateNames) {
+	for (NSString *name in @[ @"_populateSearchEngines", @"populateSearchEngines", @"_updateSearchEngines" ]) {
 		SEL sel = NSSelectorFromString(name);
 		if (class_getInstanceMethod(gSearchEngineControllerClass, sel)) {
 			SPEHPatchInstanceMethod(gSearchEngineControllerClass, sel, (IMP)SPEHPopulateSearchEnginesHook, &gOrigPopulateSearchEngines);
@@ -438,10 +375,7 @@ static void SPEHInstallSearchEngineHooks(void)
 			break;
 		}
 	}
-	if (!hookedPopulate) {
-		SPEHLog(@"[engine] 未找到 populate 方法，dump 方法列表：");
-		SPEHDumpMethodList(gSearchEngineControllerClass, 80);
-	}
+	if (!hookedPopulate) SPEHDumpMethodList(gSearchEngineControllerClass, 80, @"engine");
 
 	SPEHPatchInstanceMethod(gSearchEngineControllerClass, @selector(defaultSearchEngine), (IMP)SPEHDefaultSearchEngineHook, &gOrigDefaultSearchEngine);
 	SPEHPatchInstanceMethod(gSearchEngineControllerClass, @selector(defaultSearchEngineIfPopulated), (IMP)SPEHDefaultSearchEngineIfPopulatedHook, &gOrigDefaultSearchEngineIfPopulated);
@@ -449,16 +383,11 @@ static void SPEHInstallSearchEngineHooks(void)
 	gEngineHooked = YES;
 }
 
-// Safari 启动时 SafariServices 可能尚未加载，做有限次重试
 static void SPEHScheduleSearchEngineHookInstall(void)
 {
 	if (gEngineHooked) return;
-	if (gEngineRetryCount >= 12) {
-		SPEHLog(@"[engine] 重试上限已到，放弃安装搜索引擎 hook");
-		return;
-	}
+	if (gEngineRetryCount >= 12) return;
 	gEngineRetryCount++;
-
 	SPEHInstallSearchEngineHooks();
 	if (!gEngineHooked) {
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -467,9 +396,12 @@ static void SPEHScheduleSearchEngineHookInstall(void)
 	}
 }
 
-// MARK: - 弹窗抑制
+// MARK: - 弹窗拦截（0.2.0：多探测点 + 生命周期拦截）
 
 static IMP gOrigPresentViewController = NULL;
+static IMP gOrigAlertFactory = NULL;
+static IMP gOrigAlertViewWillAppear = NULL;
+static IMP gOrigAlertViewDidAppear = NULL;
 
 static BOOL SPEHIsTargetErrorAlert(UIAlertController *alert)
 {
@@ -479,56 +411,297 @@ static BOOL SPEHIsTargetErrorAlert(UIAlertController *alert)
 
 	NSArray *keywords = @[
 		@"打不开该网页", @"打不开这个网页", @"无法打开该网页", @"无法打开这个网页",
-		@"打不开网页", @"网址无效", @"地址无效",
+		@"打不开网页", @"网址无效", @"地址无效", @"无法显示网页", @"找不到服务器",
 		@"cannot open the page", @"can't open the page", @"cannot be opened",
-		@"address is invalid", @"the URL is invalid"
+		@"address is invalid", @"the URL is invalid", @"cannot connect"
 	];
-
 	for (NSString *kw in keywords) {
-		if ([combined rangeOfString:kw options:NSCaseInsensitiveSearch].location != NSNotFound) {
-			return YES;
-		}
+		if ([combined rangeOfString:kw options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
 	}
 	return NO;
 }
 
+static void SPEHLogAlertContext(UIAlertController *alert, NSString *stage)
+{
+	NSString *presenter = @"-";
+	UIViewController *p = alert.presentingViewController;
+	if (p) presenter = NSStringFromClass([p class]);
+	NSString *parent = @"-";
+	if (alert.parentViewController) parent = NSStringFromClass([alert.parentViewController class]);
+
+	SPEHLog(@"[alert] %@ class=%@ title=%@ message=%@ presenter=%@ parent=%@ actions=%lu",
+			stage, NSStringFromClass([alert class]), alert.title, alert.message, presenter, parent,
+			(unsigned long)alert.actions.count);
+}
+
+static void SPEHSuppressAlert(UIAlertController *alert, NSString *stage)
+{
+	SPEHLog(@"[alert] SUPPRESSED via %@: %@ / %@", stage, alert.title, alert.message);
+	NSString *toast = alert.title.length ? alert.title : @"网页无法打开";
+	if (alert.message.length && alert.message.length <= 24) {
+		toast = [toast stringByAppendingFormat:@" · %@", alert.message];
+	}
+	SPEHShowToast(toast);
+}
+
+// ① present 链路（0.1.0 未命中，保留兜底）
 static void SPEHPresentViewControllerHook(UIViewController *self, SEL _cmd, UIViewController *vc, BOOL animated, void (^completion)(void))
 {
 	if (SPEHAlertSuppressEnabled() && [vc isKindOfClass:[UIAlertController class]]) {
 		UIAlertController *alert = (UIAlertController *)vc;
-		SPEHLog(@"[alert] present by <%@> title=%@ message=%@", NSStringFromClass([self class]), alert.title, alert.message);
-
+		SPEHLogAlertContext(alert, @"present");
 		if (SPEHIsTargetErrorAlert(alert)) {
-			SPEHLog(@"[alert] SUPPRESSED: %@", alert.title);
-			NSString *toast = alert.title.length ? alert.title : @"网页无法打开";
-			if (alert.message.length && alert.message.length <= 24) {
-				toast = [toast stringByAppendingFormat:@" · %@", alert.message];
-			}
-			SPEHShowToast(toast);
+			SPEHSuppressAlert(alert, @"present");
 			if (completion) completion();
 			return;
 		}
 	}
-
 	if (gOrigPresentViewController) {
 		((void (*)(id, SEL, UIViewController *, BOOL, void (^)(void)))gOrigPresentViewController)(self, _cmd, vc, animated, completion);
 	}
 }
 
+// ② 工厂方法：任何 alert 被创建都会命中，附调用栈用于定位真实链路
+static id SPEHAlertFactoryHook(id self, SEL _cmd, NSString *title, NSString *message, UIAlertControllerStyle style)
+{
+	if (SPEHProbeEnabled()) {
+		NSArray *stack = [NSThread callStackSymbols];
+		SPEHLog(@"[alert] CREATE class=%@ title=%@ message=%@", NSStringFromClass(self), title, message);
+		NSUInteger n = MIN(stack.count, 10);
+		for (NSUInteger i = 0; i < n; i++) SPEHLog(@"[alert]    %@", stack[i]);
+	}
+	if (gOrigAlertFactory) {
+		return ((id (*)(id, SEL, NSString *, NSString *, UIAlertControllerStyle))gOrigAlertFactory)(self, _cmd, title, message, style);
+	}
+	return nil;
+}
+
+// ③ 生命周期：任何 in-process alert 出现都会走这里，最可靠的拦截点
+static void SPEHAlertViewWillAppearHook(UIAlertController *self, SEL _cmd)
+{
+	if (gOrigAlertViewWillAppear) ((void (*)(id, SEL))gOrigAlertViewWillAppear)(self, _cmd);
+
+	if (!SPEHAlertSuppressEnabled()) return;
+	SPEHLogAlertContext(self, @"viewWillAppear");
+
+	if (SPEHIsTargetErrorAlert(self)) {
+		SPEHSuppressAlert(self, @"viewWillAppear");
+		dispatch_async(dispatch_get_main_queue(), ^{
+			@try { [self dismissViewControllerAnimated:NO completion:nil]; } @catch (NSException *e) { }
+		});
+	}
+}
+
+static void SPEHAlertViewDidAppearHook(UIAlertController *self, SEL _cmd)
+{
+	if (gOrigAlertViewDidAppear) ((void (*)(id, SEL))gOrigAlertViewDidAppear)(self, _cmd);
+
+	if (!SPEHAlertSuppressEnabled()) return;
+	if (SPEHIsTargetErrorAlert(self)) {
+		SPEHSuppressAlert(self, @"viewDidAppear");
+		@try { [self dismissViewControllerAnimated:NO completion:nil]; } @catch (NSException *e) { }
+	}
+}
+
 static void SPEHInstallAlertHooks(void)
 {
-	SPEHPatchInstanceMethod([UIViewController class], @selector(presentViewController:animated:completion:), (IMP)SPEHPresentViewControllerHook, &gOrigPresentViewController);
+	SPEHPatchInstanceMethod([UIViewController class], @selector(presentViewController:animated:completion:),
+							(IMP)SPEHPresentViewControllerHook, &gOrigPresentViewController);
+	SPEHLog(@"[hook] presentViewController=%s", gOrigPresentViewController ? "ok" : "FAILED");
 
-	// 探针：记录所有进入 alert 级别的 window，用于确认弹窗真实呈现路径
+	SPEHPatchClassMethod([UIAlertController class], @selector(alertControllerWithTitle:message:preferredStyle:),
+						 (IMP)SPEHAlertFactoryHook, &gOrigAlertFactory);
+	SPEHLog(@"[hook] alertFactory=%s", gOrigAlertFactory ? "ok" : "FAILED");
+
+	SPEHPatchInstanceMethod([UIAlertController class], @selector(viewWillAppear:),
+							(IMP)SPEHAlertViewWillAppearHook, &gOrigAlertViewWillAppear);
+	SPEHLog(@"[hook] alertWillAppear=%s", gOrigAlertViewWillAppear ? "ok" : "FAILED");
+
+	SPEHPatchInstanceMethod([UIAlertController class], @selector(viewDidAppear:),
+							(IMP)SPEHAlertViewDidAppearHook, &gOrigAlertViewDidAppear);
+	SPEHLog(@"[hook] alertDidAppear=%s", gOrigAlertViewDidAppear ? "ok" : "FAILED");
+
+	// 探针：任何新窗口都记（排除键盘窗，避免刷屏）
 	[[NSNotificationCenter defaultCenter] addObserverForName:UIWindowDidBecomeVisibleNotification
 													  object:nil
 													   queue:[NSOperationQueue mainQueue]
 												  usingBlock:^(NSNotification *note) {
+		if (!SPEHProbeEnabled()) return;
 		UIWindow *w = note.object;
-		if ([w isKindOfClass:[UIWindow class]] && w.windowLevel >= UIWindowLevelAlert) {
-			SPEHLog(@"[probe] alert-level window visible: %@ level=%.0f class=%@", w, w.windowLevel, NSStringFromClass([w class]));
-		}
+		if (![w isKindOfClass:[UIWindow class]]) return;
+		NSString *cls = NSStringFromClass([w class]);
+		if ([cls rangeOfString:@"Keyboard" options:NSCaseInsensitiveSearch].location != NSNotFound) return;
+		SPEHLog(@"[probe] window visible class=%@ level=%.0f hidden=%d", cls, w.windowLevel, w.isHidden);
 	}];
+}
+
+// MARK: - 阅读器击杀
+//
+// 「阅读器可用」是 Safari 判定文章页后在地址栏临时替换 URL 的提示，
+// 源头是 *Reader* 类的可用性判定。这里按类名通用扫描，把零参 BOOL 判定压成 NO。
+
+static BOOL SPEHReturnNOHook(id self, SEL _cmd) { return NO; }
+
+static BOOL SPEHLooksLikeAvailabilitySelector(NSString *selName)
+{
+	return [selName hasPrefix:@"isReader"] || [selName hasPrefix:@"reader"] ||
+		   [selName hasPrefix:@"_isReader"] || [selName hasPrefix:@"isArticleAvailable"] ||
+		   [selName hasPrefix:@"isReaderAvailable"];
+}
+
+static void SPEHInstallReaderHooks(void)
+{
+	if (!SPEHReaderKillEnabled()) { SPEHLog(@"[reader] disabled by prefs"); return; }
+
+	unsigned int count = 0;
+	Class *classes = objc_copyClassList(&count);
+	int classHits = 0, methodHits = 0;
+
+	for (unsigned int i = 0; i < count; i++) {
+		Class cls = classes[i];
+		const char *name = class_getName(cls);
+		if (!name) continue;
+		NSString *clsName = [NSString stringWithUTF8String:name];
+		if (!clsName) continue;
+		if ([clsName rangeOfString:@"Reader"].location == NSNotFound) continue;
+		classHits++;
+
+		unsigned int mcount = 0;
+		Method *methods = class_copyMethodList(cls, &mcount);
+		for (unsigned int j = 0; j < mcount; j++) {
+			SEL sel = method_getName(methods[j]);
+			const char *selC = sel_getName(sel);
+			NSString *selName = [NSString stringWithUTF8String:selC];
+			if (!selName) continue;
+			if (strchr(selC, ':')) continue;                      // 只处理零参判定
+			if (!SPEHLooksLikeAvailabilitySelector(selName)) continue;
+			if (!SPEHMethodReturnsBool(methods[j])) continue;
+			MSHookMessageEx(cls, sel, (IMP)SPEHReturnNOHook, NULL);
+			SPEHLog(@"[reader] -[%@ %@] -> NO", clsName, selName);
+			methodHits++;
+		}
+		free(methods);
+
+		Class meta = object_getClass(cls);
+		if (meta) {
+			unsigned int ccount = 0;
+			Method *cms = class_copyMethodList(meta, &ccount);
+			for (unsigned int j = 0; j < ccount; j++) {
+				SEL sel = method_getName(cms[j]);
+				const char *selC = sel_getName(sel);
+				NSString *selName = [NSString stringWithUTF8String:selC];
+				if (!selName) continue;
+				if (strchr(selC, ':')) continue;
+				if (!SPEHLooksLikeAvailabilitySelector(selName)) continue;
+				if (!SPEHMethodReturnsBool(cms[j])) continue;
+				MSHookMessageEx(meta, sel, (IMP)SPEHReturnNOHook, NULL);
+				SPEHLog(@"[reader] +[%@ %@] -> NO", clsName, selName);
+				methodHits++;
+			}
+			free(cms);
+		}
+	}
+	free(classes);
+
+	SPEHLog(@"[reader] 'Reader' classes=%d, availability hooks=%d", classHits, methodHits);
+}
+
+// MARK: - 返回不重新加载（打开 WebKit back/forward cache）
+//
+// iOS 16 系统框架在 dyld shared cache 里，无法静态查 SPI 名，
+// 故运行时在 WKPreferences 类层次上找所有 *BackForward*Enabled: 的 setter 并置 YES。
+
+static void SPEHLogPreferencesCandidates(id prefs)
+{
+	SPEHLog(@"[bfcache] dump WKPreferences 候选 setter：");
+	Class cls = object_getClass(prefs);
+	int depth = 0;
+	while (cls && cls != [NSObject class] && depth < 4) {
+		unsigned int n = 0;
+		Method *ms = class_copyMethodList(cls, &n);
+		for (unsigned int i = 0; i < n; i++) {
+			NSString *s = NSStringFromSelector(method_getName(ms[i]));
+			if (!s) continue;
+			BOOL hit = ([s rangeOfString:@"ack" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+						[s rangeOfString:@"Cache" options:NSCaseInsensitiveSearch].location != NSNotFound);
+			if (hit && [s hasSuffix:@":"]) SPEHLog(@"[bfcache]    %@", s);
+		}
+		free(ms);
+		cls = class_getSuperclass(cls);
+		depth++;
+	}
+}
+
+static void SPEHEnableBFCache(id prefs)
+{
+	if (!prefs) return;
+	static char kMarker;
+	if (objc_getAssociatedObject(prefs, &kMarker)) return;
+	objc_setAssociatedObject(prefs, &kMarker, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+	int applied = 0;
+	Class cls = object_getClass(prefs);
+	int depth = 0;
+	while (cls && cls != [NSObject class] && depth < 6) {
+		unsigned int n = 0;
+		Method *ms = class_copyMethodList(cls, &n);
+		for (unsigned int i = 0; i < n; i++) {
+			SEL sel = method_getName(ms[i]);
+			const char *selC = sel_getName(sel);
+			if (!selC) continue;
+			NSString *s = [NSString stringWithUTF8String:selC];
+			if (!s) continue;
+
+			BOOL isSetter = [s hasPrefix:@"_set"] || [s hasPrefix:@"set"];
+			if (!isSetter || ![s hasSuffix:@":"]) continue;
+			if ([s rangeOfString:@"BackForward" options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+
+			const char *types = method_getTypeEncoding(ms[i]);
+			if (!types || types[0] != 'v' || types[1] != '@' || types[2] != ':') continue;
+
+			@try {
+				((void (*)(id, SEL, BOOL))objc_msgSend)(prefs, sel, YES);
+				SPEHLog(@"[bfcache] %@ -> YES", s);
+				applied++;
+			} @catch (NSException *e) {
+				SPEHLog(@"[bfcache] %@ exception %@", s, e);
+			}
+		}
+		free(ms);
+		cls = class_getSuperclass(cls);
+		depth++;
+	}
+
+	if (applied == 0) SPEHLogPreferencesCandidates(prefs);
+}
+
+static IMP gOrigSetPreferences = NULL;
+static IMP gOrigPreferencesGetter = NULL;
+
+static void SPEHSetPreferencesHook(id self, SEL _cmd, id prefs)
+{
+	if (gOrigSetPreferences) ((void (*)(id, SEL, id))gOrigSetPreferences)(self, _cmd, prefs);
+	if (SPEHBFCacheEnabled()) SPEHEnableBFCache(prefs);
+}
+
+static id SPEHPreferencesGetterHook(id self, SEL _cmd)
+{
+	id prefs = gOrigPreferencesGetter ? ((id (*)(id, SEL))gOrigPreferencesGetter)(self, _cmd) : nil;
+	if (SPEHBFCacheEnabled()) SPEHEnableBFCache(prefs);
+	return prefs;
+}
+
+static void SPEHInstallBFCacheHooks(void)
+{
+	if (!SPEHBFCacheEnabled()) { SPEHLog(@"[bfcache] disabled by prefs"); return; }
+
+	Class cfgCls = NSClassFromString(@"WKWebViewConfiguration");
+	if (!cfgCls) { SPEHLog(@"[bfcache] WKWebViewConfiguration 未加载"); return; }
+
+	SPEHPatchInstanceMethod(cfgCls, NSSelectorFromString(@"setPreferences:"), (IMP)SPEHSetPreferencesHook, &gOrigSetPreferences);
+	SPEHPatchInstanceMethod(cfgCls, NSSelectorFromString(@"preferences"), (IMP)SPEHPreferencesGetterHook, &gOrigPreferencesGetter);
+	SPEHLog(@"[bfcache] hooks setPreferences=%s preferences=%s",
+			gOrigSetPreferences ? "ok" : "FAILED", gOrigPreferencesGetter ? "ok" : "FAILED");
 }
 
 // MARK: - 入口
@@ -539,21 +712,34 @@ static void SPEHInstallAlertHooks(void)
 		if (!SPEHEnabled()) return;
 
 		SPEHLog(@"==============================================");
-		SPEHLog(@"Safari16Enhance 0.1.0 loaded, pid=%d", getpid());
+		SPEHLog(@"Safari16Enhance " SPEH_VERSION " loaded, pid=%d", getpid());
 		SPEHLog(@"container home = %@", NSHomeDirectory());
 		SPEHLog(@"log file        = %@", SPEHLogPath());
-		SPEHLog(@"engine enabled=%d name=%@ url=%@", SPEHEngineEnabled(), SPEHEngineName(), SPEHEngineURL());
-		SPEHLog(@"alert suppress=%d probe=%d", SPEHAlertSuppressEnabled(), SPEHProbeEnabled());
+		SPEHLog(@"engine=%d(%@) alert=%d reader=%d bfcache=%d probe=%d",
+				SPEHEngineEnabled(), SPEHEngineName(), SPEHAlertSuppressEnabled(),
+				SPEHReaderKillEnabled(), SPEHBFCacheEnabled(), SPEHProbeEnabled());
 
 		SPEHInstallAlertHooks();
+		SPEHInstallReaderHooks();
+		SPEHInstallBFCacheHooks();
+		SPEHScheduleSearchEngineHookInstall();
 
 		if (SPEHProbeEnabled()) {
-			// 延后扫描，避免和 Safari 启动争抢 CPU
 			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-				SPEHProbeScanClasses();
+				dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+					unsigned int count = 0;
+					Class *classes = objc_copyClassList(&count);
+					NSMutableArray *readerCls = [NSMutableArray array];
+					for (unsigned int i = 0; i < count; i++) {
+						const char *nm = class_getName(classes[i]);
+						if (!nm) continue;
+						NSString *s = [NSString stringWithUTF8String:nm];
+						if (s && [s rangeOfString:@"Reader"].location != NSNotFound) [readerCls addObject:s];
+					}
+					free(classes);
+					SPEHLog(@"[probe] Reader classes: %@", [readerCls componentsJoinedByString:@", "]);
+				});
 			});
 		}
-
-		SPEHScheduleSearchEngineHookInstall();
 	}
 }

@@ -60,7 +60,7 @@ jobs:
           otool -L "$DYLIB"
           STRINGS=$(strings -a "$DYLIB")
           for NEEDLE in \
-            'Safari16Enhance 0.1.0 loaded' \
+            'Safari16Enhance 0.2.0 loaded' \
             'Safari16Enhance.log' \
             'https://so.qq.com/isearch?query={searchTerms}' \
             'SearchEngineController' \

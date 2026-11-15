@@ -4,7 +4,7 @@
 		{
 			cell = PSGroupCell;
 			label = "总开关";
-			footerText = "基于独立实现（非 SafariPlus / 非 SafariX）。仅在 MobileSafari 进程内生效，不注入其它 App。";
+			footerText = "独立实现（非 SafariPlus / 非 SafariX）。仅在 MobileSafari 进程内生效。";
 		},
 		{
 			cell = PSSwitchCell;
@@ -16,7 +16,7 @@
 		{
 			cell = PSGroupCell;
 			label = "自定义搜索引擎";
-			footerText = "开启后 Safari 地址栏搜索改用下方引擎。搜索 URL 必须包含 {searchTerms}。改动后请结束 Safari 进程（上滑杀掉）再打开。";
+			footerText = "开启后 Safari 地址栏搜索改用下方引擎。搜索 URL 必须包含 {searchTerms}。改动后请上滑杀掉 Safari 再打开。";
 		},
 		{
 			cell = PSSwitchCell;
@@ -49,7 +49,7 @@
 		{
 			cell = PSGroupCell;
 			label = "错误弹窗";
-			footerText = "Safari 打不开网页时会强制弹「打不开该网页」对话框，必须点「好」才继续。开启后拦截该弹窗，改为底部 toast 轻提示（约 2 秒自动消失，不阻断操作）。";
+			footerText = "Safari 打不开网页时强制弹「打不开该网页 / 因为网址无效」对话框，必须点「好」。开启后拦截并改成底部 toast。";
 		},
 		{
 			cell = PSSwitchCell;
@@ -60,8 +60,32 @@
 		},
 		{
 			cell = PSGroupCell;
+			label = "阅读器";
+			footerText = "Safari 检测到文章页时会在地址栏临时把网址换成「阅读器可用」，并显示阅读器按钮。开启后彻底关闭该判定，提示与按钮都不再出现。";
+		},
+		{
+			cell = PSSwitchCell;
+			label = "关闭「阅读器可用」提示";
+			defaults = "com.huhansibuxin.safari16enhance";
+			key = "killReader";
+			default = YES;
+		},
+		{
+			cell = PSGroupCell;
+			label = "返回缓存";
+			footerText = "从搜索页点进网页后返回，Safari 默认重新拉网络（很慢）。开启后启用 WebKit 后退/前进缓存（bfcache），返回直接恢复上一页内存状态，不再重新加载。";
+		},
+		{
+			cell = PSSwitchCell;
+			label = "返回时使用缓存（不重新加载）";
+			defaults = "com.huhansibuxin.safari16enhance";
+			key = "backForwardCache";
+			default = YES;
+		},
+		{
+			cell = PSGroupCell;
 			label = "诊断探针";
-			footerText = "日志固定写入 Safari 自身容器：\n<容器>/Documents/Safari16Enhance.log\n启动时会打印实际路径。功能确认正常后可关闭以省资源。";
+			footerText = "日志固定写入 Safari 容器：<容器>/Documents/Safari16Enhance.log，启动时打印实际路径。功能确认正常后可关闭。";
 		},
 		{
 			cell = PSSwitchCell;
@@ -73,7 +97,7 @@
 		{
 			cell = PSGroupCell;
 			label = "功能说明";
-			footerText = "1. 自定义搜索引擎：注入自建 SearchEngineInfo 并强制作为 Safari 默认引擎（默认元宝搜索 so.qq.com，免登录可用）。\n2. 弹窗拦截：hook presentViewController，命中「打不开该网页」类文案即拦截，改为 toast，不再阻断。\n3. 运行时探针：dump 搜索引擎相关类/方法、记录每次弹窗的文案与发起类，用于 iOS 版本适配。\n\n日志位置：Safari 容器 Documents/Safari16Enhance.log（超 2MB 自动轮转为 .1）。";
+			footerText = "1. 自定义搜索引擎：注入自建 SearchEngineInfo 并强制作为默认引擎（默认元宝搜索）。\n2. 弹窗拦截：命中「打不开该网页 / 网址无效 / 地址无效」等文案即拦截，改 toast。\n3. 阅读器击杀：按类名扫描所有 Reader 类，把可用性判定压成 NO。\n4. 返回缓存：在 WKPreferences 上打开 WebKit 的 back/forward cache，返回不再重新加载。\n5. 探针：记录 alert 创建/呈现链路、Reader 类清单、bfcache setter 命中情况。\n\n日志：容器 Documents/Safari16Enhance.log（超 2MB 轮转为 .1）。";
 		}
 	);
 }
