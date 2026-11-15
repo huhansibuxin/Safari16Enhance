@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.8.0"
+#define SPEH_VERSION "0.8.1"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -299,43 +299,77 @@ static NSString *SPEHEngineNameOf(id engine)
 	return @"";
 }
 
+// 真机日志实证：searchURLTemplate / URLTemplate 这些 KVC key 全都读不到（打印 (no-template)），
+// 说明 _SFSearchEngineInfo 内部的字段名不是这些。直接反射 ivar 找：
+//   · 类型是对象、当前值里含 {searchTerms} 的那个 ivar —— 就是搜索模板。
 static NSString *SPEHEngineTemplateOf(id engine)
 {
+	if (!engine) return nil;
+
 	for (NSString *k in @[ @"searchURLTemplate", @"searchURLTemplateString", @"URLTemplate" ]) {
 		@try {
 			id v = [engine valueForKey:k];
-			if ([v isKindOfClass:[NSString class]]) return (NSString *)v;
+			if ([v isKindOfClass:[NSString class]] && ((NSString *)v).length) return (NSString *)v;
 		} @catch (NSException *e) { }
 	}
-	return nil;
+
+	unsigned int n = 0;
+	Ivar *ivars = class_copyIvarList([engine class], &n);
+	NSString *found = nil;
+	for (unsigned int i = 0; i < n; i++) {
+		const char *enc = ivar_getTypeEncoding(ivars[i]);
+		if (!enc || enc[0] != '@') continue;
+		@try {
+			id v = object_getIvar(engine, ivars[i]);
+			if (![v isKindOfClass:[NSString class]]) continue;
+			if (![(NSString *)v containsString:@"{searchTerms}"]) continue;
+			found = (NSString *)v;
+			break;
+		} @catch (NSException *e) { }
+	}
+	free(ivars);
+	return found;
 }
 
 static BOOL SPEHSetEngineTemplate(id engine, NSString *tpl)
 {
 	if (!engine || !tpl.length) return NO;
 
-	BOOL wrote = NO;
+	// ① 先按常规 KVC key 写（有效就到此为止）
 	for (NSString *k in @[ @"searchURLTemplate", @"searchURLTemplateString" ]) {
 		@try {
 			[engine setValue:tpl forKey:k];
-			wrote = YES;
+			NSString *now = SPEHEngineTemplateOf(engine);
+			if ([now isEqualToString:tpl]) {
+				SPEHLog(@"[engine] 模板写入成功 key=%@", k);
+				return YES;
+			}
+		} @catch (NSException *e) { }
+	}
+
+	// ② 反射 ivar：值是对象且含 {searchTerms} 的那一个就是模板字段
+	unsigned int n = 0;
+	Ivar *ivars = class_copyIvarList([engine class], &n);
+	NSString *used = nil;
+	for (unsigned int i = 0; i < n; i++) {
+		const char *enc = ivar_getTypeEncoding(ivars[i]);
+		if (!enc || enc[0] != '@') continue;
+		@try {
+			id v = object_getIvar(engine, ivars[i]);
+			if (![v isKindOfClass:[NSString class]]) continue;
+			if (![(NSString *)v containsString:@"{searchTerms}"]) continue;
+			object_setIvarWithStrongDefault(engine, ivars[i], tpl);
+			const char *nm = ivar_getName(ivars[i]);
+			used = nm ? [NSString stringWithUTF8String:nm] : @"?";
 			break;
 		} @catch (NSException *e) { }
 	}
-	if (!wrote) {
-		Ivar iv = class_getInstanceVariable([engine class], "_searchURLTemplate");
-		if (!iv) iv = class_getInstanceVariable([engine class], "_URLTemplate");
-		if (iv) {
-			@try {
-				object_setIvarWithStrongDefault(engine, iv, tpl);
-				wrote = YES;
-			} @catch (NSException *e) { }
-		}
-	}
-	if (!wrote) return NO;
+	free(ivars);
 
-	NSString *now = SPEHEngineTemplateOf(engine);
-	return [now isEqualToString:tpl];
+	if (!used) return NO;
+	BOOL ok = [SPEHEngineTemplateOf(engine) isEqualToString:tpl];
+	SPEHLog(@"[engine] 模板写入 ivar=%@ %s", used, ok ? "ok" : "未生效");
+	return ok;
 }
 
 static void SPEHLogEngineList(NSArray *engines)
@@ -739,40 +773,14 @@ static void SPEHApplyOpenInAppJS(id webView)
 	} @catch (NSException *e) { }
 }
 
-@protocol SPEHUserScript <NSObject>
-- (id)initWithSource:(NSString *)src injectionTime:(NSInteger)time forMainFrameOnly:(BOOL)mainOnly;
-@end
-
-@protocol SPEHUserContentController <NSObject>
-- (void)addUserScript:(id)script;
-@end
-
-// 文档开始阶段就执行同一段 JS：Safari 是「解析 HTML 时」读 apple-itunes-app 的，
-// 0.8s 后才跑等于晚了一步（GitHub 横幅就是这么漏的）。文档开始注入才拦得住。
-static void SPEHAddDocumentStartScript(id webView)
-{
-	if (!webView) return;
-	static char kDocScript;
-	if (objc_getAssociatedObject(webView, &kDocScript)) return;
-	objc_setAssociatedObject(webView, &kDocScript, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-	@try {
-		Class usCls = NSClassFromString(@"WKUserScript");
-		if (!usCls) return;
-		id cfg = [webView valueForKey:@"configuration"];
-		id ucc = [cfg valueForKey:@"userContentController"];
-		if (!ucc) return;
-
-		id script = [(id<SPEHUserScript>)[usCls alloc] initWithSource:SPEHOpenInAppJS()
-														  injectionTime:0            // AtDocumentStart
-													   forMainFrameOnly:NO];
-		if (!script) return;
-		[(id<SPEHUserContentController>)ucc addUserScript:script];
-		SPEHLog(@"[openinapp] 已注入文档开始脚本");
-	} @catch (NSException *e) {
-		SPEHLog(@"[openinapp] 文档开始脚本注入失败 %@", e.reason);
-	}
-}
+// 0.8.0 踩坑（老板实测）：原来这里用 WKUserScript 往 configuration.userContentController
+// 里 addUserScript，做「文档开始就删 meta」。后果是第三方 Safari 扩展集体异常：
+//   · Userscripts 的「自动加载下一页」不再执行；
+//   · Dark Night 每个页面都重新请求网站权限。
+// 根因：WKWebView 的 configuration 在初始化时已被内部 copy，之后再改（addUserScript /
+// 换 processPool）是非法的，会打乱 Safari 自己的注入管线（扩展 content script 走同一套）。
+// 结论：绝不碰 configuration / userContentController / processPool。
+// 删 meta 改用 evaluateJavaScript 在各时间点执行；横幅本身已由原生 hook 拦住。
 
 // Smart App Banner 原生 view：运行时按类名找，统一挂 didMoveToWindow
 
@@ -1051,8 +1059,6 @@ static void SPEHInstallSmartAppBannerPreciseHooks(void)
 
 static IMP gOrigWVDidMoveToWindow = NULL;
 
-// 定义在后文的返回缓存模块里，这里先声明
-static void SPEHApplyProcessPoolCache(id webView);
 // 定义在地址栏手势模块里
 static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag);
 
@@ -1069,8 +1075,8 @@ static void SPEHWVDidMoveToWindowHook(UIView *self, SEL _cmd)
 
 	if (first) {
 		// 原生接口 / 探针只在每个 webView 首次挂载时跑一次，不参与日常滚动
-		SPEHApplyProcessPoolCache(self);
-		SPEHAddDocumentStartScript(self);
+		// 注意：这里不再改 configuration / userContentController / processPool，
+		// 否则会打乱 Safari 扩展的 content script 注入（见上文 0.8.0 踩坑说明）。
 		if (SPEHProbeEnabled()) {
 			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
 				dispatch_get_main_queue(), ^{
@@ -1131,14 +1137,20 @@ static void SPEHInstallOpenInAppHooks(void)
 // 老板实测：用 Bing 搜索时 Safari 会从底部弹一张「继续搜索」卡片，
 // 一行「微软必应 APP → 打开」，一行「浏览器 → 继续」。这是 iOS 的 App Link 提示，
 // 由 Safari 在「当前页面对应某个 App 的 universal link」时主动弹出，跟网页自身无关。
-// 处理思路：从判定源头掐掉 —— 让 Safari 认为「这个 URL 没有可打开的 App」，
-// 它就不会有「打开 / 继续」可选，只能继续用 Safari。
+//
+// 0.8.0 日志实证（真机 dump 的方法名，之前猜的 +appLinkWithURL: / -isEnabledForURL: 都不存在）：
+//   WBSAppLink 实例: _synchronouslyFetchAppLinkWithError:、_getAppLinkWithCompletionHandler:、
+//                    decideOpenStrategyWithCompletionHandler:
+//   LSAppLink 类方法: getAppLinkWithURL:completionHandler:、appLinksWithURL:limit:error:、
+//                    appLinksWithURL:limit:includeLinksForCurrentApplication:error:
+// 所以按真名来：让这两层都拿不到任何 AppLink，Safari 就只剩「在浏览器继续」。
 
 static BOOL SPEHAppLinkKillEnabled(void) { return SPEHBoolPref(@"killAppLinkPrompt", YES); }
 
-static IMP gOrigAppLinkWithURL = NULL;
-static IMP gOrigAppLinkWithCache = NULL;
-static IMP gOrigAppLinkIsEnabledURL = NULL;
+static IMP gOrigFetchAppLinkSync = NULL;
+static IMP gOrigGetAppLinkWithURL = NULL;
+static IMP gOrigAppLinksWithURL = NULL;
+static IMP gOrigAppLinksWithURL2 = NULL;
 static IMP gOrigIncludeAppLinkActions = NULL;
 static int gAppLinkLogCount = 0;
 
@@ -1148,37 +1160,61 @@ static void SPEHPatchClassMethod(Class cls, SEL sel, IMP newImp, IMP *outOld)
 	MSHookMessageEx(object_getClass(cls), sel, newImp, outOld);
 }
 
-static id SPEHAppLinkWithURLHook(id self, SEL _cmd, id url)
+static void SPEHAppLinkLog(NSString *fmt, ...)
+{
+	if (!SPEHProbeEnabled() || gAppLinkLogCount >= 20) return;
+	gAppLinkLogCount++;
+	va_list ap;
+	va_start(ap, fmt);
+	NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+	va_end(ap);
+	SPEHLog(@"[applink] %@", msg);
+}
+
+// -[WBSAppLink _synchronouslyFetchAppLinkWithError:] -> nil
+static id SPEHFetchAppLinkSyncHook(id self, SEL _cmd, NSError **error)
 {
 	if (SPEHAppLinkKillEnabled()) {
-		if (SPEHProbeEnabled() && gAppLinkLogCount < 20) {
-			gAppLinkLogCount++;
-			SPEHLog(@"[applink] 判定 %@ → nil（当作没有对应 App）", url);
-		}
+		SPEHAppLinkLog(@"同步取 AppLink → nil");
 		return nil;
 	}
-	if (gOrigAppLinkWithURL) return ((id (*)(id, SEL, id))gOrigAppLinkWithURL)(self, _cmd, url);
+	if (gOrigFetchAppLinkSync) return ((id (*)(id, SEL, NSError **))gOrigFetchAppLinkSync)(self, _cmd, error);
 	return nil;
 }
 
-static id SPEHAppLinkWithCacheHook(id self, SEL _cmd, id url, BOOL cache)
+// +[LSAppLink appLinksWithURL:limit:error:] -> 空数组
+static id SPEHAppLinksWithURLHook(id self, SEL _cmd, id url, NSUInteger limit, NSError **error)
 {
 	if (SPEHAppLinkKillEnabled()) {
-		if (SPEHProbeEnabled() && gAppLinkLogCount < 20) {
-			gAppLinkLogCount++;
-			SPEHLog(@"[applink] 判定(cache) %@ → nil", url);
-		}
-		return nil;
+		SPEHAppLinkLog(@"查询 AppLink 列表 %@ → 空", url);
+		return @[];
 	}
-	if (gOrigAppLinkWithCache) return ((id (*)(id, SEL, id, BOOL))gOrigAppLinkWithCache)(self, _cmd, url, cache);
-	return nil;
+	if (gOrigAppLinksWithURL) return ((id (*)(id, SEL, id, NSUInteger, NSError **))gOrigAppLinksWithURL)(self, _cmd, url, limit, error);
+	return @[];
 }
 
-static BOOL SPEHAppLinkIsEnabledURLHook(id self, SEL _cmd, id url)
+static id SPEHAppLinksWithURL2Hook(id self, SEL _cmd, id url, NSUInteger limit, BOOL includeCurrent, NSError **error)
 {
-	if (SPEHAppLinkKillEnabled()) return NO;
-	if (gOrigAppLinkIsEnabledURL) return ((BOOL (*)(id, SEL, id))gOrigAppLinkIsEnabledURL)(self, _cmd, url);
-	return NO;
+	if (SPEHAppLinkKillEnabled()) {
+		SPEHAppLinkLog(@"查询 AppLink 列表(含当前App) %@ → 空", url);
+		return @[];
+	}
+	if (gOrigAppLinksWithURL2) return ((id (*)(id, SEL, id, NSUInteger, BOOL, NSError **))gOrigAppLinksWithURL2)(self, _cmd, url, limit, includeCurrent, error);
+	return @[];
+}
+
+// +[LSAppLink getAppLinkWithURL:completionHandler:] -> 回调 (nil, nil)
+static void SPEHGetAppLinkHook(id self, SEL _cmd, id url, id completion)
+{
+	if (SPEHAppLinkKillEnabled()) {
+		SPEHAppLinkLog(@"异步取 AppLink %@ → nil", url);
+		if (completion) {
+			void (^cb)(id, id) = completion;
+			@try { cb(nil, nil); } @catch (NSException *e) { }
+		}
+		return;
+	}
+	if (gOrigGetAppLinkWithURL) ((void (*)(id, SEL, id, id))gOrigGetAppLinkWithURL)(self, _cmd, url, completion);
 }
 
 static BOOL SPEHIncludeAppLinkActionsHook(id self, SEL _cmd, id webView, id element)
@@ -1188,157 +1224,55 @@ static BOOL SPEHIncludeAppLinkActionsHook(id self, SEL _cmd, id webView, id elem
 	return NO;
 }
 
-static void SPEHDumpAppLinkClasses(void)
-{
-	for (NSString *cn in @[ @"WBSAppLink", @"SFAppLink", @"_LSAppLink", @"LSAppLink" ]) {
-		Class c = NSClassFromString(cn);
-		if (!c) { SPEHLog(@"[applink] %@ 未加载", cn); continue; }
-		NSMutableArray *cls = [NSMutableArray array];
-		NSMutableArray *ins = [NSMutableArray array];
-		unsigned int n = 0;
-		Method *cm = class_copyMethodList(object_getClass(c), &n);
-		for (unsigned int i = 0; i < n; i++) {
-			const char *sn = sel_getName(method_getName(cm[i]));
-			if (strstr(sn, "appLink") || strstr(sn, "AppLink") || strstr(sn, "Enabled") || strstr(sn, "Open")) {
-				[cls addObject:[NSString stringWithUTF8String:sn]];
-			}
-		}
-		free(cm);
-		n = 0;
-		Method *im = class_copyMethodList(c, &n);
-		for (unsigned int i = 0; i < n; i++) {
-			const char *sn = sel_getName(method_getName(im[i]));
-			if (strstr(sn, "appLink") || strstr(sn, "AppLink") || strstr(sn, "Enabled") || strstr(sn, "Open")) {
-				[ins addObject:[NSString stringWithUTF8String:sn]];
-			}
-		}
-		free(im);
-		SPEHLog(@"[applink] %@ 类方法: %@ / 实例方法: %@", cn,
-				cls.count ? [cls componentsJoinedByString:@", "] : @"(无)",
-				ins.count ? [ins componentsJoinedByString:@", "] : @"(无)");
-	}
-}
-
 static void SPEHInstallAppLinkHooks(void)
 {
 	if (!SPEHAppLinkKillEnabled()) { SPEHLog(@"[applink] disabled by prefs"); return; }
 
 	NSMutableArray *hit = [NSMutableArray array];
-	for (NSString *cn in @[ @"WBSAppLink", @"SFAppLink" ]) {
-		Class c = NSClassFromString(cn);
-		if (!c) continue;
 
-		SEL s1 = NSSelectorFromString(@"appLinkWithURL:");
-		if (class_getClassMethod(c, s1)) {
-			SPEHPatchClassMethod(c, s1, (IMP)SPEHAppLinkWithURLHook, &gOrigAppLinkWithURL);
-			[hit addObject:[NSString stringWithFormat:@"%@ +appLinkWithURL:", cn]];
-		}
-		SEL s2 = NSSelectorFromString(@"appLinkWithURL:useCacheIfRecent:");
-		if (class_getClassMethod(c, s2)) {
-			SPEHPatchClassMethod(c, s2, (IMP)SPEHAppLinkWithCacheHook, &gOrigAppLinkWithCache);
-			[hit addObject:[NSString stringWithFormat:@"%@ +appLinkWithURL:useCacheIfRecent:", cn]];
-		}
-		SEL s3 = NSSelectorFromString(@"isEnabledForURL:");
-		if (class_getInstanceMethod(c, s3)) {
-			SPEHPatchInstanceMethod(c, s3, (IMP)SPEHAppLinkIsEnabledURLHook, &gOrigAppLinkIsEnabledURL);
-			[hit addObject:[NSString stringWithFormat:@"%@ -isEnabledForURL:", cn]];
+	Class wbsCls = NSClassFromString(@"WBSAppLink");
+	if (wbsCls) {
+		SEL sel = NSSelectorFromString(@"_synchronouslyFetchAppLinkWithError:");
+		if (class_getInstanceMethod(wbsCls, sel)) {
+			SPEHPatchInstanceMethod(wbsCls, sel, (IMP)SPEHFetchAppLinkSyncHook, &gOrigFetchAppLinkSync);
+			[hit addObject:@"WBSAppLink -_synchronouslyFetchAppLinkWithError:"];
 		}
 	}
 
-	Class tabCls = NSClassFromString(@"TabDocument");
-	if (tabCls) {
+	Class lsCls = NSClassFromString(@"LSAppLink");
+	if (lsCls) {
+		SEL s1 = NSSelectorFromString(@"getAppLinkWithURL:completionHandler:");
+		if (class_getClassMethod(lsCls, s1)) {
+			SPEHPatchClassMethod(lsCls, s1, (IMP)SPEHGetAppLinkHook, &gOrigGetAppLinkWithURL);
+			[hit addObject:@"LSAppLink +getAppLinkWithURL:completionHandler:"];
+		}
+		SEL s2 = NSSelectorFromString(@"appLinksWithURL:limit:error:");
+		if (class_getClassMethod(lsCls, s2)) {
+			SPEHPatchClassMethod(lsCls, s2, (IMP)SPEHAppLinksWithURLHook, &gOrigAppLinksWithURL);
+			[hit addObject:@"LSAppLink +appLinksWithURL:limit:error:"];
+		}
+		SEL s3 = NSSelectorFromString(@"appLinksWithURL:limit:includeLinksForCurrentApplication:error:");
+		if (class_getClassMethod(lsCls, s3)) {
+			SPEHPatchClassMethod(lsCls, s3, (IMP)SPEHAppLinksWithURL2Hook, &gOrigAppLinksWithURL2);
+			[hit addObject:@"LSAppLink +appLinksWithURL:limit:includeLinksForCurrentApplication:error:"];
+		}
+	}
+
+	for (NSString *cn in @[ @"TabDocument", @"_SFTabDocument" ]) {
+		Class tabCls = NSClassFromString(cn);
+		if (!tabCls) continue;
 		for (NSString *sn in @[ @"_webView:shouldIncludeAppLinkActionsForElement:",
 								@"webView:shouldIncludeAppLinkActionsForElement:" ]) {
 			SEL sel = NSSelectorFromString(sn);
 			if (class_getInstanceMethod(tabCls, sel)) {
 				SPEHPatchInstanceMethod(tabCls, sel, (IMP)SPEHIncludeAppLinkActionsHook, &gOrigIncludeAppLinkActions);
-				[hit addObject:[NSString stringWithFormat:@"TabDocument -%@", sn]];
+				[hit addObject:[NSString stringWithFormat:@"%@ -%@", cn, sn]];
 			}
 		}
 	}
 
 	SPEHLog(@"[applink] hook %lu 条: %@", (unsigned long)hit.count,
 			hit.count ? [hit componentsJoinedByString:@" | "] : @"(未命中任何方法)");
-	if (SPEHProbeEnabled()) SPEHDumpAppLinkClasses();
-}
-
-// MARK: - 返回缓存：WKProcessPool 原生接口探针
-//
-// 0.3.0 已全量 dump 证实：WKPreferences / WKWebViewConfiguration 上没有任何
-// BackForward / PageCache 开关。iOS 16 唯一还可能存在原生接口的地方是
-// WKProcessPool（底层 WebProcessPool 才有 back/forward cache 容量控制）。
-// 这里做定向查找 + 全量 dump，命中就置值，没命中说明也没有。
-
-static void SPEHDumpProcessPoolCacheSpis(void)
-{
-	Class poolCls = NSClassFromString(@"WKProcessPool");
-	if (!poolCls) { SPEHLog(@"[bfcache] WKProcessPool 未加载"); return; }
-
-	NSMutableArray *hits = [NSMutableArray array];
-	for (int pass = 0; pass < 2; pass++) {
-		Class c = pass == 0 ? poolCls : NSClassFromString(@"_WKProcessPoolConfiguration");
-		if (!c) continue;
-		unsigned int n = 0;
-		Method *ms = class_copyMethodList(c, &n);
-		for (unsigned int i = 0; i < n; i++) {
-			const char *nm = sel_getName(method_getName(ms[i]));
-			if (strstr(nm, "BackForward") || strstr(nm, "PageCache") || strstr(nm, "CacheCapacity")) {
-				[hits addObject:[NSString stringWithFormat:@"%s>%s", class_getName(c), nm]];
-			}
-		}
-		free(ms);
-	}
-	SPEHLog(@"[bfcache] WKProcessPool 候选 %lu 条: %@",
-			(unsigned long)hits.count, hits.count ? [hits componentsJoinedByString:@", "] : @"(无)");
-}
-
-static int SPEHTryProcessPoolCacheSetters(id pool)
-{
-	if (!pool) return 0;
-	NSArray *names = @[
-		// 0.6.1 日志实证：_WKProcessPoolConfiguration 上确实存在 setPageCacheEnabled:
-		@"setPageCacheEnabled:", @"_setPageCacheEnabled:",
-		@"_setProcessCacheCapacity:", @"_setBackForwardCacheEnabled:", @"_setUsesBackForwardCache:",
-		@"_setUsesPageCache:", @"_setBackForwardCacheCapacity:", @"_setPageCacheCapacity:"
-	];
-	int applied = 0;
-	for (NSString *nm in names) {
-		SEL sel = NSSelectorFromString(nm);
-		if (![pool respondsToSelector:sel]) continue;
-		@try {
-			if ([nm rangeOfString:@"Capacity"].location != NSNotFound) {
-				((void (*)(id, SEL, unsigned long))objc_msgSend)(pool, sel, (unsigned long)16);
-			} else {
-				((void (*)(id, SEL, BOOL))objc_msgSend)(pool, sel, YES);
-			}
-			SPEHLog(@"[bfcache] WKProcessPool %@ 已置值", nm);
-			applied++;
-		} @catch (NSException *e) { }
-	}
-	return applied;
-}
-
-static void SPEHApplyProcessPoolCache(id webView)
-{
-	if (!webView) return;
-	@try {
-		id cfg = [webView valueForKey:@"configuration"];
-		id pool = cfg ? [cfg valueForKey:@"processPool"] : nil;
-		if (!pool) return;
-		static char kDone;
-		if (objc_getAssociatedObject(pool, &kDone)) return;
-		objc_setAssociatedObject(pool, &kDone, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-		int n = SPEHTryProcessPoolCacheSetters(pool);
-
-		// 真正有 setPageCacheEnabled: 的是 _WKProcessPoolConfiguration，一并试
-		id cfgObj = nil;
-		@try { cfgObj = [pool valueForKey:@"_configuration"]; } @catch (NSException *e) { }
-		if (cfgObj) n += SPEHTryProcessPoolCacheSetters(cfgObj);
-
-		SPEHDumpProcessPoolCacheSpis();
-		SPEHLog(@"[bfcache] processPool/config 原生接口命中 %d 条（0=确认不存在）", n);
-	} @catch (NSException *e) { }
 }
 
 // MARK: - 返回后滚动恢复
