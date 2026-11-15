@@ -72,6 +72,18 @@
 		},
 		{
 			cell = PSGroupCell;
+			label = "App Store 跳转";
+			footerText = "有些网站一打开就用 itms-apps:// 或 apps.apple.com 直接跳到 App Store。开启后一律拦截，只弹一条 toast，正常网页浏览不受影响。";
+		},
+		{
+			cell = PSSwitchCell;
+			label = "拦截跳转 App Store";
+			defaults = "com.huhansibuxin.safari16enhance";
+			key = "blockAppStore";
+			default = YES;
+		},
+		{
+			cell = PSGroupCell;
 			label = "阅读器";
 			footerText = "Safari 检测到文章页时会在地址栏临时把网址换成「阅读器可用」，并显示阅读器按钮。开启后彻底关闭该判定。";
 		},
@@ -85,7 +97,7 @@
 		{
 			cell = PSGroupCell;
 			label = "返回";
-			footerText = "iOS 16 的 WebKit 无 bfcache 开关（已实测确认）。此开关在返回后主动复位滚动视图，缓解返回上一页后前几次滑动不响应的问题。";
+			footerText = "iOS 16 的 WebKit 无 bfcache 开关（已实测确认）。开启后：返回时吞掉多余的一次 reload（只吞同 URL，不影响点新链接），并注入 JS 复位页面残留的滚动锁 —— 元宝搜索这类 SPA 页返回后滑不动的根因就在这里。";
 		},
 		{
 			cell = PSSwitchCell;
@@ -109,7 +121,7 @@
 		{
 			cell = PSGroupCell;
 			label = "功能说明";
-			footerText = "1. 自定义搜索引擎：注入自建 SearchEngineInfo 并强制作为默认引擎（默认元宝搜索）。\n2. 弹窗拦截：只保留精准命中，Safari 自绘的 SFDialogView 按文本拆除，网页自己的 JS 对话框不受影响。\n3. 推广横幅：JS 清网页自绘「App 内打开」浮层 + 移除 apple-itunes-app meta + 原生 Smart App Banner 直接拆除。\n4. 阅读器：白名单精准命中已实测确认的可用性判定，压成 NO。\n5. 返回：iOS 16 无 bfcache SPI，改为返回后主动复位滚动视图。\n\n日志：容器 Documents/Safari16Enhance.log（超 2MB 轮转为 .1）。";
+			footerText = "1. 自定义搜索引擎：注入自建 SearchEngineInfo 并强制作为默认引擎（默认元宝搜索）。\n2. 弹窗拦截：只保留精准命中，Safari 自绘的 SFDialogView 按文本拆除，网页自己的 JS 对话框不受影响。\n3. 推广横幅：JS 清网页自绘「App 内打开」浮层 + 移除 apple-itunes-app meta + 原生 Smart App Banner 直接拆除。\n4. 阅读器：白名单精准命中已实测确认的可用性判定，压成 NO。\n5. 返回：iOS 16 无 bfcache SPI，改为后退窗口内吞掉多余 reload + JS 复位页面滚动锁。\n6. App Store：拦截 itms* scheme 与 apps.apple.com / itunes.apple.com / testflight.apple.com，杜绝网站强跳商店。\n\n日志：容器 Documents/Safari16Enhance.log（超 2MB 轮转为 .1）。";
 		}
 	);
 }
