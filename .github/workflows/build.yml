@@ -68,7 +68,6 @@ jobs:
             'defaultSearchEngineIfPopulated' \
             'SFDialogView' \
             'smartbanner' \
-            'apple-itunes-app' \
             'killOpenInApp' \
             'fixBackScroll' \
             'Documents' ; do
@@ -84,7 +83,7 @@ jobs:
           import os, sys
           data = open(os.environ["DYLIB"], "rb").read()
           ok = True
-          for kw in ["打不开该网页", "无法打开该网页", "网址无效"]:
+          for kw in ["打不开该网页", "无法打开该网页", "网址无效", "App 内打开"]:
               u8  = kw.encode("utf-8") in data
               u16 = kw.encode("utf-16-le") in data
               print(f"{kw}  utf8={u8} utf16le={u16}")
