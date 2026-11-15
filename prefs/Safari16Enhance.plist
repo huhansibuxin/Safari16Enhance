@@ -86,27 +86,15 @@
 		},
 		{
 			cell = PSGroupCell;
-			label = "返回";
-			footerText = "iOS 16 的 WebKit 无 bfcache 开关（已实测确认）。开启后：返回时吞掉多余的一次 reload（只吞同 URL，不影响点新链接），并注入 JS 复位页面残留的滚动锁 —— 部分 SPA 页面返回后滑不动的根因就在这里。";
-		},
-		{
-			cell = PSSwitchCell;
-			label = "返回后修复滑动";
-			defaults = "com.huhansibuxin.safari16enhance";
-			key = "fixBackScroll";
-			default = YES;
-		},
-		{
-			cell = PSGroupCell;
 			label = "诊断探针";
-			footerText = "日志固定写入 Safari 容器：<容器>/Documents/Safari16Enhance.log，启动时打印实际路径。功能确认正常后可关闭。";
+			footerText = "日志固定写入 Safari 容器：<容器>/Documents/Safari16Enhance.log，启动时打印实际路径。默认关闭；只有排查问题时才打开。关闭时仅记录「真正发生了拦截」的事件（弹窗拆除 / 横幅丢弃 / 手势类名 dump 不记）。";
 		},
 		{
 			cell = PSSwitchCell;
 			label = "启用运行时探针";
 			defaults = "com.huhansibuxin.safari16enhance";
 			key = "probeEnabled";
-			default = YES;
+			default = NO;
 		},
 		{
 			cell = PSGroupCell;
@@ -115,13 +103,12 @@
 2. Smart App Banner：精准 hook TabDocument（setAppBanner: / appBanner / didFindAppBannerWithContent: / setAppSuggestionBanner:isPinned: / setStoreBannersAreDisabled:）与 BrowserController（检查完成 / 钉顶 / 移除）共 8 个方法，不做类名通扫。
 3. 「App 内打开」浮层：JS 清网页自绘浮层 + MutationObserver 见到 apple-itunes-app meta 就删 + 捕获阶段拦非 http(s) scheme 的点击。
 4. 阅读器：白名单精准命中已实测确认的可用性判定，压成 NO。
-5. 返回：后退窗口内吞掉多余 reload + JS 复位页面滚动锁。
-6. 在 App 中打开：让 Safari 拿不到 WBSAppLink，「微软必应 APP 打开 / 浏览器 继续」这类卡片不再出现。
-7. 地址栏手势：禁用底部地址栏上的左右滑动切页，防误触。
+5. 在 App 中打开：让 Safari 拿不到 WBSAppLink，「微软必应 APP 打开 / 浏览器 继续」这类卡片不再出现。
+6. 地址栏手势：禁用底部地址栏上的左右滑动切页，防误触。
 
 （本插件不修改 WKWebView 的 configuration / userContentController / processPool，也不 hook WebKit 导航决策并手工回调 decisionHandler，避免影响第三方扩展的脚本注入与权限流程。）
 
-日志：容器 Documents/Safari16Enhance.log（超 2MB 轮转为 .1）。";
+日志：容器 Documents/Safari16Enhance.log（超 2MB 轮转为 .1）。运行时探针默认关闭，关闭时只记录真正发生的拦截事件。";
 		}
 	);
 }

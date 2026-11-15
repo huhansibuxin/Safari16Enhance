@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.9.2"
+#define SPEH_VERSION "0.9.4"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -157,8 +157,7 @@ static BOOL SPEHDialogKillEnabled(void)    { return SPEHBoolPref(@"suppressError
 static BOOL SPEHReaderKillEnabled(void)    { return SPEHBoolPref(@"killReader", YES); }
 static BOOL SPEHOpenInAppKillEnabled(void) { return SPEHBoolPref(@"killOpenInApp", YES); }
 static BOOL SPEHSmartBannerKillEnabled(void) { return SPEHBoolPref(@"killSmartBanner", YES); }
-static BOOL SPEHBackScrollFixEnabled(void) { return SPEHBoolPref(@"fixBackScroll", YES); }
-static BOOL SPEHProbeEnabled(void)         { return SPEHBoolPref(@"probeEnabled", YES); }
+static BOOL SPEHProbeEnabled(void)         { return SPEHBoolPref(@"probeEnabled", NO); }
 
 // MARK: - 通用工具
 
@@ -376,11 +375,12 @@ static void SPEHInstallReaderHooks(void)
 		if (!m || !SPEHMethodReturnsBool(m)) { miss++; continue; }
 
 		MSHookMessageEx(cls, sel, (IMP)SPEHReturnNOHook, NULL);
-		SPEHLog(@"[reader] 精准命中 -[%s %s] -> NO", clsC, selC);
 		hit++;
 	}
 
-	SPEHLog(@"[reader] 白名单 total=%lu hit=%d miss=%d", (unsigned long)total, hit, miss);
+	if (hit == 0 || SPEHProbeEnabled()) {
+		SPEHLog(@"[reader] 白名单 total=%lu hit=%d miss=%d", (unsigned long)total, hit, miss);
+	}
 }
 
 // MARK: - 「App 内打开」浮层 + Smart App Banner
@@ -469,6 +469,15 @@ static int SPEHJSInt(NSString *s, NSString *key)
 static void SPEHApplyOpenInAppJS(id webView)
 {
 	if (!webView) return;
+
+	// 0.9.3：日志里那串「JS 执行失败 执行JavaScript返回结果的类型不受支持」全是
+	// 快速连按返回时的空注入 —— webView 正在换页/已脱离窗口，evaluateJavaScript 会返回
+	// WKErrorCode 5（结果类型不支持）。这种注入本来就没意义，直接跳过，既省一次 IPC 也不刷屏。
+	@try {
+		if ([webView isKindOfClass:[UIView class]] && !((UIView *)webView).window) return;
+		if ([webView respondsToSelector:@selector(isLoading)] && [webView isLoading]) return;
+	} @catch (NSException *e) { }
+
 	@try {
 		[(id<SPEHWebViewJS>)webView evaluateJavaScript:SPEHOpenInAppJS() completionHandler:^(id result, NSError *error) {
 			if (error) {
@@ -485,11 +494,11 @@ static void SPEHApplyOpenInAppJS(id webView)
 			int click = SPEHJSInt(r, @"click");
 			int blocked = SPEHJSInt(r, @"s");
 
-			// 每个新页面打一条「就绪」：这是「JS 侧防线真的装上了」的直接证据
-			if (first == 1) {
+			// 0.9.3：探针默认关闭。「就绪」是诊断用的每页一条，只在 probe 打开时打；
+			// 「清理」只在真的动过手（删了 meta / 拆了浮层 / 拦了点击）时打，属于真事件，保留。
+			if (first == 1 && SPEHProbeEnabled()) {
 				SPEHLog(@"[openinapp] 就绪 link=%d meta=%d click=%d", link, meta, click);
 			}
-			// 有清理动作 / 有拦截动作才追加，避免刷屏
 			if (meta > 0 || elems > 0 || blocked > 0) {
 				SPEHLog(@"[openinapp] 清理 meta=%d el=%d 已拦点击=%d", meta, elems, blocked);
 			}
@@ -600,6 +609,14 @@ static void SPEHBCRemoveBannerHook(id self, SEL _cmd, id tabDocument, BOOL anima
 
 static void SPEHInstallSmartAppBannerPreciseHooks(void)
 {
+	// 0.9.3 修：原来是 per-webView 的 `first` 判断，Safari 有多个 WKWebView，
+	// 每个新 webView 挂窗口都会重装一遍 → 日志里「精准 hook 8 条」出现 7 次，
+	// 同一 SEL 被反复 MSHookMessageEx 会把 orig 指向自己的上一层，迟早自递归。
+	// 改成进程级只装一次。
+	static BOOL installed = NO;
+	if (installed) return;
+	installed = YES;
+
 	NSMutableArray *hit = [NSMutableArray array];
 
 	Class tabCls = NSClassFromString(@"TabDocument");
@@ -768,7 +785,20 @@ static void SPEHPatchClassMethod(Class cls, SEL sel, IMP newImp, IMP *outOld)
 }
 
 // 老板要求：这个卡片是「偶尔才弹」，必须能确定拦截是否真的命中。
-// 所以 AppLink 这层的日志**不受 probe 开关限制**，永远记录（上限 40 条防刷屏）。
+// 0.9.3：默认只在「值得记」的时候落盘 —— ① probe 打开时全记；② 命中 bing 域名的查询永远记
+// （就是那张「微软必应 APP / 浏览器 继续」卡片的来源，留着当长期证据）。
+// 其它站点每次返回 nil 的记录属探针，默认不写，避免把日志刷满。
+static BOOL SPEHURLIsBing(id url)
+{
+	NSString *s = nil;
+	@try {
+		if ([url isKindOfClass:[NSURL class]]) s = [(NSURL *)url absoluteString];
+		else if ([url isKindOfClass:[NSString class]]) s = url;
+		else if ([url respondsToSelector:@selector(absoluteString)]) s = [url valueForKey:@"absoluteString"];
+	} @catch (NSException *e) { }
+	return s ? ([s rangeOfString:@"bing." options:NSCaseInsensitiveSearch].location != NSNotFound) : NO;
+}
+
 static void SPEHAppLinkLog(NSString *fmt, ...)
 {
 	if (gAppLinkLogCount >= 40) return;
@@ -784,7 +814,7 @@ static void SPEHAppLinkLog(NSString *fmt, ...)
 static id SPEHFetchAppLinkSyncHook(id self, SEL _cmd, NSError **error)
 {
 	if (SPEHAppLinkKillEnabled()) {
-		SPEHAppLinkLog(@"同步取 AppLink → nil");
+		if (SPEHProbeEnabled()) SPEHAppLinkLog(@"同步取 AppLink → nil");
 		return nil;
 	}
 	if (gOrigFetchAppLinkSync) return ((id (*)(id, SEL, NSError **))gOrigFetchAppLinkSync)(self, _cmd, error);
@@ -795,7 +825,7 @@ static id SPEHFetchAppLinkSyncHook(id self, SEL _cmd, NSError **error)
 static id SPEHAppLinksWithURLHook(id self, SEL _cmd, id url, NSUInteger limit, NSError **error)
 {
 	if (SPEHAppLinkKillEnabled()) {
-		SPEHAppLinkLog(@"查询 AppLink 列表 %@ → 空", url);
+		if (SPEHProbeEnabled()) SPEHAppLinkLog(@"查询 AppLink 列表 %@ → 空", url);
 		return @[];
 	}
 	if (gOrigAppLinksWithURL) return ((id (*)(id, SEL, id, NSUInteger, NSError **))gOrigAppLinksWithURL)(self, _cmd, url, limit, error);
@@ -805,7 +835,7 @@ static id SPEHAppLinksWithURLHook(id self, SEL _cmd, id url, NSUInteger limit, N
 static id SPEHAppLinksWithURL2Hook(id self, SEL _cmd, id url, NSUInteger limit, BOOL includeCurrent, NSError **error)
 {
 	if (SPEHAppLinkKillEnabled()) {
-		SPEHAppLinkLog(@"查询 AppLink 列表(含当前App) %@ → 空", url);
+		if (SPEHProbeEnabled()) SPEHAppLinkLog(@"查询 AppLink 列表(含当前App) %@ → 空", url);
 		return @[];
 	}
 	if (gOrigAppLinksWithURL2) return ((id (*)(id, SEL, id, NSUInteger, BOOL, NSError **))gOrigAppLinksWithURL2)(self, _cmd, url, limit, includeCurrent, error);
@@ -816,7 +846,9 @@ static id SPEHAppLinksWithURL2Hook(id self, SEL _cmd, id url, NSUInteger limit, 
 static void SPEHGetAppLinkHook(id self, SEL _cmd, id url, id completion)
 {
 	if (SPEHAppLinkKillEnabled()) {
-		SPEHAppLinkLog(@"异步取 AppLink %@ → nil", url);
+		if (SPEHProbeEnabled() || SPEHURLIsBing(url)) {
+			SPEHAppLinkLog(@"异步取 AppLink %@ → nil", url);
+		}
 		if (completion) {
 			void (^cb)(id, id) = completion;
 			@try { cb(nil, nil); } @catch (NSException *e) { }
@@ -884,148 +916,16 @@ static void SPEHInstallAppLinkHooks(void)
 			hit.count ? [hit componentsJoinedByString:@" | "] : @"(未命中任何方法)");
 }
 
-// MARK: - 返回后滚动恢复
+// MARK: - （已删除）返回后滚动恢复模块
 //
-// 老板实测：返回上一页后，页面前几次上/下滑完全不响应，加载完也要滑几下才生效。
-// 日志取证（0.5.0）：goBack 后 0.3/0.9/1.8s 检查 scrollEnabled 与 pan 全部是 YES，
-// 一条「复位」都没打 → 不是原生被禁用，而是页面 JS 残留滚动锁（部分 SPA 站点，
-// 百度传统页不锁，所以百度不卡）。所以改为：① JS 复位页面的 overflow / touch-action
-// 与残留全屏遮罩；② 后退窗口内吞掉 Safari 多余的一次 reload / 同 URL loadRequest。
-
-static IMP gOrigWKGoBack = NULL;
-static IMP gOrigWKGoForward = NULL;
-static IMP gOrigWKReload = NULL;
-static IMP gOrigWKReloadFromOrigin = NULL;
-static IMP gOrigWKLoadRequest = NULL;
-
-// 后退窗口：goBack 之后 2.5 秒内，丢弃同一 webView 上的多余 reload
-static id gSuppressView = nil;
-static NSTimeInterval gSuppressUntil = 0;
-
-static BOOL SPEHInBackWindow(id webView)
-{
-	if (!gSuppressView || webView != gSuppressView) return NO;
-	return [NSDate timeIntervalSinceReferenceDate] <= gSuppressUntil;
-}
-
-static void SPEHResetScroll(id webView, NSString *tag)
-{
-	if (!webView || !SPEHBackScrollFixEnabled()) return;
-	@try {
-		id sv = [webView valueForKey:@"scrollView"];
-		if (!sv) return;
-		BOOL changed = NO;
-		if ([sv respondsToSelector:@selector(isScrollEnabled)] && ![sv isScrollEnabled]) {
-			[sv setScrollEnabled:YES];
-			changed = YES;
-		}
-		id pan = [sv valueForKey:@"panGestureRecognizer"];
-		if (pan && [pan respondsToSelector:@selector(isEnabled)] && ![pan isEnabled]) {
-			[pan setEnabled:YES];
-			changed = YES;
-		}
-		if (changed && SPEHProbeEnabled()) {
-			SPEHLog(@"[backscroll] %@ 复位 scrollView (enabled/pan)", tag);
-		}
-	} @catch (NSException *e) { }
-}
-
-static void SPEHWKGoBackHook(id self, SEL _cmd)
-{
-	if (gOrigWKGoBack) ((void (*)(id, SEL))gOrigWKGoBack)(self, _cmd);
-
-	if (!SPEHBackScrollFixEnabled()) return;
-
-	gSuppressView = self;
-	gSuppressUntil = [NSDate timeIntervalSinceReferenceDate] + 2.5;
-
-	__weak id weakSelf = self;
-	NSArray *delays = @[ @0.30, @0.90, @1.80 ];
-	for (NSNumber *d in delays) {
-		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-			SPEHResetScroll(weakSelf, [NSString stringWithFormat:@"goBack+%@s", d]);
-		});
-	}
-	if (SPEHProbeEnabled()) SPEHLog(@"[backnav] goBack 打开 2.5s 后退窗口（吞 reload）");
-}
-
-static void SPEHWKGoForwardHook(id self, SEL _cmd)
-{
-	if (gOrigWKGoForward) ((void (*)(id, SEL))gOrigWKGoForward)(self, _cmd);
-	SPEHResetScroll(self, @"goForward");
-}
-
-static void SPEHWKReloadHook(id self, SEL _cmd)
-{
-	if (SPEHInBackWindow(self)) {
-		if (SPEHProbeEnabled()) SPEHLog(@"[backnav] 后退窗口内吞掉 -%s", sel_getName(_cmd));
-		return;
-	}
-	if (gOrigWKReload) ((void (*)(id, SEL))gOrigWKReload)(self, _cmd);
-}
-
-static void SPEHWKReloadFromOriginHook(id self, SEL _cmd)
-{
-	if (SPEHInBackWindow(self)) {
-		if (SPEHProbeEnabled()) SPEHLog(@"[backnav] 后退窗口内吞掉 -%s", sel_getName(_cmd));
-		return;
-	}
-	if (gOrigWKReloadFromOrigin) ((void (*)(id, SEL))gOrigWKReloadFromOrigin)(self, _cmd);
-}
-
-// 只吞「URL 与当前页完全相同」的 loadRequest（即重载同一页），
-// 用户返回后点新链接不会受影响。
-static void SPEHWKLoadRequestHook(id self, SEL _cmd, id request)
-{
-	if (SPEHInBackWindow(self) && request) {
-		@try {
-			NSURL *u = [request valueForKey:@"URL"];
-			NSURL *cur = [self valueForKey:@"URL"];
-			if (u && cur && [[u absoluteString] isEqualToString:[cur absoluteString]]) {
-				if (SPEHProbeEnabled()) SPEHLog(@"[backnav] 后退窗口内吞掉同 URL loadRequest");
-				return;
-			}
-		} @catch (NSException *e) { }
-	}
-	if (gOrigWKLoadRequest) ((void (*)(id, SEL, id))gOrigWKLoadRequest)(self, _cmd, request);
-}
-
-static void SPEHInstallBackScrollHooks(void)
-{
-	if (!SPEHBackScrollFixEnabled()) { SPEHLog(@"[backscroll] disabled by prefs"); return; }
-
-	Class wkCls = NSClassFromString(@"WKWebView");
-	if (!wkCls) return;
-
-	SPEHPatchInstanceMethod(wkCls, NSSelectorFromString(@"goBack"), (IMP)SPEHWKGoBackHook, &gOrigWKGoBack);
-	SPEHPatchInstanceMethod(wkCls, NSSelectorFromString(@"goForward"), (IMP)SPEHWKGoForwardHook, &gOrigWKGoForward);
-	SPEHPatchInstanceMethod(wkCls, NSSelectorFromString(@"reload"), (IMP)SPEHWKReloadHook, &gOrigWKReload);
-	SPEHPatchInstanceMethod(wkCls, NSSelectorFromString(@"reloadFromOrigin"), (IMP)SPEHWKReloadFromOriginHook, &gOrigWKReloadFromOrigin);
-	SPEHPatchInstanceMethod(wkCls, NSSelectorFromString(@"loadRequest:"), (IMP)SPEHWKLoadRequestHook, &gOrigWKLoadRequest);
-
-	for (NSString *name in @[ @"_SFWebView", @"SFWebView" ]) {
-		Class sub = NSClassFromString(name);
-		if (!sub) continue;
-		unsigned int n = 0;
-		Method *ms = class_copyMethodList(sub, &n);
-		for (unsigned int i = 0; i < n; i++) {
-			const char *selName = sel_getName(method_getName(ms[i]));
-			if (strcmp(selName, "goBack") == 0) {
-				SPEHPatchInstanceMethod(sub, NSSelectorFromString(@"goBack"), (IMP)SPEHWKGoBackHook, NULL);
-			} else if (strcmp(selName, "reload") == 0) {
-				SPEHPatchInstanceMethod(sub, NSSelectorFromString(@"reload"), (IMP)SPEHWKReloadHook, NULL);
-			} else if (strcmp(selName, "reloadFromOrigin") == 0) {
-				SPEHPatchInstanceMethod(sub, NSSelectorFromString(@"reloadFromOrigin"), (IMP)SPEHWKReloadFromOriginHook, NULL);
-			}
-		}
-		free(ms);
-	}
-
-	SPEHLog(@"[backscroll] hooks goBack=%s goForward=%s reload=%s reloadFromOrigin=%s loadRequest=%s",
-			gOrigWKGoBack ? "ok" : "FAILED", gOrigWKGoForward ? "ok" : "FAILED",
-			gOrigWKReload ? "ok" : "FAILED", gOrigWKReloadFromOrigin ? "ok" : "FAILED",
-			gOrigWKLoadRequest ? "ok" : "FAILED");
-}
+// 0.9.4：老板「我现在不用元宝，卡顿那些代码都删除」 ⇒ 整模块移除。
+// 删掉的东西：
+//   · -[WKWebView goBack]/goForward/reload/reloadFromOrigin/loadRequest: 五个 hook
+//   · 2.5s 后退窗口「吞 reload / 吞同 URL loadRequest」
+//   · SPEHResetScroll 三次（0.3/0.9/1.8s）复位 scrollEnabled / pan 的兜底
+//   · 对应 prefs 开关 fixBackScroll 与 CI 校验串
+// 为什么删：这套只为「返回后滑不动」的 SPA 站点（元宝）加的，而且左滑手势返回
+// 根本不走 -[WKWebView goBack]，对它本来就没生效。留着只是多 5 个 WKWebView hook 面。
 
 // MARK: - 禁用底部地址栏左右滑动切页
 //
@@ -1081,8 +981,10 @@ static void SPEHEnhanceAddGestureHook(UIView *self, SEL _cmd, UIGestureRecognize
 
 				if (isSwipe || isPanOnURL) {
 					gr.enabled = NO;
-					SPEHLog(@"[urlswipe] 已禁用 %@ on %@",
-							NSStringFromClass(object_getClass(gr)), hostCls);
+					if (SPEHProbeEnabled()) {
+						SPEHLog(@"[urlswipe] 已禁用 %@ on %@",
+								NSStringFromClass(object_getClass(gr)), hostCls);
+					}
 					return;   // 不转发 = 手势根本没挂上
 				}
 			}
@@ -1160,8 +1062,10 @@ static void SPEHKillBarSwipes(UIView *v, CGFloat winH, int depth)
 			UIScrollView *sv = (UIScrollView *)v;
 			if (sv.contentSize.width > sv.bounds.size.width * 1.15 && sv.scrollEnabled) {
 				sv.scrollEnabled = NO;
-				SPEHLog(@"[urlswipe] 关闭横向滚动 %@ contentW=%.0f boundsW=%.0f",
-						cls, sv.contentSize.width, sv.bounds.size.width);
+				if (SPEHProbeEnabled()) {
+					SPEHLog(@"[urlswipe] 关闭横向滚动 %@ contentW=%.0f boundsW=%.0f",
+							cls, sv.contentSize.width, sv.bounds.size.width);
+				}
 			}
 		}
 
@@ -1213,15 +1117,14 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 		SPEHLog(@"==============================================");
 		SPEHLog(@"Safari16Enhance " SPEH_VERSION " loaded, pid=%d", getpid());
 		SPEHLog(@"log file = %@", SPEHLogPath());
-		SPEHLog(@"dialog=%d reader=%d openinapp=%d smartbanner=%d backscroll=%d applink=%d probe=%d",
+		SPEHLog(@"dialog=%d reader=%d openinapp=%d smartbanner=%d applink=%d probe=%d",
 				SPEHDialogKillEnabled(), SPEHReaderKillEnabled(),
 				SPEHOpenInAppKillEnabled(), SPEHSmartBannerKillEnabled(),
-				SPEHBackScrollFixEnabled(), SPEHAppLinkKillEnabled(), SPEHProbeEnabled());
+				SPEHAppLinkKillEnabled(), SPEHProbeEnabled());
 
 		SPEHInstallSFDialogHooks();
 		SPEHInstallReaderHooks();
 		SPEHInstallOpenInAppHooks();
-		SPEHInstallBackScrollHooks();
 		SPEHInstallAppLinkHooks();
 		SPEHInstallURLBarSwipeHooks();
 	}
