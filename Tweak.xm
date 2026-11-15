@@ -18,7 +18,9 @@
 #import <objc/message.h>
 #import <substrate.h>
 
-#define SPEH_PREF_DOMAIN @"com.huhansibuxin.safari16enhance"
+// CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏，NSString 侧另建常量
+#define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
+#define SPEH_PREF_DOMAIN SPEH_PREF_DOMAIN_CSTR
 #define SPEH_LOG_NAME    @"Safari16Enhance.log"
 
 // MARK: - 日志（写入 Safari 容器 Documents）
@@ -146,7 +148,7 @@ static void SPEHLog(NSString *fmt, ...)
 
 static BOOL SPEHBoolPref(NSString *key, BOOL def)
 {
-	CFPropertyListRef v = CFPreferencesCopyAppValue((__bridge CFStringRef)key, CFSTR(SPEH_PREF_DOMAIN));
+	CFPropertyListRef v = CFPreferencesCopyAppValue((__bridge CFStringRef)key, CFSTR(SPEH_PREF_DOMAIN_CSTR));
 	if (!v) return def;
 	BOOL r = def;
 	if (CFGetTypeID(v) == CFBooleanGetTypeID()) r = CFBooleanGetValue((CFBooleanRef)v);
@@ -159,7 +161,7 @@ static BOOL SPEHBoolPref(NSString *key, BOOL def)
 
 static NSString *SPEHStringPref(NSString *key, NSString *def)
 {
-	CFPropertyListRef v = CFPreferencesCopyAppValue((__bridge CFStringRef)key, CFSTR(SPEH_PREF_DOMAIN));
+	CFPropertyListRef v = CFPreferencesCopyAppValue((__bridge CFStringRef)key, CFSTR(SPEH_PREF_DOMAIN_CSTR));
 	if (!v) return def;
 	NSString *r = def;
 	if (CFGetTypeID(v) == CFStringGetTypeID()) r = [(__bridge NSString *)v copy];
