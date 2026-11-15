@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.6.2"
+#define SPEH_VERSION "0.7.0"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -573,14 +573,37 @@ static void SPEHApplyOpenInAppJS(id webView)
 				return;
 			}
 			NSString *r = [result isKindOfClass:[NSString class]] ? (NSString *)result : nil;
-			if (!SPEHProbeEnabled()) return;
-			if (!r || [r isEqualToString:@"meta=0 el=0"]) {
-				SPEHLog(@"[openinapp] JS 已执行，本页无可清理浮层/meta");
-				return;
-			}
+			if (!r || [r isEqualToString:@"meta=0 el=0"]) return;   // 没啥可清，不刷日志
 			SPEHLog(@"[openinapp] 清理结果 %@", r);
 		}];
 	} @catch (NSException *e) { }
+}
+
+// 文档开始阶段就执行同一段 JS：Safari 是「解析 HTML 时」读 apple-itunes-app 的，
+// 0.8s 后才跑等于晚了一步（GitHub 横幅就是这么漏的）。文档开始注入才拦得住。
+static void SPEHAddDocumentStartScript(id webView)
+{
+	if (!webView) return;
+	static char kDocScript;
+	if (objc_getAssociatedObject(webView, &kDocScript)) return;
+	objc_setAssociatedObject(webView, &kDocScript, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+	@try {
+		Class usCls = NSClassFromString(@"WKUserScript");
+		if (!usCls) return;
+		id cfg = [webView valueForKey:@"configuration"];
+		id ucc = [cfg valueForKey:@"userContentController"];
+		if (!ucc) return;
+
+		id script = [[usCls alloc] initWithSource:SPEHOpenInAppJS()
+									 injectionTime:0            // WKUserScriptInjectionTimeAtDocumentStart
+								  forMainFrameOnly:NO];
+		if (!script) return;
+		[ucc addUserScript:script];
+		SPEHLog(@"[openinapp] 已注入文档开始脚本");
+	} @catch (NSException *e) {
+		SPEHLog(@"[openinapp] 文档开始脚本注入失败 %@", e.reason);
+	}
 }
 
 // Smart App Banner 原生 view：运行时按类名找，统一挂 didMoveToWindow
@@ -662,6 +685,53 @@ static void SPEHDumpBannerCandidates(UIView *anchor)
 
 static IMP gOrigSetAppBanner = NULL;
 static IMP gOrigSetStoreBannersDisabled = NULL;
+static IMP gOrigSetAppSuggestionBanner = NULL;
+static IMP gOrigDidFindAppBanner = NULL;
+
+// 按类名拆「页面顶部横幅」视图。
+// 0.6.2 日志的视图树证明：横幅不是 TabDocument 的属性渲染，而是挂在
+// MobileSafariWindow 下面的一层 view（框在页面顶部），所以吞 setter 有可能吞不到，
+// 必须再加一层「见到就拆」。
+static int SPEHKillBannerViews(UIView *v, int depth, CGRect winRect)
+{
+	if (!v || depth > 9) return 0;
+	int killed = 0;
+
+	NSString *cls = NSStringFromClass(object_getClass(v));
+	BOOL looks = ([cls rangeOfString:@"Banner"].location != NSNotFound ||
+				  [cls rangeOfString:@"AppLink"].location != NSNotFound);
+	if (looks) {
+		CGRect inWindow = v.bounds;
+		@try {
+			UIView *win = v.window;
+			if (win) inWindow = [v convertRect:v.bounds toView:win];
+		} @catch (NSException *e) { }
+		// 只打「页面顶部、条状、不占满屏」的横幅，避免误伤其它同名视图
+		if (inWindow.size.height > 20 && inWindow.size.height <= 240 &&
+			inWindow.origin.y < winRect.size.height * 0.45) {
+			@try {
+				v.hidden = YES;
+				[v removeFromSuperview];
+			} @catch (NSException *e) { }
+			SPEHLog(@"[smartbanner] 拆除视图 %@ rect=%@", cls, NSStringFromCGRect(inWindow));
+			return 1;
+		}
+	}
+
+	for (UIView *s in [v subviews]) killed += SPEHKillBannerViews(s, depth + 1, winRect);
+	return killed;
+}
+
+static void SPEHSweepBannerViews(UIView *anchor, NSString *tag)
+{
+	if (!anchor) return;
+	UIView *root = anchor.window ?: anchor;
+	if (!root) return;
+	@try {
+		int n = SPEHKillBannerViews(root, 0, root.bounds);
+		if (n > 0) SPEHLog(@"[smartbanner] %@ 共拆除 %d 个横幅视图", tag, n);
+	} @catch (NSException *e) { }
+}
 
 static void SPEHSetAppBannerHook(id self, SEL _cmd, id banner)
 {
@@ -669,6 +739,24 @@ static void SPEHSetAppBannerHook(id self, SEL _cmd, id banner)
 		SPEHLog(@"[smartbanner] 拦截 setAppBanner: 丢弃 %@", NSStringFromClass(object_getClass(banner)));
 	}
 	// 不转发：banner 永远进不了 TabDocument
+}
+
+static void SPEHSetAppSuggestionBannerHook(id self, SEL _cmd, id banner, BOOL pinned)
+{
+	if (SPEHProbeEnabled()) {
+		SPEHLog(@"[smartbanner] 拦截 setAppSuggestionBanner:isPinned: 丢弃 %@",
+				banner ? NSStringFromClass(object_getClass(banner)) : @"(nil)");
+	}
+	// 不转发
+}
+
+static void SPEHDidFindAppBannerHook(id self, SEL _cmd, id content)
+{
+	// 不转发：Safari 认为「没发现 app banner」，不会再建视图
+	if (SPEHProbeEnabled()) {
+		SPEHLog(@"[smartbanner] 拦截 didFindAppBannerWithContent: 丢弃 %@",
+				content ? NSStringFromClass(object_getClass(content)) : @"(nil)");
+	}
 }
 
 static void SPEHSetStoreBannersDisabledHook(id self, SEL _cmd, BOOL value)
@@ -686,11 +774,17 @@ static void SPEHInstallSmartAppBannerPreciseHooks(void)
 
 	SPEHPatchInstanceMethod(tabCls, NSSelectorFromString(@"setAppBanner:"),
 		(IMP)SPEHSetAppBannerHook, &gOrigSetAppBanner);
+	SPEHPatchInstanceMethod(tabCls, NSSelectorFromString(@"setAppSuggestionBanner:isPinned:"),
+		(IMP)SPEHSetAppSuggestionBannerHook, &gOrigSetAppSuggestionBanner);
+	SPEHPatchInstanceMethod(tabCls, NSSelectorFromString(@"didFindAppBannerWithContent:"),
+		(IMP)SPEHDidFindAppBannerHook, &gOrigDidFindAppBanner);
 	SPEHPatchInstanceMethod(tabCls, NSSelectorFromString(@"setStoreBannersAreDisabled:"),
 		(IMP)SPEHSetStoreBannersDisabledHook, &gOrigSetStoreBannersDisabled);
 
-	SPEHLog(@"[smartbanner] 精准 hook setAppBanner=%s setStoreBannersAreDisabled=%s",
+	SPEHLog(@"[smartbanner] 精准 hook setAppBanner=%s setAppSuggestionBanner=%s didFindAppBanner=%s storeDisabled=%s",
 			gOrigSetAppBanner ? "ok" : "missing",
+			gOrigSetAppSuggestionBanner ? "ok" : "missing",
+			gOrigDidFindAppBanner ? "ok" : "missing",
 			gOrigSetStoreBannersDisabled ? "ok" : "missing");
 }
 
@@ -715,16 +809,29 @@ static void SPEHWVDidMoveToWindowHook(UIView *self, SEL _cmd)
 	if (first) {
 		// 原生接口 / 探针只在每个 webView 首次挂载时跑一次，不参与日常滚动
 		SPEHApplyProcessPoolCache(self);
-		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-			dispatch_get_main_queue(), ^{
-				SPEHNeutralizeURLBarSwipe(weakSelf, @"首次挂载");
-			});
+		SPEHAddDocumentStartScript(self);
 		if (SPEHProbeEnabled()) {
 			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
 				dispatch_get_main_queue(), ^{
 					SPEHDumpBannerCandidates(weakSelf);
 				});
 		}
+	}
+
+	// 横幅视图清扫：三个时间点，横幅有时在页面加载完后才插进来
+	for (NSNumber *d in @[ @1.0, @2.5, @4.0 ]) {
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
+			dispatch_get_main_queue(), ^{
+				SPEHSweepBannerViews(weakSelf, [NSString stringWithFormat:@"%@s", d]);
+			});
+	}
+
+	// 条状手势禁用：每次挂载都跑（标签栏会重建），两个时间点兜住懒加载出来的视图
+	for (NSNumber *d in @[ @1.2, @3.5 ]) {
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
+			dispatch_get_main_queue(), ^{
+				SPEHNeutralizeURLBarSwipe(weakSelf, [NSString stringWithFormat:@"%@s", d]);
+			});
 	}
 
 	NSArray *delays = @[ @0.8, @2.5, @5.0 ];
@@ -847,6 +954,67 @@ static BOOL SPEHLSOpenSensitiveHook(id self, SEL _cmd, NSURL *url, NSDictionary 
 	return NO;
 }
 
+// 0.6.2 日志实证：4 条 URL 拦截 hook 全 ok 但零命中 → Safari 打开 App 走的不是这些。
+// 补三条更底层的路径：
+//   ① -[LSApplicationWorkspace openApplicationWithBundleID:]  ← 最终启动 App 的那一步
+//   ② -[LSApplicationWorkspace openSensitiveURL:withOptions:error:]（3 参带 error）
+//   ③ -[LSAppLink openWithCompletionHandler:]  ← universal link（apps.apple.com 走这条）
+static IMP gOrigOpenAppByBundle = NULL;
+static IMP gOrigLSOpenSensitive3 = NULL;
+static IMP gOrigAppLinkOpen = NULL;
+static IMP gOrigAppLinkOpenStrategy = NULL;
+
+static BOOL SPEHBundleIsAppStore(NSString *bundleID)
+{
+	if (!bundleID.length) return NO;
+	NSString *b = bundleID.lowercaseString;
+	return ([b hasPrefix:@"com.apple.appstore"] ||
+			[b hasPrefix:@"com.apple.store"] ||
+			[b containsString:@"appstore"]);
+}
+
+static BOOL SPEHOpenAppByBundleHook(id self, SEL _cmd, NSString *bundleID)
+{
+	if (SPEHAppStoreKillEnabled() && SPEHBundleIsAppStore(bundleID)) {
+		SPEHLog(@"[appstore] 拦截启动 App bundle=%@", bundleID);
+		SPEHShowToast(@"已拦截跳转 App Store");
+		return NO;
+	}
+	if (gOrigOpenAppByBundle) {
+		return ((BOOL (*)(id, SEL, NSString *))gOrigOpenAppByBundle)(self, _cmd, bundleID);
+	}
+	return NO;
+}
+
+static BOOL SPEHLSOpenSensitive3Hook(id self, SEL _cmd, NSURL *url, NSDictionary *options, NSError **error)
+{
+	if (SPEHAppStoreKillEnabled() && SPEHURLTargetsAppStore(url)) {
+		SPEHLog(@"[appstore] 拦截 LaunchServices(sensitive3) %@", url.absoluteString);
+		SPEHShowToast(@"已拦截跳转 App Store");
+		return NO;
+	}
+	if (gOrigLSOpenSensitive3) {
+		return ((BOOL (*)(id, SEL, NSURL *, NSDictionary *, NSError **))gOrigLSOpenSensitive3)(self, _cmd, url, options, error);
+	}
+	return NO;
+}
+
+static void SPEHAppLinkOpenHook(id self, SEL _cmd, id completion)
+{
+	if (SPEHAppStoreKillEnabled()) {
+		NSString *desc = @"";
+		@try { desc = [[self valueForKey:@"URL"] absoluteString] ?: @""; } @catch (NSException *e) { }
+		SPEHLog(@"[appstore] 拦截 LSAppLink 打开 %@", desc.length ? desc : @"(unknown)");
+		SPEHShowToast(@"已拦截打开外部 App");
+		if (completion) {
+			void (^cb)(BOOL, NSError *) = completion;
+			@try { cb(NO, nil); } @catch (NSException *e) { }
+		}
+		return;
+	}
+	if (gOrigAppLinkOpen) ((void (*)(id, SEL, id))gOrigAppLinkOpen)(self, _cmd, completion);
+}
+
 static void SPEHInstallAppStoreHooks(void)
 {
 	if (!SPEHAppStoreKillEnabled()) { SPEHLog(@"[appstore] disabled by prefs"); return; }
@@ -866,14 +1034,27 @@ static void SPEHInstallAppStoreHooks(void)
 			(IMP)SPEHLSOpen3Hook, &gOrigLSOpen3);
 		SPEHPatchInstanceMethod(lsCls, NSSelectorFromString(@"openSensitiveURL:withOptions:"),
 			(IMP)SPEHLSOpenSensitiveHook, &gOrigLSOpenSensitive);
+		SPEHPatchInstanceMethod(lsCls, NSSelectorFromString(@"openSensitiveURL:withOptions:error:"),
+			(IMP)SPEHLSOpenSensitive3Hook, &gOrigLSOpenSensitive3);
+		SPEHPatchInstanceMethod(lsCls, NSSelectorFromString(@"openApplicationWithBundleID:"),
+			(IMP)SPEHOpenAppByBundleHook, &gOrigOpenAppByBundle);
 	}
 
-	SPEHLog(@"[appstore] hooks optionsHandler=%s legacyOpenURL=%s ls2=%s ls3=%s lssensitive=%s",
+	Class appLinkCls = NSClassFromString(@"LSAppLink");
+	if (appLinkCls) {
+		SPEHPatchInstanceMethod(appLinkCls, NSSelectorFromString(@"openWithCompletionHandler:"),
+			(IMP)SPEHAppLinkOpenHook, &gOrigAppLinkOpen);
+	}
+
+	SPEHLog(@"[appstore] hooks optionsHandler=%s legacyOpenURL=%s ls2=%s ls3=%s lssensitive=%s sensitive3=%s openAppBundle=%s appLink=%s",
 			gOrigOpenURLOptions ? "ok" : "FAILED",
 			gOrigOpenURL ? "ok" : "FAILED",
 			gOrigLSWorkspaceOpen ? "ok" : "missing",
 			gOrigLSOpen3 ? "ok" : "missing",
-			gOrigLSOpenSensitive ? "ok" : "missing");
+			gOrigLSOpenSensitive ? "ok" : "missing",
+			gOrigLSOpenSensitive3 ? "ok" : "missing",
+			gOrigOpenAppByBundle ? "ok" : "missing",
+			gOrigAppLinkOpen ? "ok" : "missing");
 }
 
 // MARK: - 返回缓存：WKProcessPool 原生接口探针
@@ -1195,35 +1376,63 @@ static void SPEHInstallURLBarSwipeHooks(void)
 // 找到胶囊栏，把它所有 pan 打上标记；之后 setTranslation 里只吃掉横向分量，
 // 纵向（上拉展开标签页网格）不受影响。
 
-static int SPEHTagCapsulePans(UIView *v, int depth, int found)
-{
-	if (!v || depth > 6) return found;
+// 找到胶囊栏/底部工具条，直接把「横滑切页」那颗手势本体掐死。
+// 0.6.2 日志实证：标记了 7 个 pan，但 setTranslation:inView: 一条都没触发
+// → 真正处理横滑的是 UIScrollView 自己的 _UIScrollViewPanGestureRecognizer
+//   （子类重写了 setTranslation，父类 hook 拦不到），或者根本不走 setTranslation。
+// 所以改成两手：① 带横向翻页能力的 scrollView 直接 scrollEnabled=NO
+//              ② 条状视图上的 pan/swipe 手势 enabled=NO（它就是切页那一颗）
 
+static int gKilledRecognizers = 0;
+
+static BOOL SPEHBarAreaView(UIView *v, CGFloat winH)
+{
+	if (!v) return NO;
 	NSString *cls = NSStringFromClass(object_getClass(v));
-	BOOL hit = ([cls rangeOfString:@"SFCapsule"].location != NSNotFound ||
-				[cls rangeOfString:@"SFUnifiedBar"].location != NSNotFound);
-	if (hit) {
-		found++;
-		if (SPEHBoolPref(@"urlBarSwipeHardMode", NO) && [v respondsToSelector:@selector(setScrollEnabled:)]) {
-			@try { [(id)v setScrollEnabled:NO]; } @catch (NSException *e) { }
+	if ([cls rangeOfString:@"SFCapsule"].location != NSNotFound) return YES;
+	if ([cls rangeOfString:@"SFUnifiedBar"].location != NSNotFound) return YES;
+	if ([cls rangeOfString:@"SFUnifiedTabBar"].location != NSNotFound) return YES;
+	if ([cls isEqualToString:@"BrowserToolbar"]) return YES;
+
+	// 兜底按位置判定：贴着屏幕底部、高度像一条工具栏
+	CGRect f = v.frame;
+	if (f.size.height > 0 && f.size.height <= 140 && f.origin.y >= winH - 200) return YES;
+	return NO;
+}
+
+static void SPEHKillBarSwipes(UIView *v, CGFloat winH, int depth)
+{
+	if (!v || depth > 8) return;
+
+	if (SPEHBarAreaView(v, winH)) {
+		NSString *cls = NSStringFromClass(object_getClass(v));
+
+		// ① 能横向翻页的 scrollView：直接关掉滚动
+		if ([v isKindOfClass:[UIScrollView class]]) {
+			UIScrollView *sv = (UIScrollView *)v;
+			if (sv.contentSize.width > sv.bounds.size.width * 1.15 && sv.scrollEnabled) {
+				sv.scrollEnabled = NO;
+				SPEHLog(@"[urlswipe] 关闭横向滚动 %@ contentW=%.0f boundsW=%.0f",
+						cls, sv.contentSize.width, sv.bounds.size.width);
+			}
 		}
-		@try {
-			if ([v respondsToSelector:@selector(panGestureRecognizer)]) {
-				id pan = [(id)v panGestureRecognizer];
-				if (pan) objc_setAssociatedObject(pan, &kCapsulePanTag, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+		// ② 条状视图上的 pan / swipe：本体禁用
+		NSArray *grs = nil;
+		@try { grs = [v gestureRecognizers]; } @catch (NSException *e) { }
+		for (UIGestureRecognizer *g in grs) {
+			if (!([g isKindOfClass:[UIPanGestureRecognizer class]] ||
+				  [g isKindOfClass:[UISwipeGestureRecognizer class]])) continue;
+			if (!g.enabled) continue;
+			g.enabled = NO;
+			gKilledRecognizers++;
+			if (SPEHProbeEnabled() && gKilledRecognizers <= 30) {
+				SPEHLog(@"[urlswipe] 禁用 %@ on %@", NSStringFromClass(object_getClass(g)), cls);
 			}
-			if ([v respondsToSelector:@selector(gestureRecognizers)]) {
-				for (UIGestureRecognizer *g in [(id)v gestureRecognizers]) {
-					if ([g isKindOfClass:[UIPanGestureRecognizer class]]) {
-						objc_setAssociatedObject(g, &kCapsulePanTag, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-					}
-				}
-			}
-		} @catch (NSException *e) { }
+		}
 	}
 
-	for (UIView *s in [v subviews]) found = SPEHTagCapsulePans(s, depth + 1, found);
-	return found;
+	for (UIView *s in [v subviews]) SPEHKillBarSwipes(s, winH, depth + 1);
 }
 
 static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
@@ -1231,15 +1440,17 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 	if (!anchor || !SPEHURLBarSwipeKillEnabled()) return;
 	UIView *root = anchor.window ?: anchor;
 	@try {
-		int n = SPEHTagCapsulePans(root, 0, 0);
+		CGFloat winH = root.bounds.size.height;
+		gKilledRecognizers = 0;
+		SPEHKillBarSwipes(root, winH, 0);
+
 		static NSMutableSet *seen = nil;
 		static dispatch_once_t once;
 		dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
-		NSString *key = [NSString stringWithFormat:@"%@|%d", tag, n];
-		if (SPEHProbeEnabled() && ![seen containsObject:key]) {
+		NSString *key = [NSString stringWithFormat:@"%@|%d", tag, gKilledRecognizers];
+		if (SPEHProbeEnabled() && ![seen containsObject:key] && seen.count < 12) {
 			[seen addObject:key];
-			SPEHLog(@"[urlswipe] %@ 标记胶囊 pan %d 个（hardMode=%d）", tag, n,
-					SPEHBoolPref(@"urlBarSwipeHardMode", NO));
+			SPEHLog(@"[urlswipe] %@ 禁用条状手势 %d 个", tag, gKilledRecognizers);
 		}
 	} @catch (NSException *e) { }
 }

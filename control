@@ -1,6 +1,6 @@
 Package: com.huhansibuxin.safari16enhance
 Name: Safari16Enhance
-Version: 0.6.2
+Version: 0.7.0
 Architecture: iphoneos-arm64
 Description: Safari 双功能增强（独立实现，非 SafariPlus / 非 SafariX）。① 自定义默认搜索引擎：注入自建 SearchEngineInfo 并强制 defaultSearchEngine 返回它，内置元宝搜索 https://so.qq.com/isearch?query={searchTerms}（免登录可用），可在设置里改成任意 URL 模板。② 拦截「Safari 打不开该网页」强制弹窗：hook UIViewController 的 presentViewController，命中错误文案即丢弃并改成底部 toast，不再强制点「好」阻断操作。③ 运行时探针（可关）：dump 搜索引擎相关类/方法、记录每次弹窗文案与发起类，用于 iOS 版本适配。日志固定写入 Safari 自身容器 Documents/Safari16Enhance.log（多级路径兜底 + 真实写入校验，超 2MB 自动轮转）。
 Maintainer: huhansibuxin
