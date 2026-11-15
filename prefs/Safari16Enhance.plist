@@ -90,6 +90,13 @@
 			default = YES;
 		},
 		{
+			cell = PSSwitchCell;
+			label = "返回后抑制多余重载";
+			defaults = "com.huhansibuxin.safari16enhance";
+			key = "blockReloadOnBack";
+			default = YES;
+		},
+		{
 			cell = PSGroupCell;
 			label = "诊断探针";
 			footerText = "日志固定写入 Safari 容器：<容器>/Documents/Safari16Enhance.log，启动时打印实际路径。功能确认正常后可关闭。";
@@ -104,7 +111,7 @@
 		{
 			cell = PSGroupCell;
 			label = "功能说明";
-			footerText = "1. 自定义搜索引擎：注入自建 SearchEngineInfo 并强制作为默认引擎（默认元宝搜索）。\n2. 弹窗拦截：命中「打不开该网页 / 网址无效 / 地址无效」等文案即拦截，改 toast。\n3. 阅读器击杀：白名单精准命中 3 个已实测确认的可用性判定，压成 NO；可选深度扫描兜底。\n4. 返回缓存：尝试打开 WebKit 的 back/forward cache，iOS 16 若无对应 SPI 会记录在日志里。\n5. 探针：记录 alert 创建/呈现链路、视图层弹窗真实类名、Reader 命中清单、bfcache 候选 dump。\n\n日志：容器 Documents/Safari16Enhance.log（超 2MB 轮转为 .1）。";
+			footerText = "1. 自定义搜索引擎：注入自建 SearchEngineInfo 并强制作为默认引擎（默认元宝搜索）。\n2. 弹窗拦截：Safari 自绘的 SFDialogView（打不开该网页 / 网址无效）按文本精准拆除，改 toast；网页自己的 JS 对话框不受影响。\n3. 阅读器击杀：白名单精准命中已实测确认的可用性判定，压成 NO；可选深度扫描兜底。\n4. 返回缓存：iOS 16 的 WKPreferences 无 bfcache 开关（已实测确认），改为在后退窗口内抑制多余 reload。\n5. 探针：记录 SFDialog 文本、alert 链路、Reader 命中清单、bfcache 候选 dump。\n\n日志：容器 Documents/Safari16Enhance.log（超 2MB 轮转为 .1）。";
 		}
 	);
 }

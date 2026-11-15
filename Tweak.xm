@@ -12,13 +12,13 @@
 //   bfcache：0.2.0 dump 出的 WKPreferences 候选 setter 里没有 BackForward 相关，
 //          iOS 16 上不存在 _setBackForwardCacheEnabled: 这类开关 → 换候选名 + 全量 dump 确认。
 //
-// 0.3.0 变更：
-//   1. 阅读器：改为白名单精准命中（只 hook 已实测确认的 3 个方法 + 自动激活管理器），
-//      不再全类名通扫，零误伤、零启动开销
-//   2. 弹窗：加视图层探针 —— hook -[UIView didMoveToWindow] 与 -[UIViewController viewDidAppear:]，
-//      按类名（Alert/Dialog/Prompt/Error）过滤并去重，一定能抓到那个弹窗的真实类名
-//   3. bfcache：候选名扩到 BackForward / PageCache / Snapshot，并对 WKPreferences +
-//      WKWebViewConfiguration 做全量 dump，一次看清 iOS 16 到底有没有这个开关
+// 0.4.0 变更（基于 0.3.0 日志实证）：
+//   1. 弹窗：真身确认是 Safari 自绘的 SFDialogView（挂在 _SFWebView 上），
+//      改 hook -[SFDialogView didMoveToWindow] / layoutSubviews，递归取文本，
+//      只有命中「打不开该网页 / 网址无效」才 removeFromSuperview + toast，不误伤网页 JS 对话框
+//   2. 返回：实测左滑手势返回有缓存、按钮返回重载 → 不是 bfcache 问题，是调用路径多了一次 reload，
+//      改为 goBack/goForward 打开 2 秒窗口，窗口内吞掉 reload / reloadFromOrigin
+//   3. bfcache：确认 iOS 16 WKPreferences 无相关 SPI，dump 改为每类只做一次，避免刷日志
 //
 // 原则：所有 hook 先检查类/方法存在性，返回类型校验，全部 @try 包裹，绝不让 Safari 崩
 
@@ -29,7 +29,7 @@
 #import <substrate.h>
 #import <unistd.h>
 
-#define SPEH_VERSION "0.3.0"
+#define SPEH_VERSION "0.4.0"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -434,22 +434,31 @@ static BOOL SPEHMarkSeen(NSString *cls)
 	return isNew;
 }
 
+static BOOL SPEHTextMatchesError(NSString *text)
+{
+	if (text.length == 0) return NO;
+
+	static NSArray *keywords = nil;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		keywords = @[
+			@"打不开该网页", @"打不开这个网页", @"无法打开该网页", @"无法打开这个网页",
+			@"打不开网页", @"网址无效", @"地址无效", @"无法显示网页", @"找不到服务器",
+			@"cannot open the page", @"can't open the page", @"cannot be opened",
+			@"address is invalid", @"the URL is invalid", @"cannot connect"
+		];
+	});
+	for (NSString *kw in keywords) {
+		if ([text rangeOfString:kw options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+	}
+	return NO;
+}
+
 static BOOL SPEHIsTargetErrorAlert(UIAlertController *alert)
 {
 	NSString *title = alert.title ?: @"";
 	NSString *message = alert.message ?: @"";
-	NSString *combined = [title stringByAppendingString:message];
-
-	NSArray *keywords = @[
-		@"打不开该网页", @"打不开这个网页", @"无法打开该网页", @"无法打开这个网页",
-		@"打不开网页", @"网址无效", @"地址无效", @"无法显示网页", @"找不到服务器",
-		@"cannot open the page", @"can't open the page", @"cannot be opened",
-		@"address is invalid", @"the URL is invalid", @"cannot connect"
-	];
-	for (NSString *kw in keywords) {
-		if ([combined rangeOfString:kw options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
-	}
-	return NO;
+	return SPEHTextMatchesError([title stringByAppendingString:message]);
 }
 
 static void SPEHLogAlertContext(UIAlertController *alert, NSString *stage)
@@ -550,6 +559,8 @@ static void SPEHUIViewDidMoveToWindowHook(UIView *self, SEL _cmd)
 
 	const char *name = class_getName(object_getClass(self));
 	if (!SPEHClassNameLooksLikeAlert(name)) return;
+	// SFDialog* 由专用模块处理，这里不重复记
+	if (strncmp(name, "SFDialog", 8) == 0) return;
 
 	NSString *cls = [NSString stringWithUTF8String:name];
 	if (!SPEHMarkSeen(cls)) return;
@@ -623,6 +634,121 @@ static void SPEHInstallAlertHooks(void)
 		if ([cls rangeOfString:@"Keyboard" options:NSCaseInsensitiveSearch].location != NSNotFound) return;
 		SPEHLog(@"[probe] window visible class=%@ level=%.0f hidden=%d", cls, w.windowLevel, w.isHidden);
 	}];
+}
+
+// MARK: - SFDialogView 精准击杀（0.3.0 日志实证的真身）
+//
+// 实测证据（13:38:52）：
+//   [alertview] 挂载 class=SFDialogView frame={{0,0},{430,932}}
+//   chain = _SFWebView <- TabDocumentView <- UIScrollView <- SFOrderedContainerView
+// 结论：「Safari 打不开该网页 / 因为网址无效」不是 UIAlertController，
+// 而是 Safari 自绘的 SFDialogView（内含 SFDialogContentView + SFDialogTextView），
+// 直接 addSubview 到 _SFWebView 上，所以 presentViewController / alert 工厂永远抓不到。
+//
+// 处理：只按文本内容精准命中才拆，避免误伤网页自己的 JS alert/confirm/prompt。
+
+static NSString *SPEHCollectDialogText(UIView *v, int depth)
+{
+	if (!v || depth > 8) return @"";
+	NSMutableString *out = [NSMutableString string];
+
+	if ([v isKindOfClass:[UILabel class]]) {
+		NSString *t = ((UILabel *)v).text;
+		if (t.length) [out appendString:t];
+	} else if ([v isKindOfClass:[UITextView class]]) {
+		NSString *t = ((UITextView *)v).text;
+		if (t.length) [out appendString:t];
+	} else if ([v isKindOfClass:[UITextField class]]) {
+		NSString *t = ((UITextField *)v).text;
+		if (t.length) [out appendString:t];
+	}
+
+	for (UIView *sub in v.subviews) {
+		NSString *s = SPEHCollectDialogText(sub, depth + 1);
+		if (s.length) [out appendString:s];
+	}
+	return out;
+}
+
+static char kSFDialogHandledKey;
+static char kSFDialogLastCheckKey;
+
+static void SPEHInspectSFDialog(UIView *dialog)
+{
+	if (!dialog) return;
+	if (!SPEHAlertSuppressEnabled()) return;
+	if (objc_getAssociatedObject(dialog, &kSFDialogHandledKey)) return;
+
+	// 节流：同一对话框 0.25s 内只检查一次
+	NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+	NSNumber *last = objc_getAssociatedObject(dialog, &kSFDialogLastCheckKey);
+	if (last && (now - last.doubleValue) < 0.25) return;
+	objc_setAssociatedObject(dialog, &kSFDialogLastCheckKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+	NSString *text = SPEHCollectDialogText(dialog, 0);
+	if (text.length == 0) return;
+
+	if (!SPEHTextMatchesError(text)) {
+		// 不是目标对话框：只记一次，便于确认没有误伤网页自己的 JS 弹窗
+		static char kLoggedKey;
+		if (!objc_getAssociatedObject(dialog, &kLoggedKey)) {
+			objc_setAssociatedObject(dialog, &kLoggedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+			if (SPEHProbeEnabled()) SPEHLog(@"[sfdialog] 放行（非目标）text=%@", text);
+		}
+		return;
+	}
+
+	objc_setAssociatedObject(dialog, &kSFDialogHandledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+	SPEHLog(@"[sfdialog] 精准命中并拆除 class=%@ text=%@ frame=%@", NSStringFromClass([dialog class]), text, NSStringFromCGRect(dialog.frame));
+
+	@try { [dialog removeFromSuperview]; } @catch (NSException *e) { }
+	SPEHShowToast(@"网页无法打开");
+}
+
+static IMP gOrigSFDialogDidMoveToWindow = NULL;
+static IMP gOrigSFDialogLayoutSubviews = NULL;
+
+static void SPEHSFDialogDidMoveToWindowHook(UIView *self, SEL _cmd)
+{
+	if (gOrigSFDialogDidMoveToWindow) ((void (*)(id, SEL))gOrigSFDialogDidMoveToWindow)(self, _cmd);
+	if (!self.window) return;
+	// 文本常在挂载后才写入，延迟一次再判
+	__weak UIView *weakSelf = self;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+		SPEHInspectSFDialog(weakSelf);
+	});
+}
+
+static void SPEHSFDialogLayoutSubviewsHook(UIView *self, SEL _cmd)
+{
+	if (gOrigSFDialogLayoutSubviews) ((void (*)(id, SEL))gOrigSFDialogLayoutSubviews)(self, _cmd);
+	if (!self.window) return;
+	SPEHInspectSFDialog(self);
+}
+
+static void SPEHInstallSFDialogHooks(void)
+{
+	if (!SPEHAlertSuppressEnabled()) { SPEHLog(@"[sfdialog] disabled by prefs"); return; }
+
+	Class cls = NSClassFromString(@"SFDialogView");
+	if (!cls) {
+		// 兜底：运行时按名字找
+		unsigned int count = 0;
+		Class *classes = objc_copyClassList(&count);
+		for (unsigned int i = 0; i < count; i++) {
+			const char *nm = class_getName(classes[i]);
+			if (nm && strcmp(nm, "SFDialogView") == 0) { cls = classes[i]; break; }
+		}
+		free(classes);
+	}
+	if (!cls) { SPEHLog(@"[sfdialog] SFDialogView 未找到"); return; }
+
+	SPEHPatchInstanceMethod(cls, @selector(didMoveToWindow), (IMP)SPEHSFDialogDidMoveToWindowHook, &gOrigSFDialogDidMoveToWindow);
+	SPEHPatchInstanceMethod(cls, @selector(layoutSubviews), (IMP)SPEHSFDialogLayoutSubviewsHook, &gOrigSFDialogLayoutSubviews);
+
+	SPEHLog(@"[sfdialog] hooks didMoveToWindow=%s layoutSubviews=%s",
+			gOrigSFDialogDidMoveToWindow ? "ok" : "FAILED",
+			gOrigSFDialogLayoutSubviews ? "ok" : "FAILED");
 }
 
 // MARK: - 阅读器击杀（白名单精准命中）
@@ -705,9 +831,10 @@ static void SPEHInstallReaderHooks(void)
 
 // MARK: - 返回不重新加载（bfcache）
 //
-// 0.2.0 实测：WKPreferences 上不存在任何 *BackForward* setter。
-// 0.3.0 扩大候选名 + 全量 dump WKPreferences / WKWebViewConfiguration 上与缓存相关的方法，
-// 一次看清 iOS 16 有没有这个开关；有就直接开，没有就如实记录无解。
+// 0.3.0 实测：WKPreferences 上不存在任何 *BackForward* setter。
+// 0.4.0 追加实测（用户体感）：左滑手势返回有缓存、按钮返回仍重载
+//   → 说明页面本身还在内存里，差别只在调用路径：按钮返回额外触发了一次 reload。
+//   → 对策：后退窗口期内吞掉 reload/reloadFromOrigin，让导航自己走完。
 
 static void SPEHDumpCacheRelated(id obj, NSString *tag)
 {
@@ -792,7 +919,15 @@ static void SPEHEnableBFCache(id prefs)
 	objc_setAssociatedObject(prefs, &kMarker, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
 	int applied = SPEHTryCacheSetters(prefs);
-	if (applied == 0) SPEHDumpCacheRelated(prefs, @"preferences");
+	if (applied == 0) {
+		// 同一类只 dump 一次，避免每次 setPreferences 都刷日志、白跑一遍方法遍历
+		static char kDumpedMarker;
+		NSString *clsName = NSStringFromClass(object_getClass(prefs));
+		if (!objc_getAssociatedObject(clsName, &kDumpedMarker)) {
+			objc_setAssociatedObject(clsName, &kDumpedMarker, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+			SPEHDumpCacheRelated(prefs, @"preferences");
+		}
+	}
 }
 
 static IMP gOrigSetPreferences = NULL;
@@ -829,6 +964,8 @@ static void SPEHSetConfigurationHook(id self, SEL _cmd, id cfg)
 	if (applied == 0) SPEHDumpCacheRelated(cfg, @"WKWebViewConfiguration");
 }
 
+static void SPEHInstallBackNavigationHooks(void);
+
 static void SPEHInstallBFCacheHooks(void)
 {
 	if (!SPEHBFCacheEnabled()) { SPEHLog(@"[bfcache] disabled by prefs"); return; }
@@ -840,11 +977,115 @@ static void SPEHInstallBFCacheHooks(void)
 	SPEHPatchInstanceMethod(cfgCls, NSSelectorFromString(@"preferences"), (IMP)SPEHPreferencesGetterHook, &gOrigPreferencesGetter);
 
 	Class wkCls = NSClassFromString(@"WKWebView");
-	SPEHPatchInstanceMethod(wkCls, NSSelectorFromString(@"setConfiguration:"), (IMP)SPEHSetConfigurationHook, &gOrigSetConfiguration);
+	SPEHPatchInstanceMethod(wkCls, NSSelectorFromString(@"_setConfiguration:"), (IMP)SPEHSetConfigurationHook, &gOrigSetConfiguration);
 
-	SPEHLog(@"[bfcache] hooks setPreferences=%s preferences=%s setConfiguration=%s",
+	SPEHLog(@"[bfcache] hooks setPreferences=%s preferences=%s _setConfiguration=%s",
 			gOrigSetPreferences ? "ok" : "FAILED", gOrigPreferencesGetter ? "ok" : "FAILED",
 			gOrigSetConfiguration ? "ok" : "FAILED");
+
+	SPEHInstallBackNavigationHooks();
+}
+
+// MARK: - 后退不重载（0.4.0）
+//
+// 用户实测：左滑手势返回不重载、按钮返回重载 → 差别在调用路径，不是 bfcache。
+// 做法：goBack/goForward 打开一个 2 秒窗口，窗口内把 reload / reloadFromOrigin 吞掉。
+
+static NSTimeInterval gBackNavWindowUntil = 0;
+static IMP gOrigWKGoBack = NULL;
+static IMP gOrigWKGoForward = NULL;
+static IMP gOrigWKReload = NULL;
+static IMP gOrigWKReloadFromOrigin = NULL;
+
+static NSString *SPEHBackItemURL(id webView)
+{
+	NSString *url = @"-";
+	@try {
+		id list = [webView valueForKey:@"backForwardList"];
+		if (!list) return url;
+		id item = [list valueForKey:@"backItem"];
+		if (!item) return url;
+		id u = [item valueForKey:@"URL"];
+		if ([u isKindOfClass:[NSURL class]]) url = [(NSURL *)u absoluteString] ?: @"-";
+	} @catch (NSException *e) { }
+	return url;
+}
+
+static void SPEHOpenBackWindow(NSString *why, NSString *target)
+{
+	gBackNavWindowUntil = [NSDate timeIntervalSinceReferenceDate] + 2.0;
+	SPEHLog(@"[backnav] 打开窗口 why=%@ target=%@", why, target);
+}
+
+static void SPEHWKGoBackHook(id self, SEL _cmd)
+{
+	SPEHOpenBackWindow(@"goBack", SPEHBackItemURL(self));
+	if (gOrigWKGoBack) ((void (*)(id, SEL))gOrigWKGoBack)(self, _cmd);
+}
+
+static void SPEHWKGoForwardHook(id self, SEL _cmd)
+{
+	SPEHOpenBackWindow(@"goForward", @"-");
+	if (gOrigWKGoForward) ((void (*)(id, SEL))gOrigWKGoForward)(self, _cmd);
+}
+
+static BOOL SPEHShouldSwallowReload(void)
+{
+	if (!SPEHBoolPref(@"blockReloadOnBack", YES)) return NO;
+	return gBackNavWindowUntil > [NSDate timeIntervalSinceReferenceDate];
+}
+
+static void SPEHWKReloadHook(id self, SEL _cmd)
+{
+	if (SPEHShouldSwallowReload()) {
+		SPEHLog(@"[backnav] 后退窗口内吞掉 reload，避免重新加载");
+		return;
+	}
+	if (gOrigWKReload) ((void (*)(id, SEL))gOrigWKReload)(self, _cmd);
+}
+
+static void SPEHWKReloadFromOriginHook(id self, SEL _cmd)
+{
+	if (SPEHShouldSwallowReload()) {
+		SPEHLog(@"[backnav] 后退窗口内吞掉 reloadFromOrigin，避免重新加载");
+		return;
+	}
+	if (gOrigWKReloadFromOrigin) ((void (*)(id, SEL))gOrigWKReloadFromOrigin)(self, _cmd);
+}
+
+static void SPEHInstallBackNavigationHooks(void)
+{
+	Class wkCls = NSClassFromString(@"WKWebView");
+	if (!wkCls) { SPEHLog(@"[backnav] WKWebView 未加载"); return; }
+
+	SPEHPatchInstanceMethod(wkCls, NSSelectorFromString(@"goBack"), (IMP)SPEHWKGoBackHook, &gOrigWKGoBack);
+	SPEHPatchInstanceMethod(wkCls, NSSelectorFromString(@"goForward"), (IMP)SPEHWKGoForwardHook, &gOrigWKGoForward);
+	SPEHPatchInstanceMethod(wkCls, NSSelectorFromString(@"reload"), (IMP)SPEHWKReloadHook, &gOrigWKReload);
+	SPEHPatchInstanceMethod(wkCls, NSSelectorFromString(@"reloadFromOrigin"), (IMP)SPEHWKReloadFromOriginHook, &gOrigWKReloadFromOrigin);
+
+	// Safari 自己的 webview 子类可能 override 这些，逐个补
+	NSArray *subclassNames = @[ @"_SFWebView", @"SFWebView" ];
+	for (NSString *name in subclassNames) {
+		Class sub = NSClassFromString(name);
+		if (!sub) continue;
+		unsigned int n = 0;
+		Method *ms = class_copyMethodList(sub, &n);
+		for (unsigned int i = 0; i < n; i++) {
+			NSString *s = NSStringFromSelector(method_getName(ms[i]));
+			if ([s isEqualToString:@"goBack"]) {
+				SPEHPatchInstanceMethod(sub, NSSelectorFromString(s), (IMP)SPEHWKGoBackHook, NULL);
+			} else if ([s isEqualToString:@"reload"]) {
+				SPEHPatchInstanceMethod(sub, NSSelectorFromString(s), (IMP)SPEHWKReloadHook, NULL);
+			} else if ([s isEqualToString:@"reloadFromOrigin"]) {
+				SPEHPatchInstanceMethod(sub, NSSelectorFromString(s), (IMP)SPEHWKReloadFromOriginHook, NULL);
+			}
+		}
+		free(ms);
+	}
+
+	SPEHLog(@"[backnav] hooks goBack=%s goForward=%s reload=%s reloadFromOrigin=%s",
+			gOrigWKGoBack ? "ok" : "FAILED", gOrigWKGoForward ? "ok" : "FAILED",
+			gOrigWKReload ? "ok" : "FAILED", gOrigWKReloadFromOrigin ? "ok" : "FAILED");
 }
 
 // MARK: - 入口
@@ -863,6 +1104,7 @@ static void SPEHInstallBFCacheHooks(void)
 				SPEHReaderKillEnabled(), SPEHBFCacheEnabled(), SPEHProbeEnabled());
 
 		SPEHInstallAlertHooks();
+		SPEHInstallSFDialogHooks();
 		SPEHInstallReaderHooks();
 		SPEHInstallBFCacheHooks();
 		SPEHScheduleSearchEngineHookInstall();

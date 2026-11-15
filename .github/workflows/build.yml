@@ -60,13 +60,15 @@ jobs:
           otool -L "$DYLIB"
           STRINGS=$(strings -a "$DYLIB")
           for NEEDLE in \
-            'Safari16Enhance 0.3.0 loaded' \
+            'Safari16Enhance 0.4.0 loaded' \
             'Safari16Enhance.log' \
             'https://so.qq.com/isearch?query={searchTerms}' \
             'SearchEngineController' \
             '_populateSearchEngines' \
             'defaultSearchEngineIfPopulated' \
             'presentViewController:animated:completion:' \
+            'SFDialogView' \
+            'blockReloadOnBack' \
             'SUPPRESSED' \
             'Documents' ; do
             if ! echo "$STRINGS" | grep -qF "$NEEDLE"; then
