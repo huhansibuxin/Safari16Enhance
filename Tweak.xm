@@ -594,8 +594,8 @@ static void SPEHDumpViewTree(UIView *v, int depth, NSMutableString *out, int *bu
 {
 	if (!v || depth > 5 || *budget <= 0) return;
 	const char *nm = class_getName(object_getClass(v));
-	[out appendFormat:@"\n%@%s %@", [[@"" stringByPaddingToLength:(NSUInteger)(depth * 2)
-		withString:@" " startingAtIndex:0] UTF8String], nm, NSStringFromCGRect(v.frame)];
+	NSString *pad = [@"" stringByPaddingToLength:(NSUInteger)(depth * 2) withString:@" " startingAtIndex:0];
+	[out appendFormat:@"\n%@%s %@", pad, nm, NSStringFromCGRect(v.frame)];
 	(*budget)--;
 	NSArray *subs = [v subviews];
 	NSUInteger lim = MIN(subs.count, (NSUInteger)10);
@@ -711,6 +711,9 @@ static void SPEHInstallSmartAppBannerHooks(void)
 }
 
 static IMP gOrigWVDidMoveToWindow = NULL;
+
+// 定义在后文的返回缓存模块里，这里先声明
+static void SPEHApplyProcessPoolCache(id webView);
 
 static void SPEHWVDidMoveToWindowHook(UIView *self, SEL _cmd)
 {
