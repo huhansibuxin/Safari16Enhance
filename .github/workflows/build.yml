@@ -63,19 +63,12 @@ jobs:
           for NEEDLE in \
             "Safari16Enhance $VER loaded" \
             'Safari16Enhance.log' \
-            'https://so.qq.com/isearch?query={searchTerms}' \
-            'SearchEngineController' \
-            '_populateSearchEngines' \
-            'defaultSearchEngineIfPopulated' \
-            'hostEngineName' \
             'SFDialogView' \
             'killOpenInApp' \
             'fixBackScroll' \
             'killAppLinkPrompt' \
             'AppLinkWithURL' \
             'appBanner' \
-            'blockCustomScheme' \
-            'decidePolicyForNavigationAction' \
             'killURLBarSwipe' \
             'didMoveToWindow' \
             'Documents' ; do

@@ -15,47 +15,6 @@
 		},
 		{
 			cell = PSGroupCell;
-			label = "搜索引擎";
-			footerText = "「设置 → Safari → 搜索引擎」由系统设置进程渲染，插件注入的新引擎不会出现在那里，也无法被选中。所以改用槽位替换：把内置的 Ecosia 一栏的搜索地址改写成元宝。设置里选「Ecosia」＝元宝搜索；选 Google / Bing / 百度 就是原样，随时可以自由切换，默认引擎完全交还系统。改动后请上滑杀掉 Safari 再打开。";
-		},
-		{
-			cell = PSSwitchCell;
-			label = "启用（Ecosia 槽位＝元宝）";
-			defaults = "com.huhansibuxin.safari16enhance";
-			key = "customEngineEnabled";
-			default = YES;
-		},
-		{
-			cell = PSTextFieldCell;
-			label = "接管哪个内置引擎";
-			defaults = "com.huhansibuxin.safari16enhance";
-			key = "hostEngineName";
-			default = "Ecosia";
-			placeholder = "Ecosia";
-		},
-		{
-			cell = PSTextFieldCell;
-			label = "引擎名称（仅日志显示）";
-			defaults = "com.huhansibuxin.safari16enhance";
-			key = "customEngineName";
-			default = "元宝搜索";
-			placeholder = "元宝搜索";
-		},
-		{
-			cell = PSTextFieldCell;
-			label = "搜索 URL";
-			defaults = "com.huhansibuxin.safari16enhance";
-			key = "customEngineURL";
-			default = "https://so.qq.com/isearch?query={searchTerms}";
-			placeholder = "https://so.qq.com/isearch?query={searchTerms}";
-		},
-		{
-			cell = PSGroupCell;
-			label = "常用模板（直接复制）";
-			footerText = "元宝　https://so.qq.com/isearch?query={searchTerms}\n百度　https://www.baidu.com/s?wd={searchTerms}\nGoogle　https://www.google.com/search?q={searchTerms}\nBing　https://www.bing.com/search?q={searchTerms}";
-		},
-		{
-			cell = PSGroupCell;
 			label = "弹窗";
 			footerText = "Safari 打不开网页时会弹「打不开该网页 / 因为网址无效」，必须点「好」。开启后按文本精准命中该对话框并拆除，改底部 toast。";
 		},
@@ -76,18 +35,6 @@
 			label = "移除「App 内打开」与 Smart App Banner";
 			defaults = "com.huhansibuxin.safari16enhance";
 			key = "killOpenInApp";
-			default = YES;
-		},
-		{
-			cell = PSGroupCell;
-			label = "在 App 中打开";
-			footerText = "Bing 搜索时底部弹的「继续搜索 / 微软必应 APP 打开 / 浏览器 继续」是网页自己的 JS 去唤起自定义 scheme（如 ms-bing://），Safari 收到未知 scheme 才弹这张卡。开启后：网页发起的非 http/https/tel/mailto/sms scheme 一律在导航决策处 Cancel，同时让 Safari 拿不到 AppLink，「打开」这个选项不会再出现。";
-		},
-		{
-			cell = PSSwitchCell;
-			label = "拦截网页唤起 App（自定义 scheme）";
-			defaults = "com.huhansibuxin.safari16enhance";
-			key = "blockCustomScheme";
 			default = YES;
 		},
 		{
@@ -131,7 +78,7 @@
 		{
 			cell = PSGroupCell;
 			label = "返回";
-			footerText = "iOS 16 的 WebKit 无 bfcache 开关（已实测确认）。开启后：返回时吞掉多余的一次 reload（只吞同 URL，不影响点新链接），并注入 JS 复位页面残留的滚动锁 —— 元宝搜索这类 SPA 页返回后滑不动的根因就在这里。";
+			footerText = "iOS 16 的 WebKit 无 bfcache 开关（已实测确认）。开启后：返回时吞掉多余的一次 reload（只吞同 URL，不影响点新链接），并注入 JS 复位页面残留的滚动锁 —— 部分 SPA 页面返回后滑不动的根因就在这里。";
 		},
 		{
 			cell = PSSwitchCell;
@@ -155,8 +102,16 @@
 		{
 			cell = PSGroupCell;
 			label = "功能说明";
-			footerText = "1. 搜索引擎：把内置 Ecosia 的搜索地址换成元宝（https://so.qq.com/isearch?query=…）。设置里选 Ecosia＝元宝，选别的引擎照常，可自由切换。\n2. 弹窗拦截：只保留精准命中，Safari 自绘的 SFDialogView 按文本拆除，网页自己的 JS 对话框不受影响。\n3. 推广横幅：JS 清网页自绘「App 内打开」浮层 + 用 MutationObserver 见到 apple-itunes-app meta 就删 + 吞掉 TabDocument / BrowserController 的 App Banner 链路。\n4. 阅读器：白名单精准命中已实测确认的可用性判定，压成 NO。\n5. 返回：后退窗口内吞掉多余 reload + JS 复位页面滚动锁。\n6. 在 App 中打开：网页 JS 唤起自定义 scheme（ms-bing:// 等）在 WebKit 导航决策处一律 Cancel，同时让 Safari 拿不到 WBSAppLink，「微软必应 APP 打开 / 浏览器 继续」这类卡片不再出现。
-   （本插件不修改 WKWebView 的 configuration / processPool，避免影响第三方扩展的脚本注入。）\n7. 地址栏手势：禁用底部地址栏上的左右滑动切页，防误触。\n\n日志：容器 Documents/Safari16Enhance.log（超 2MB 轮转为 .1）。";
+			footerText = "1. 弹窗拦截：只保留精准命中，Safari 自绘的 SFDialogView 按文本拆除，网页自己的 JS 对话框不受影响。
+2. 推广横幅：JS 清网页自绘「App 内打开」浮层 + 用 MutationObserver 见到 apple-itunes-app meta 就删 + 吞掉 TabDocument / BrowserController 的 App Banner 链路。
+3. 阅读器：白名单精准命中已实测确认的可用性判定，压成 NO。
+4. 返回：后退窗口内吞掉多余 reload + JS 复位页面滚动锁。
+5. 在 App 中打开：让 Safari 拿不到 WBSAppLink，「微软必应 APP 打开 / 浏览器 继续」这类卡片不再出现。
+6. 地址栏手势：禁用底部地址栏上的左右滑动切页，防误触。
+
+（本插件不修改 WKWebView 的 configuration / processContentController / processPool，也不 hook WebKit 导航决策，避免影响第三方扩展的脚本注入与权限流程。）
+
+日志：容器 Documents/Safari16Enhance.log（超 2MB 轮转为 .1）。";
 		}
 	);
 }

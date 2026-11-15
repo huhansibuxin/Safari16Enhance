@@ -1,20 +1,20 @@
-// Safari16Enhance 0.5.0 - iOS 16 Safari 增强
+// Safari16Enhance 0.9.0 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
-//   引擎：_SFSearchEngineController + _populateSearchEngines，注入自建引擎可用（0.1.0 起稳定）
 //   阅读器：三个真实方法已确认，白名单精准命中有效
 //   弹窗：真身是 Safari 自绘的 SFDialogView（挂在 _SFWebView 上），
 //        不是 UIAlertController、不走 presentViewController —— 0.4.0 按文本精准拆除，实测生效
 //   返回：iOS 16 WKPreferences 无任何 bfcache 开关（已全量 dump 确认），
 //        左滑手势返回有缓存、按钮返回重载 → 差别在调用路径
 //
-// 0.5.0 变更：
-//   1. 只保留精准命中：删除 presentViewController / UIAlertController 工厂 /
-//      viewWillAppear / viewDidAppear / 全局 UIView didMoveToWindow 等宽泛 hook，
-//      全局 view hook 本身也是「返回后滑不动」的重点嫌疑
-//   2. 「App 内打开」：网页自绘浮层用 JS 清（只删 fixed/sticky 小文本节点）
-//   3. Smart App Banner：删 apple-itunes-app meta + 原生 view 层直接拆除（运行时按类名找）
-//   4. 返回后滚动恢复：goBack 后分三个时间点复位 scrollView
+// 0.9.0 变更（教训汇总）：
+//   1. 删除自定义搜索引擎全部代码：设置页引擎列表由 Preferences 进程渲染，
+//      注入进程改不到它；槽位替换虽能用但元宝页面本身卡，老板决定弃用，回归系统默认引擎。
+//   2. 删除「网页唤起 App（自定义 scheme）」全部代码：
+//      在 webView:decidePolicyForNavigationAction:preferences:decisionHandler: 上 hook
+//      并回调 decisionHandler，导致 CFRetain 在 PAC 失效地址上 SIGSEGV（真机 5 份 IPS 实证）。
+//      ⇒ 铁律：**永不 hook WebKit 导航决策类 delegate 并手工回调 decisionHandler**。
+//   3. 保留 AppLink 层（WBSAppLink / LSAppLink 返回 nil），这层只读不回调，安全。
 //
 // 原则：hook 只挂具体类，先查存在性，全部 @try 包裹，绝不让 Safari 崩
 
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.8.2"
+#define SPEH_VERSION "0.9.0"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -152,29 +152,12 @@ static BOOL SPEHBoolPref(NSString *key, BOOL def)
 	return r;
 }
 
-static NSString *SPEHStringPref(NSString *key, NSString *def)
-{
-	CFPropertyListRef v = CFPreferencesCopyAppValue((__bridge CFStringRef)key, CFSTR(SPEH_PREF_DOMAIN_CSTR));
-	if (!v) return def;
-	NSString *r = def;
-	if (CFGetTypeID(v) == CFStringGetTypeID()) r = [(__bridge NSString *)v copy];
-	CFRelease(v);
-	return r;
-}
-
-static NSString *const SPEHDefaultEngineName = @"元宝搜索";
-static NSString *const SPEHDefaultEngineURL  = @"https://so.qq.com/isearch?query={searchTerms}";
-
 static BOOL SPEHEnabled(void)              { return SPEHBoolPref(@"enabled", YES); }
-static BOOL SPEHEngineEnabled(void)        { return SPEHBoolPref(@"customEngineEnabled", YES); }
 static BOOL SPEHDialogKillEnabled(void)    { return SPEHBoolPref(@"suppressErrorAlert", YES); }
 static BOOL SPEHReaderKillEnabled(void)    { return SPEHBoolPref(@"killReader", YES); }
 static BOOL SPEHOpenInAppKillEnabled(void) { return SPEHBoolPref(@"killOpenInApp", YES); }
 static BOOL SPEHBackScrollFixEnabled(void) { return SPEHBoolPref(@"fixBackScroll", YES); }
 static BOOL SPEHProbeEnabled(void)         { return SPEHBoolPref(@"probeEnabled", YES); }
-
-static NSString *SPEHEngineName(void)      { return SPEHStringPref(@"customEngineName", SPEHDefaultEngineName); }
-static NSString *SPEHEngineURL(void)       { return SPEHStringPref(@"customEngineURL", SPEHDefaultEngineURL); }
 
 // MARK: - 通用工具
 
@@ -242,317 +225,6 @@ static void SPEHPatchInstanceMethod(Class cls, SEL sel, IMP newImp, IMP *outOld)
 	Method m = class_getInstanceMethod(cls, sel);
 	if (!m) return;
 	MSHookMessageEx(cls, sel, newImp, outOld);
-}
-
-// MARK: - 搜索引擎（宿主槽位替换：默认元宝 + 仍可在设置里自由切换）
-//
-// 0.7.x 的做法是「新建一个 _SFSearchEngineInfo 塞进 _searchEngines，再 hook
-// defaultSearchEngine 强制返回它」。真机结论：
-//   ① 「设置 → Safari → 搜索引擎」是 Preferences 进程（com.apple.Preferences）渲染的，
-//      本插件只注入 MobileSafari，所以新建的「元宝搜索」永远不出现在那个列表里；
-//   ② defaultSearchEngine 被强制返回元宝后，用户在设置里选谁都白选 —— 切不动。
-// 现在的做法（老板指定的 fallback 方案）：
-//   不动引擎数组结构，直接借用内置引擎 Ecosia 的槽位，把它的 SearchURLTemplate
-//   改写成元宝的 URL。设置里选「Ecosia」就是元宝搜索，选 Google/Bing/百度 就是原样，
-//   默认引擎完全交还给 Safari 自己的持久化，切换立刻生效。
-
-@protocol SPEHEngineInfoInit <NSObject>
-- (id)initWithDictionary:(NSDictionary *)dict usingContext:(id)context;
-@end
-
-static Class gSearchEngineControllerClass = Nil;
-static Class gSearchEngineInfoClass = Nil;
-static id gCustomSearchEngine = nil;
-static BOOL gEngineHooked = NO;
-static BOOL gEngineListDumped = NO;
-static BOOL gNeedForceDefault = NO;      // 只有「列表里找不到宿主引擎、只能追加」时才为 YES
-static int gEngineRetryCount = 0;
-
-static IMP gOrigPopulateSearchEngines = NULL;
-static IMP gOrigDefaultSearchEngine = NULL;
-static IMP gOrigDefaultSearchEngineIfPopulated = NULL;
-
-static BOOL SPEHForceDefaultEnabled(void) { return SPEHBoolPref(@"forceDefaultEngine", NO); }
-
-// 宿主引擎：默认 Ecosia，取不到再按这个顺序找（都取不到才退回「追加 + 强制默认」）
-static NSArray<NSString *> *SPEHHostEngineCandidates(void)
-{
-	return @[ @"Ecosia", @"Bing", @"必应", @"Yahoo", @"DuckDuckGo", @"Google", @"Baidu", @"百度" ];
-}
-
-static NSArray *SPEHGetEnginesArray(id controller)
-{
-	id engines = nil;
-	@try { engines = [controller valueForKey:@"_searchEngines"]; } @catch (NSException *e) { }
-	if (!engines) { @try { engines = [controller valueForKey:@"engines"]; } @catch (NSException *e) { } }
-	return [engines isKindOfClass:[NSArray class]] ? (NSArray *)engines : nil;
-}
-
-static NSString *SPEHEngineNameOf(id engine)
-{
-	for (NSString *k in @[ @"name", @"shortName", @"displayName", @"scriptingName" ]) {
-		@try {
-			id v = [engine valueForKey:k];
-			if ([v isKindOfClass:[NSString class]] && ((NSString *)v).length) return (NSString *)v;
-		} @catch (NSException *e) { }
-	}
-	return @"";
-}
-
-// 真机日志实证：searchURLTemplate / URLTemplate 这些 KVC key 全都读不到（打印 (no-template)），
-// 说明 _SFSearchEngineInfo 内部的字段名不是这些。直接反射 ivar 找：
-//   · 类型是对象、当前值里含 {searchTerms} 的那个 ivar —— 就是搜索模板。
-static NSString *SPEHEngineTemplateOf(id engine)
-{
-	if (!engine) return nil;
-
-	for (NSString *k in @[ @"searchURLTemplate", @"searchURLTemplateString", @"URLTemplate" ]) {
-		@try {
-			id v = [engine valueForKey:k];
-			if ([v isKindOfClass:[NSString class]] && ((NSString *)v).length) return (NSString *)v;
-		} @catch (NSException *e) { }
-	}
-
-	unsigned int n = 0;
-	Ivar *ivars = class_copyIvarList([engine class], &n);
-	NSString *found = nil;
-	for (unsigned int i = 0; i < n; i++) {
-		const char *enc = ivar_getTypeEncoding(ivars[i]);
-		if (!enc || enc[0] != '@') continue;
-		@try {
-			id v = object_getIvar(engine, ivars[i]);
-			if (![v isKindOfClass:[NSString class]]) continue;
-			if (![(NSString *)v containsString:@"{searchTerms}"]) continue;
-			found = (NSString *)v;
-			break;
-		} @catch (NSException *e) { }
-	}
-	free(ivars);
-	return found;
-}
-
-static BOOL SPEHSetEngineTemplate(id engine, NSString *tpl)
-{
-	if (!engine || !tpl.length) return NO;
-
-	// ① 先按常规 KVC key 写（有效就到此为止）
-	for (NSString *k in @[ @"searchURLTemplate", @"searchURLTemplateString" ]) {
-		@try {
-			[engine setValue:tpl forKey:k];
-			NSString *now = SPEHEngineTemplateOf(engine);
-			if ([now isEqualToString:tpl]) {
-				SPEHLog(@"[engine] 模板写入成功 key=%@", k);
-				return YES;
-			}
-		} @catch (NSException *e) { }
-	}
-
-	// ② 反射 ivar：值是对象且含 {searchTerms} 的那一个就是模板字段
-	unsigned int n = 0;
-	Ivar *ivars = class_copyIvarList([engine class], &n);
-	NSString *used = nil;
-	for (unsigned int i = 0; i < n; i++) {
-		const char *enc = ivar_getTypeEncoding(ivars[i]);
-		if (!enc || enc[0] != '@') continue;
-		@try {
-			id v = object_getIvar(engine, ivars[i]);
-			if (![v isKindOfClass:[NSString class]]) continue;
-			if (![(NSString *)v containsString:@"{searchTerms}"]) continue;
-			object_setIvarWithStrongDefault(engine, ivars[i], tpl);
-			const char *nm = ivar_getName(ivars[i]);
-			used = nm ? [NSString stringWithUTF8String:nm] : @"?";
-			break;
-		} @catch (NSException *e) { }
-	}
-	free(ivars);
-
-	if (!used) return NO;
-	BOOL ok = [SPEHEngineTemplateOf(engine) isEqualToString:tpl];
-	SPEHLog(@"[engine] 模板写入 ivar=%@ %s", used, ok ? "ok" : "未生效");
-	return ok;
-}
-
-static void SPEHLogEngineList(NSArray *engines)
-{
-	NSMutableArray *desc = [NSMutableArray array];
-	for (id e in engines) {
-		NSString *n = SPEHEngineNameOf(e);
-		NSString *t = SPEHEngineTemplateOf(e) ?: @"(no-template)";
-		[desc addObject:[NSString stringWithFormat:@"%@<%s>=%@", n.length ? n : @"?", object_getClassName(e), t]];
-	}
-	SPEHLog(@"[engine] 内置引擎 %lu 个: %@", (unsigned long)engines.count,
-			[desc componentsJoinedByString:@" | "]);
-}
-
-static id SPEHCreateCustomSearchEngine(id controller)
-{
-	NSString *urlTemplate = SPEHEngineURL();
-	if (![urlTemplate containsString:@"{searchTerms}"]) {
-		SPEHLog(@"[engine] custom URL 模板缺少 {searchTerms}，放弃注入");
-		return nil;
-	}
-	Class infoCls = gSearchEngineInfoClass;
-	if (!infoCls) return nil;
-
-	NSDictionary *dict = @{
-		@"SearchEngineIdentifier" : @"com.huhansibuxin.speh.custom",
-		@"SearchEngineID" : @20261115,
-		@"SearchURLTemplate" : urlTemplate,
-		@"SuggestionsURLTemplate" : @"",
-		@"ShortName" : SPEHEngineName(),
-		@"ScriptingName" : SPEHEngineName(),
-	};
-
-	id engine = nil;
-	SEL modernSel = @selector(initWithDictionary:usingContext:);
-	SEL legacySel = NSSelectorFromString(@"engineFromDictionary:withController:");
-
-	if ([infoCls instancesRespondToSelector:modernSel]) {
-		engine = [(id<SPEHEngineInfoInit>)[infoCls alloc] initWithDictionary:dict usingContext:controller];
-	} else if ([infoCls respondsToSelector:legacySel]) {
-		typedef id (*LegacyFn)(id, SEL, id, id);
-		engine = ((LegacyFn)objc_msgSend)(infoCls, legacySel, dict, controller);
-	}
-
-	SPEHLog(@"[engine] built engine=%@ name=%@", engine, SPEHEngineName());
-	return engine;
-}
-
-// 兜底路径专用：列表里一个宿主引擎都认不出来时，才追加自建引擎（设置页里看不到它）
-static BOOL SPEHAppendCustomEngine(id controller, id engine)
-{
-	@try {
-		id engines = nil;
-		@try { engines = [controller valueForKey:@"_searchEngines"]; } @catch (NSException *e) { }
-		if (!engines) { @try { engines = [controller valueForKey:@"engines"]; } @catch (NSException *e) { } }
-		if (!engines) return NO;
-
-		if ([engines isKindOfClass:[NSMutableArray class]]) {
-			NSMutableArray *arr = (NSMutableArray *)engines;
-			if ([arr containsObject:engine]) return YES;
-			[arr addObject:engine];
-			return YES;
-		}
-		if ([engines isKindOfClass:[NSArray class]]) {
-			NSArray *arr = (NSArray *)engines;
-			if ([arr containsObject:engine]) return YES;
-			NSArray *newArr = [arr arrayByAddingObject:engine];
-			@try { [controller setValue:newArr forKey:@"_searchEngines"]; } @catch (NSException *e) { }
-			@try { [controller setValue:newArr forKey:@"engines"]; } @catch (NSException *e) { }
-			return YES;
-		}
-	} @catch (NSException *e) {
-		SPEHLog(@"[engine] append exception: %@", e);
-	}
-	return NO;
-}
-
-static void SPEHPopulateSearchEnginesHook(id self, SEL _cmd)
-{
-	if (gOrigPopulateSearchEngines) ((void (*)(id, SEL))gOrigPopulateSearchEngines)(self, _cmd);
-	if (!SPEHEngineEnabled()) return;
-
-	NSArray *engines = SPEHGetEnginesArray(self);
-	if (!engines.count) { SPEHLog(@"[engine] 引擎列表为空，放弃"); return; }
-
-	if (!gEngineListDumped) {
-		gEngineListDumped = YES;
-		SPEHLogEngineList(engines);
-	}
-
-	NSString *tpl = SPEHEngineURL();
-	if (![tpl containsString:@"{searchTerms}"]) {
-		SPEHLog(@"[engine] 模板缺少 {searchTerms}，放弃：%@", tpl);
-		return;
-	}
-
-	// ① 主路径：找宿主引擎，直接把它的模板换成元宝（设置里选它=元宝，其余引擎原样）
-	id host = nil;
-	NSString *wanted = SPEHStringPref(@"hostEngineName", @"Ecosia");
-	for (id e in engines) {
-		if ([SPEHEngineNameOf(e) caseInsensitiveCompare:wanted] == NSOrderedSame) { host = e; break; }
-	}
-	if (!host) {
-		for (NSString *cand in SPEHHostEngineCandidates()) {
-			for (id e in engines) {
-				if ([SPEHEngineNameOf(e) caseInsensitiveCompare:cand] == NSOrderedSame) { host = e; break; }
-			}
-			if (host) break;
-		}
-	}
-
-	if (host) {
-		if (SPEHSetEngineTemplate(host, tpl)) {
-			gCustomSearchEngine = host;
-			gNeedForceDefault = NO;
-			SPEHLog(@"[engine] 宿主引擎「%@」已指向元宝：%@", SPEHEngineNameOf(host), tpl);
-			return;
-		}
-		SPEHLog(@"[engine] 宿主引擎「%@」模板改写失败，转兜底", SPEHEngineNameOf(host));
-	}
-
-	// ② 兜底：追加自建引擎，并强制默认（否则设置页选不到它）
-	if (!gCustomSearchEngine) gCustomSearchEngine = SPEHCreateCustomSearchEngine(self);
-	if (!gCustomSearchEngine) return;
-	if (SPEHAppendCustomEngine(self, gCustomSearchEngine)) {
-		gNeedForceDefault = YES;
-		SPEHLog(@"[engine] 兜底追加自建引擎（设置页不可见，靠强制默认生效）");
-	}
-}
-
-static BOOL SPEHShouldForceDefault(void)
-{
-	if (!SPEHEngineEnabled() || !gCustomSearchEngine) return NO;
-	return gNeedForceDefault || SPEHForceDefaultEnabled();
-}
-
-static id SPEHDefaultSearchEngineHook(id self, SEL _cmd)
-{
-	if (SPEHShouldForceDefault()) return gCustomSearchEngine;
-	if (gOrigDefaultSearchEngine) return ((id (*)(id, SEL))gOrigDefaultSearchEngine)(self, _cmd);
-	return nil;
-}
-
-static id SPEHDefaultSearchEngineIfPopulatedHook(id self, SEL _cmd)
-{
-	if (SPEHShouldForceDefault()) return gCustomSearchEngine;
-	if (gOrigDefaultSearchEngineIfPopulated) return ((id (*)(id, SEL))gOrigDefaultSearchEngineIfPopulated)(self, _cmd);
-	return nil;
-}
-
-static void SPEHInstallSearchEngineHooks(void)
-{
-	gSearchEngineControllerClass = NSClassFromString(@"SearchEngineController") ?: NSClassFromString(@"_SFSearchEngineController");
-	gSearchEngineInfoClass = NSClassFromString(@"SearchEngineInfo") ?: NSClassFromString(@"_SFSearchEngineInfo");
-	if (!gSearchEngineControllerClass) return;
-
-	for (NSString *name in @[ @"_populateSearchEngines", @"populateSearchEngines", @"_updateSearchEngines" ]) {
-		SEL sel = NSSelectorFromString(name);
-		if (class_getInstanceMethod(gSearchEngineControllerClass, sel)) {
-			SPEHPatchInstanceMethod(gSearchEngineControllerClass, sel, (IMP)SPEHPopulateSearchEnginesHook, &gOrigPopulateSearchEngines);
-			break;
-		}
-	}
-
-	SPEHPatchInstanceMethod(gSearchEngineControllerClass, @selector(defaultSearchEngine), (IMP)SPEHDefaultSearchEngineHook, &gOrigDefaultSearchEngine);
-	SPEHPatchInstanceMethod(gSearchEngineControllerClass, @selector(defaultSearchEngineIfPopulated), (IMP)SPEHDefaultSearchEngineIfPopulatedHook, &gOrigDefaultSearchEngineIfPopulated);
-
-	gEngineHooked = YES;
-	SPEHLog(@"[engine] controller=%@ info=%@ populate=%s", NSStringFromClass(gSearchEngineControllerClass),
-			NSStringFromClass(gSearchEngineInfoClass), gOrigPopulateSearchEngines ? "ok" : "FAILED");
-}
-
-static void SPEHScheduleSearchEngineHookInstall(void)
-{
-	if (gEngineHooked) return;
-	if (gEngineRetryCount >= 12) return;
-	gEngineRetryCount++;
-	SPEHInstallSearchEngineHooks();
-	if (!gEngineHooked) {
-		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-			SPEHScheduleSearchEngineHookInstall();
-		});
-	}
 }
 
 // MARK: - SFDialogView 精准命中（唯一保留的弹窗拦截链路）
@@ -722,7 +394,7 @@ static NSString *SPEHOpenInAppJS(void)
 	static NSString *js = nil;
 	static dispatch_once_t once;
 	dispatch_once(&once, ^{
-		js = @"(function(){try{var r={m:0,e:0,i:0};"
+		js = @"(function(){try{var r={m:0,e:0};"
 			 "var killMeta=function(){var ms=document.querySelectorAll('meta[name=apple-itunes-app],meta[name=smartbanner]');"
 			 "for(var i=0;i<ms.length;i++){try{ms[i].parentNode.removeChild(ms[i]);r.m++;}catch(q){}}};"
 			 "killMeta();"
@@ -733,21 +405,6 @@ static NSString *SPEHOpenInAppJS(void)
 			 "var nm=String((n.getAttribute&&n.getAttribute('name'))||'').toLowerCase();"
 			 "if(nm==='apple-itunes-app'||nm==='smartbanner'){try{n.parentNode.removeChild(n);r.m++;}catch(q){}}}}});"
 			 "mo.observe(document.documentElement||document,{childList:true,subtree:true});}catch(o){}"
-			 // ① 拦 itms / itunes scheme 的点击（网页跳 App Store 最常见的一条）
-			 // 「要唤起 App」判定：itms* 直接算；其余非 http/https/tel/mailto/sms 的自定义 scheme 也算
-			 // （Bing 那种「继续搜索 / 打开 App」卡片就是网页 JS 导航到 ms-bing:// 这类 scheme 触发的）
-			 "var bad=function(h){h=String(h||'');if(!h)return false;if(/^(itms|itunes)/i.test(h))return true;"
-			 "var m=/^([a-z][a-z0-9+.\\-]*):/i.exec(h);if(!m)return false;"
-			 "var sc=m[1].toLowerCase();"
-			 "if(sc==='http'||sc==='https'||sc==='tel'||sc==='mailto'||sc==='sms')return false;return true;};"
-			 "document.addEventListener('click',function(e){try{var t=e.target;"
-			 "while(t&&t.tagName!=='A'){t=t.parentNode;}if(!t)return;"
-			 "if(bad(t.getAttribute&&t.getAttribute('href'))){e.preventDefault();e.stopPropagation();r.i++;}}catch(x){}},true);"
-			 // ② 拦 window.open
-			 "try{var _o=window.open;window.open=function(u){if(bad(u)){r.i++;return null;}return _o.apply(window,arguments);};}catch(x2){}"
-			 // location.assign / replace 也包一层；location.href 直接赋值拦不住，交给原生导航决策兜底
-			 "try{var _as=location.assign;location.assign=function(u){if(bad(u)){r.i++;return;}return _as.call(location,u);};}catch(x3){}"
-			 "try{var _rp=location.replace;location.replace=function(u){if(bad(u)){r.i++;return;}return _rp.call(location,u);};}catch(x4){}"
 			 "var kws=['App 内打开','App内打开','在App内打开','在 App 内打开','打开App','打开 App'];"
 			 "var els=document.querySelectorAll('body *');"
 			 "for(var j=0;j<els.length;j++){var el=els[j];if(!el.parentNode)continue;"
@@ -756,7 +413,7 @@ static NSString *SPEHOpenInAppJS(void)
 			 "if(!hit)continue;"
 			 "var cs=getComputedStyle(el);"
 			 "if(cs.position==='fixed'||cs.position==='sticky'||cs.position==='absolute'){el.parentNode.removeChild(el);r.e++;}}"
-			 "return 'meta='+r.m+' el='+r.e+' itms='+r.i;}catch(err){return 'ERR:'+err;}})()";
+			 "return 'meta='+r.m+' el='+r.e;}catch(err){return 'ERR:'+err;}})()";
 	});
 	return js;
 }
@@ -1283,131 +940,11 @@ static void SPEHInstallAppLinkHooks(void)
 			hit.count ? [hit componentsJoinedByString:@" | "] : @"(未命中任何方法)");
 }
 
-// MARK: - 网页唤起 App 拦截（自定义 scheme）
-//
-// 老板实测订正：Bing 那个「继续搜索 / 微软必应 APP 打开 / 浏览器 继续」的底部卡片
-// 不是 Safari 主动弹的，是必应网页自己的 JS 去导航到 ms-bing:// 这类自定义 scheme，
-// Safari 收到「未知 scheme 想唤起 App」才弹这张卡。
-// 所以除了 AppLink 那层，还得堵住「网页 -> 自定义 scheme」这条路：
-//   ① WebKit 导航决策里，凡是非白名单 scheme 一律 Cancel（网页根本发不出去）；
-//   ② JS 侧兜底：window.open / location.assign / location.replace / a[href] 点击 也拦一道。
-// 白名单只放行正常浏览与系统安全 scheme，其余（itms*、ms-bing、alipays、weixin …）全拦。
-
-static IMP gOrigSchemePolicy4 = NULL;
-static IMP gOrigSchemePolicy3 = NULL;
-static int gSchemeLogCount = 0;
-static int gSchemeHooked = 0;
-
-static BOOL SPEHSchemeBlockEnabled(void) { return SPEHBoolPref(@"blockCustomScheme", YES); }
-
-static BOOL SPEHShouldBlockSchemeURL(NSURL *url)
-{
-	if (!url) return NO;
-	NSString *scheme = url.scheme.lowercaseString;
-	if (!scheme.length) return NO;
-
-	static NSSet *allow = nil;
-	static dispatch_once_t once;
-	dispatch_once(&once, ^{
-		allow = [NSSet setWithArray:@[ @"http", @"https", @"about", @"data", @"blob",
-										@"file", @"javascript", @"tel", @"mailto", @"sms", @"facetime" ]];
-	});
-	return ![allow containsObject:scheme];
-}
-
-static NSURL *SPEHNavActionURL(id action)
-{
-	if (!action) return nil;
-	NSURL *u = nil;
-	@try {
-		id req = [action valueForKey:@"request"];
-		if (req) u = [req valueForKey:@"URL"];
-		if (!u) u = [action valueForKey:@"URL"];
-	} @catch (NSException *e) { }
-	return [u isKindOfClass:[NSURL class]] ? u : nil;
-}
-
-static void SPEHSchemePolicy4Hook(id self, SEL _cmd, id webView, id action, id prefs, id handler)
-{
-	if (SPEHSchemeBlockEnabled()) {
-		NSURL *u = SPEHNavActionURL(action);
-		if (SPEHShouldBlockSchemeURL(u)) {
-			if (SPEHProbeEnabled() && gSchemeLogCount < 30) {
-				gSchemeLogCount++;
-				SPEHLog(@"[scheme] 拦下网页唤起 App：%@", u.absoluteString);
-			}
-			if (handler) { void (^h)(NSInteger) = handler; @try { h(1); } @catch (NSException *e) { } }  // Cancel
-			return;
-		}
-	}
-	if (gOrigSchemePolicy4) ((void (*)(id, SEL, id, id, id, id))gOrigSchemePolicy4)(self, _cmd, webView, action, prefs, handler);
-}
-
-static void SPEHSchemePolicy3Hook(id self, SEL _cmd, id webView, id action, id handler)
-{
-	if (SPEHSchemeBlockEnabled()) {
-		NSURL *u = SPEHNavActionURL(action);
-		if (SPEHShouldBlockSchemeURL(u)) {
-			if (SPEHProbeEnabled() && gSchemeLogCount < 30) {
-				gSchemeLogCount++;
-				SPEHLog(@"[scheme] 拦下网页唤起 App：%@", u.absoluteString);
-			}
-			if (handler) { void (^h)(NSInteger) = handler; @try { h(1); } @catch (NSException *e) { } }
-			return;
-		}
-	}
-	if (gOrigSchemePolicy3) ((void (*)(id, SEL, id, id, id))gOrigSchemePolicy3)(self, _cmd, webView, action, handler);
-}
-
-static void SPEHInstallSchemeBlockHooks(void)
-{
-	if (!SPEHSchemeBlockEnabled()) { SPEHLog(@"[scheme] disabled by prefs"); return; }
-
-	// 0.6.0 教训：同一个 selector 在父类/子类各 hook 一次，orig 会被后一次覆盖，
-	// 转发到错误的 IMP 直接爆栈。所以只 hook「自己声明了这个方法」的那个类，每个 selector 只一次。
-	NSArray *classes = @[ @"TabDocument", @"_SFTabDocument", @"BrowserController", @"_SFWebView", @"SFWebView" ];
-	NSArray *sels = @[ @"_webView:decidePolicyForNavigationAction:preferences:decisionHandler:",
-					   @"webView:decidePolicyForNavigationAction:preferences:decisionHandler:",
-					   @"_webView:decidePolicyForNavigationAction:decisionHandler:",
-					   @"webView:decidePolicyForNavigationAction:decisionHandler:" ];
-	NSMutableArray *hit = [NSMutableArray array];
-
-	for (NSString *sn in sels) {
-		SEL sel = NSSelectorFromString(sn);
-		Class owner = Nil;
-		for (NSString *cn in classes) {
-			Class c = NSClassFromString(cn);
-			if (!c) continue;
-			unsigned int n = 0;
-			Method *ms = class_copyMethodList(c, &n);
-			BOOL declared = NO;
-			for (unsigned int i = 0; i < n; i++) {
-				if (method_getName(ms[i]) == sel) { declared = YES; break; }
-			}
-			free(ms);
-			if (declared) { owner = c; break; }
-		}
-		if (!owner) { continue; }
-
-		BOOL is4 = ([sn rangeOfString:@"preferences"].location != NSNotFound);
-		if (is4) {
-			MSHookMessageEx(owner, sel, (IMP)SPEHSchemePolicy4Hook, &gOrigSchemePolicy4);
-		} else {
-			MSHookMessageEx(owner, sel, (IMP)SPEHSchemePolicy3Hook, &gOrigSchemePolicy3);
-		}
-		gSchemeHooked++;
-		[hit addObject:[NSString stringWithFormat:@"%@ -%@", NSStringFromClass(owner), sn]];
-	}
-
-	SPEHLog(@"[scheme] hook 导航决策 %d 条: %@（非白名单 scheme 一律 Cancel）", gSchemeHooked,
-			hit.count ? [hit componentsJoinedByString:@" | "] : @"(未命中)");
-}
-
 // MARK: - 返回后滚动恢复
 //
 // 老板实测：返回上一页后，页面前几次上/下滑完全不响应，加载完也要滑几下才生效。
 // 日志取证（0.5.0）：goBack 后 0.3/0.9/1.8s 检查 scrollEnabled 与 pan 全部是 YES，
-// 一条「复位」都没打 → 不是原生被禁用，而是页面 JS 残留滚动锁（元宝搜索是 SPA，
+// 一条「复位」都没打 → 不是原生被禁用，而是页面 JS 残留滚动锁（部分 SPA 站点，
 // 百度传统页不锁，所以百度不卡）。所以改为：① JS 复位页面的 overflow / touch-action
 // 与残留全屏遮罩；② 后退窗口内吞掉 Safari 多余的一次 reload / 同 URL loadRequest。
 
@@ -1732,17 +1269,16 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 		SPEHLog(@"==============================================");
 		SPEHLog(@"Safari16Enhance " SPEH_VERSION " loaded, pid=%d", getpid());
 		SPEHLog(@"log file = %@", SPEHLogPath());
-		SPEHLog(@"engine=%d(%@) dialog=%d reader=%d openinapp=%d backscroll=%d probe=%d",
-				SPEHEngineEnabled(), SPEHEngineName(), SPEHDialogKillEnabled(), SPEHReaderKillEnabled(),
-				SPEHOpenInAppKillEnabled(), SPEHBackScrollFixEnabled(), SPEHProbeEnabled());
+		SPEHLog(@"dialog=%d reader=%d openinapp=%d backscroll=%d applink=%d probe=%d",
+				SPEHDialogKillEnabled(), SPEHReaderKillEnabled(),
+				SPEHOpenInAppKillEnabled(), SPEHBackScrollFixEnabled(),
+				SPEHAppLinkKillEnabled(), SPEHProbeEnabled());
 
 		SPEHInstallSFDialogHooks();
 		SPEHInstallReaderHooks();
 		SPEHInstallOpenInAppHooks();
 		SPEHInstallBackScrollHooks();
 		SPEHInstallAppLinkHooks();
-		SPEHInstallSchemeBlockHooks();
 		SPEHInstallURLBarSwipeHooks();
-		SPEHScheduleSearchEngineHookInstall();
 	}
 }
