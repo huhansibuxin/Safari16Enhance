@@ -77,7 +77,7 @@ jobs:
             'blockCustomScheme' \
             'decidePolicyForNavigationAction' \
             'killURLBarSwipe' \
-            'WKProcessPool' \
+            'didMoveToWindow' \
             'Documents' ; do
             if ! echo "$STRINGS" | grep -qF "$NEEDLE"; then
               echo "::error::required string missing from dylib: $NEEDLE"
