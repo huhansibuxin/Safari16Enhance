@@ -68,7 +68,6 @@ jobs:
             'fixBackScroll' \
             'killAppLinkPrompt' \
             'AppLinkWithURL' \
-            'appBanner' \
             'killURLBarSwipe' \
             'didMoveToWindow' \
             'Documents' ; do

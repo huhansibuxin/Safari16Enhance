@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.9.0"
+#define SPEH_VERSION "0.9.1"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -447,280 +447,13 @@ static void SPEHApplyOpenInAppJS(id webView)
 // 结论：绝不碰 configuration / userContentController / processPool。
 // 删 meta 改用 evaluateJavaScript 在各时间点执行；横幅本身已由原生 hook 拦住。
 
-// Smart App Banner 原生 view：运行时按类名找，统一挂 didMoveToWindow
-
-
-// 0.5.0 实测 hooked=0：iOS 16 的类名不含 "SmartAppBanner"，猜不出就得探。
-// 这里做三层探针，一次拿全：
-//   ① 全量类名扫描（Banner / AppLink / AppInfoOverlay）
-//   ② Safari 关键类上含 Banner/AppLink 的方法名
-//   ③ 从 window 根 dump 视图树（横幅是原生 view，只能这么看到它）
-static void SPEHDumpViewTree(UIView *v, int depth, NSMutableString *out, int *budget)
-{
-	if (!v || depth > 5 || *budget <= 0) return;
-	const char *nm = class_getName(object_getClass(v));
-	NSString *pad = [@"" stringByPaddingToLength:(NSUInteger)(depth * 2) withString:@" " startingAtIndex:0];
-	[out appendFormat:@"\n%@%s %@", pad, nm, NSStringFromCGRect(v.frame)];
-	(*budget)--;
-	NSArray *subs = [v subviews];
-	NSUInteger lim = MIN(subs.count, (NSUInteger)10);
-	for (NSUInteger i = 0; i < lim; i++) SPEHDumpViewTree(subs[i], depth + 1, out, budget);
-}
-
-static void SPEHDumpBannerCandidates(UIView *anchor)
-{
-	NSMutableArray *clsHits = [NSMutableArray array];
-	unsigned int count = 0;
-	Class *classes = objc_copyClassList(&count);
-	for (unsigned int i = 0; i < count; i++) {
-		const char *nm = class_getName(classes[i]);
-		if (!nm) continue;
-		if (strstr(nm, "Banner") || strstr(nm, "AppLink") || strstr(nm, "AppInfoOverlay") ||
-			strstr(nm, "ITunesStore") || strstr(nm, "StoreProduct")) {
-			[clsHits addObject:[NSString stringWithUTF8String:nm]];
-			if (clsHits.count >= 40) break;
-		}
-	}
-	free(classes);
-	SPEHLog(@"[smartbanner] 类名候选 %lu 条: %@",
-			(unsigned long)clsHits.count,
-			clsHits.count ? [clsHits componentsJoinedByString:@", "] : @"(无)");
-
-	for (NSString *cn in @[ @"TabDocument", @"_SFTabDocument", @"_SFWebView", @"SFWebView", @"BrowserController" ]) {
-		Class c = NSClassFromString(cn);
-		if (!c) continue;
-		NSMutableArray *ms = [NSMutableArray array];
-		unsigned int n = 0;
-		Method *list = class_copyMethodList(c, &n);
-		for (unsigned int i = 0; i < n; i++) {
-			const char *sn = sel_getName(method_getName(list[i]));
-			if (strstr(sn, "Banner") || strstr(sn, "AppLink") || strstr(sn, "ITunes")) {
-				[ms addObject:[NSString stringWithUTF8String:sn]];
-			}
-		}
-		free(list);
-		if (ms.count) SPEHLog(@"[smartbanner] %@ 方法: %@", cn, [ms componentsJoinedByString:@", "]);
-	}
-
-	if (!anchor) return;
-	UIView *root = anchor.window ?: anchor;
-	NSMutableString *tree = [NSMutableString string];
-	int budget = 120;
-	SPEHDumpViewTree(root, 0, tree, &budget);
-	SPEHLog(@"[smartbanner] 视图树(%d 节点):%@", 120 - budget, tree);
-}
-
-// 0.6.0 崩溃复盘（IPS 实证）：
-//   把类名匹配从 "SmartAppBanner" 放宽到 "Banner" 后，同时命中了父子类，
-//   MSHookMessageEx 对父子两个类各 hook 一次 didMoveToWindow，子类那次的 orig
-//   直接指向父类被替换后的 IMP（也就是本函数自己），于是 A→A 自调，
-//   栈帧全是 SPEHSmartBannerDidMoveToWindow +216，最终 KERN_PROTECTION_FAILURE 爆栈。
-// 结论：这种「按类名通扫 + 循环 hook 同一 selector」的做法本身不可靠，整体移除。
-// 顶部横幅改由「JS 删 apple-itunes-app meta」从源头断掉，原生侧只保留只读探针。
-
-// 0.6.1 探针拿到的真名（TabDocument）：
-//   setAppBanner: / didFindAppBannerWithContent: / appBanner / setStoreBannersAreDisabled:
-//   BrowserController: removeAppBannerFromTabDocument:animated: / setAppBannerPinnedToTop:forTabDocument:
-// 精准做法：banner 一到 TabDocument 就吞掉，从源头不让它存在 —— 单类单选方法 hook，
-// 不涉及父子类通扫，不会有 0.6.0 那类自递归风险。
-
-static IMP gOrigSetAppBanner = NULL;
-static IMP gOrigSetStoreBannersDisabled = NULL;
-static IMP gOrigSetAppSuggestionBanner = NULL;
-static IMP gOrigDidFindAppBanner = NULL;
-
-// 按类名拆「页面顶部横幅」视图。
-// 0.6.2 日志的视图树证明：横幅不是 TabDocument 的属性渲染，而是挂在
-// MobileSafariWindow 下面的一层 view（框在页面顶部），所以吞 setter 有可能吞不到，
-// 必须再加一层「见到就拆」。
-static int SPEHKillBannerViews(UIView *v, int depth, CGRect winRect)
-{
-	if (!v || depth > 9) return 0;
-	int killed = 0;
-
-	NSString *cls = NSStringFromClass(object_getClass(v));
-	BOOL looks = ([cls rangeOfString:@"Banner"].location != NSNotFound ||
-				  [cls rangeOfString:@"AppLink"].location != NSNotFound);
-	if (looks) {
-		CGRect inWindow = v.bounds;
-		@try {
-			UIView *win = v.window;
-			if (win) inWindow = [v convertRect:v.bounds toView:win];
-		} @catch (NSException *e) { }
-		// 只打「页面顶部、条状、不占满屏」的横幅，避免误伤其它同名视图
-		if (inWindow.size.height > 20 && inWindow.size.height <= 240 &&
-			inWindow.origin.y < winRect.size.height * 0.45) {
-			@try {
-				v.hidden = YES;
-				[v removeFromSuperview];
-			} @catch (NSException *e) { }
-			SPEHLog(@"[smartbanner] 拆除视图 %@ rect=%@", cls, NSStringFromCGRect(inWindow));
-			return 1;
-		}
-	}
-
-	for (UIView *s in [v subviews]) killed += SPEHKillBannerViews(s, depth + 1, winRect);
-	return killed;
-}
-
-static void SPEHSweepBannerViews(UIView *anchor, NSString *tag)
-{
-	if (!anchor) return;
-	UIView *root = anchor.window ?: anchor;
-	if (!root) return;
-	@try {
-		int n = SPEHKillBannerViews(root, 0, root.bounds);
-		if (n > 0) SPEHLog(@"[smartbanner] %@ 共拆除 %d 个横幅视图", tag, n);
-	} @catch (NSException *e) { }
-}
-
-// 扫所有窗口（不依赖某个 webView 的锚点）
-static void SPEHSweepAllWindows(NSString *tag)
-{
-	@try {
-		int total = 0;
-		for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-			if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-			for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-				total += SPEHKillBannerViews(w, 0, w.bounds);
-			}
-		}
-		if (total > 0) SPEHLog(@"[smartbanner] %@ 拆掉 %d 个", tag, total);
-	} @catch (NSException *e) { }
-}
-
-// 横幅类名到现在还没确定（0.7.0 里有 didFindAppBanner 被丢弃 21 次，但用户仍看到横幅，
-// 说明那个横幅视图的类名既不含 Banner 也不含 AppLink）。
-// 这里把「页面顶部、条状」的所有视图类名打出来，一次拿真名。
-static void SPEHDumpTopAreaRec(UIView *v, int depth, UIView *win, NSMutableArray *out)
-{
-	if (!v || depth > 9 || out.count >= 24) return;
-	CGRect r = v.bounds;
-	@try { if (win) r = [v convertRect:v.bounds toView:win]; } @catch (NSException *e) { }
-	CGFloat winH = win.bounds.size.height;
-	if (r.size.height > 18 && r.size.height <= 260 && r.size.width > 180 && r.origin.y < winH * 0.42) {
-		[out addObject:[NSString stringWithFormat:@"%@%@", NSStringFromClass(object_getClass(v)),
-			NSStringFromCGRect(r)]];
-	}
-	for (UIView *s in [v subviews]) SPEHDumpTopAreaRec(s, depth + 1, win, out);
-}
-
-static void SPEHDumpTopArea(UIView *anchor, NSString *tag)
-{
-	if (!anchor || !SPEHProbeEnabled()) return;
-	UIView *root = anchor.window ?: anchor;
-	if (!root) return;
-	@try {
-		NSMutableArray *out = [NSMutableArray array];
-		SPEHDumpTopAreaRec(root, 0, root, out);
-		SPEHLog(@"[smartbanner] %@ 顶部条状视图 %lu 个: %@", tag, (unsigned long)out.count,
-				out.count ? [out componentsJoinedByString:@" | "] : @"(无)");
-	} @catch (NSException *e) { }
-}
-
-static void SPEHSetAppBannerHook(id self, SEL _cmd, id banner)
-{
-	if (banner && SPEHProbeEnabled()) {
-		SPEHLog(@"[smartbanner] 拦截 setAppBanner: 丢弃 %@", NSStringFromClass(object_getClass(banner)));
-	}
-	// 不转发：banner 永远进不了 TabDocument
-}
-
-static void SPEHSetAppSuggestionBannerHook(id self, SEL _cmd, id banner, BOOL pinned)
-{
-	if (SPEHProbeEnabled()) {
-		SPEHLog(@"[smartbanner] 拦截 setAppSuggestionBanner:isPinned: 丢弃 %@",
-				banner ? NSStringFromClass(object_getClass(banner)) : @"(nil)");
-	}
-	// 不转发
-}
-
-static IMP gOrigAppBannerGetter = NULL;
-static IMP gOrigBCDidCompleteCheck = NULL;
-static IMP gOrigBCPinTop = NULL;
-static IMP gOrigBCRemoveBanner = NULL;
-
-static void SPEHSweepAllWindows(NSString *tag);
-
-static void SPEHDidFindAppBannerHook(id self, SEL _cmd, id content)
-{
-	// 不转发：Safari 认为「没发现 app banner」，不会再建视图
-	if (SPEHProbeEnabled()) {
-		SPEHLog(@"[smartbanner] 拦截 didFindAppBannerWithContent: 丢弃 %@",
-				content ? NSStringFromClass(object_getClass(content)) : @"(nil)");
-	}
-	// 有些版本即使这里不转发，BrowserController 那边也会补建一次视图，顺手再扫一遍
-	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
-		dispatch_get_main_queue(), ^{
-			SPEHSweepAllWindows(@"didFind 后");
-		});
-}
-
-// appBanner getter 一律返回 nil：任何读它的渲染路径都拿不到 banner 对象
-static id SPEHAppBannerGetterHook(id self, SEL _cmd)
-{
-	return nil;
-}
-
-// BrowserController 的「检查完成 → 上屏」链路整段掐掉
-static void SPEHBCDidCompleteCheckHook(id self, SEL _cmd, id tabDocument)
-{
-	if (SPEHProbeEnabled()) SPEHLog(@"[smartbanner] 拦截 tabDocumentDidCompleteCheckForAppBanner:");
-	// 不转发
-}
-
-static void SPEHBCPinTopHook(id self, SEL _cmd, BOOL pinned, id tabDocument)
-{
-	// 不转发：不把横幅钉到顶部
-}
-
-static void SPEHBCRemoveBannerHook(id self, SEL _cmd, id tabDocument, BOOL animated)
-{
-	if (gOrigBCRemoveBanner) ((void (*)(id, SEL, id, BOOL))gOrigBCRemoveBanner)(self, _cmd, tabDocument, animated);
-}
-
-static void SPEHSetStoreBannersDisabledHook(id self, SEL _cmd, BOOL value)
-{
-	// 无论 Safari 传什么，一律 YES（全局禁用商店横幅）
-	if (gOrigSetStoreBannersDisabled) {
-		((void (*)(id, SEL, BOOL))gOrigSetStoreBannersDisabled)(self, _cmd, YES);
-	}
-}
-
-static void SPEHInstallSmartAppBannerPreciseHooks(void)
-{
-	Class tabCls = NSClassFromString(@"TabDocument");
-	if (!tabCls) { SPEHLog(@"[smartbanner] TabDocument 未加载"); return; }
-
-	SPEHPatchInstanceMethod(tabCls, NSSelectorFromString(@"setAppBanner:"),
-		(IMP)SPEHSetAppBannerHook, &gOrigSetAppBanner);
-	SPEHPatchInstanceMethod(tabCls, NSSelectorFromString(@"setAppSuggestionBanner:isPinned:"),
-		(IMP)SPEHSetAppSuggestionBannerHook, &gOrigSetAppSuggestionBanner);
-	SPEHPatchInstanceMethod(tabCls, NSSelectorFromString(@"didFindAppBannerWithContent:"),
-		(IMP)SPEHDidFindAppBannerHook, &gOrigDidFindAppBanner);
-	SPEHPatchInstanceMethod(tabCls, NSSelectorFromString(@"setStoreBannersAreDisabled:"),
-		(IMP)SPEHSetStoreBannersDisabledHook, &gOrigSetStoreBannersDisabled);
-	SPEHPatchInstanceMethod(tabCls, NSSelectorFromString(@"appBanner"),
-		(IMP)SPEHAppBannerGetterHook, &gOrigAppBannerGetter);
-
-	Class bcCls = NSClassFromString(@"BrowserController");
-	if (bcCls) {
-		SPEHPatchInstanceMethod(bcCls, NSSelectorFromString(@"tabDocumentDidCompleteCheckForAppBanner:"),
-			(IMP)SPEHBCDidCompleteCheckHook, &gOrigBCDidCompleteCheck);
-		SPEHPatchInstanceMethod(bcCls, NSSelectorFromString(@"setAppBannerPinnedToTop:forTabDocument:"),
-			(IMP)SPEHBCPinTopHook, &gOrigBCPinTop);
-		SPEHPatchInstanceMethod(bcCls, NSSelectorFromString(@"removeAppBannerFromTabDocument:animated:"),
-			(IMP)SPEHBCRemoveBannerHook, &gOrigBCRemoveBanner);
-	}
-
-	SPEHLog(@"[smartbanner] 精准 hook setAppBanner=%s appBanner(nil)=%s didFind=%s storeDisabled=%s bcCheck=%s bcPin=%s",
-			gOrigSetAppBanner ? "ok" : "missing",
-			gOrigAppBannerGetter ? "ok" : "missing",
-			gOrigDidFindAppBanner ? "ok" : "missing",
-			gOrigSetStoreBannersDisabled ? "ok" : "missing",
-			gOrigBCDidCompleteCheck ? "ok" : "missing",
-			gOrigBCPinTop ? "ok" : "missing");
-}
+// MARK: - 「App 内打开」浮层的注入时机
+//
+// 0.9.1：Smart App Banner 的原生拦截代码（TabDocument appBanner / setAppBanner: /
+// didFindAppBannerWithContent: / BrowserController 检查链路 / 视图清扫 / 类名探针）
+// 已全部删除。老板实测这些 hook 与扩展权限反复弹窗的时间线重合，先全删掉排除干扰。
+// 现在本模块只剩：WKWebView didMoveToWindow 时跑一次 JS，清网页自绘的「App 内打开」浮层
+// 与 apple-itunes-app meta（纯 DOM 操作，不碰任何原生对象、不碰 configuration）。
 
 static IMP gOrigWVDidMoveToWindow = NULL;
 
@@ -738,44 +471,17 @@ static void SPEHWVDidMoveToWindowHook(UIView *self, SEL _cmd)
 
 	__weak UIView *weakSelf = self;
 
+	// 地址栏横滑禁用：每次挂载都跑（标签栏会重建），两个时间点兜住懒加载出来的视图
 	if (first) {
-		// 原生接口 / 探针只在每个 webView 首次挂载时跑一次，不参与日常滚动
-		// 注意：这里不再改 configuration / userContentController / processPool，
-		// 否则会打乱 Safari 扩展的 content script 注入（见上文 0.8.0 踩坑说明）。
-		if (SPEHProbeEnabled()) {
-			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-				dispatch_get_main_queue(), ^{
-					SPEHDumpBannerCandidates(weakSelf);
-				});
-		}
-	}
-
-	// 横幅视图清扫：多个时间点，横幅有时在页面加载完后才插进来
-	for (NSNumber *d in @[ @1.0, @2.5, @4.0, @6.0 ]) {
-		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
-			dispatch_get_main_queue(), ^{
-				SPEHSweepBannerViews(weakSelf, [NSString stringWithFormat:@"%@s", d]);
-			});
-	}
-
-	// 顶部条状视图类名探针（只在装了 probe 时跑，拿来定位横幅真身）
-	if (SPEHProbeEnabled()) {
-		for (NSNumber *d in @[ @1.5, @3.2 ]) {
+		for (NSNumber *d in @[ @1.2, @3.5 ]) {
 			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
 				dispatch_get_main_queue(), ^{
-					SPEHDumpTopArea(weakSelf, [NSString stringWithFormat:@"%@s", d]);
+					SPEHNeutralizeURLBarSwipe(weakSelf, [NSString stringWithFormat:@"%@s", d]);
 				});
 		}
 	}
 
-	// 条状手势禁用：每次挂载都跑（标签栏会重建），两个时间点兜住懒加载出来的视图
-	for (NSNumber *d in @[ @1.2, @3.5 ]) {
-		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
-			dispatch_get_main_queue(), ^{
-				SPEHNeutralizeURLBarSwipe(weakSelf, [NSString stringWithFormat:@"%@s", d]);
-			});
-	}
-
+	// 清「App 内打开」浮层与 apple-itunes-app meta（纯 JS，不碰原生）
 	NSArray *delays = @[ @0.8, @2.5, @5.0 ];
 	for (NSNumber *d in delays) {
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -792,9 +498,8 @@ static void SPEHInstallOpenInAppHooks(void)
 	if (!wkCls) { SPEHLog(@"[openinapp] WKWebView 未加载"); return; }
 
 	SPEHPatchInstanceMethod(wkCls, @selector(didMoveToWindow), (IMP)SPEHWVDidMoveToWindowHook, &gOrigWVDidMoveToWindow);
-	SPEHLog(@"[openinapp] hook didMoveToWindow=%s", gOrigWVDidMoveToWindow ? "ok" : "FAILED");
-
-	SPEHInstallSmartAppBannerPreciseHooks();
+	SPEHLog(@"[openinapp] hook didMoveToWindow=%s（Smart App Banner 原生拦截已全部移除）",
+			gOrigWVDidMoveToWindow ? "ok" : "FAILED");
 }
 
 // MARK: - 「在 App 中打开 / 继续」提示（Bing 等通用链接）

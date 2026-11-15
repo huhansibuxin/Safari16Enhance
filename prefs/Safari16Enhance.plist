@@ -28,11 +28,12 @@
 		{
 			cell = PSGroupCell;
 			label = "推广横幅";
-			footerText = "「App 内打开」绿色浮层是网页自己画的；顶部 Smart App Banner 是 Safari 原生横幅。开启后两者都清掉。";
+			footerText = "「App 内打开」绿色胶囊浮层是网页自己用 HTML 画的，开启后用 JS 清掉（纯 DOM 操作）。
+注意：顶部那条「Dark Night 已请求额外权限 / 检查」是 Safari 自己的扩展权限提示条，不属于本插件范围，也无法用 tweak 拦掉 —— 它是系统按「扩展 → 网站访问权限」的设置逐站点发出的。";
 		},
 		{
 			cell = PSSwitchCell;
-			label = "移除「App 内打开」与 Smart App Banner";
+			label = "移除「App 内打开」浮层";
 			defaults = "com.huhansibuxin.safari16enhance";
 			key = "killOpenInApp";
 			default = YES;
@@ -103,7 +104,8 @@
 			cell = PSGroupCell;
 			label = "功能说明";
 			footerText = "1. 弹窗拦截：只保留精准命中，Safari 自绘的 SFDialogView 按文本拆除，网页自己的 JS 对话框不受影响。
-2. 推广横幅：JS 清网页自绘「App 内打开」浮层 + 用 MutationObserver 见到 apple-itunes-app meta 就删 + 吞掉 TabDocument / BrowserController 的 App Banner 链路。
+2. 「App 内打开」浮层：JS 清网页自绘的绿色胶囊浮层 + MutationObserver 见到 apple-itunes-app meta 就删。
+   （Smart App Banner 的原生拦截链路已全部移除，见下方说明。）
 3. 阅读器：白名单精准命中已实测确认的可用性判定，压成 NO。
 4. 返回：后退窗口内吞掉多余 reload + JS 复位页面滚动锁。
 5. 在 App 中打开：让 Safari 拿不到 WBSAppLink，「微软必应 APP 打开 / 浏览器 继续」这类卡片不再出现。
