@@ -84,6 +84,18 @@
 		},
 		{
 			cell = PSGroupCell;
+			label = "地址栏手势";
+			footerText = "底部输入网址/搜索的地址栏上左右滑动会切到上一页/下一页，很容易误触。开启后地址栏的左右滑动被彻底禁用，网页本身的滚动与左右滑动不受影响。";
+		},
+		{
+			cell = PSSwitchCell;
+			label = "禁用地址栏左右滑动切页";
+			defaults = "com.huhansibuxin.safari16enhance";
+			key = "killURLBarSwipe";
+			default = YES;
+		},
+		{
+			cell = PSGroupCell;
 			label = "阅读器";
 			footerText = "Safari 检测到文章页时会在地址栏临时把网址换成「阅读器可用」，并显示阅读器按钮。开启后彻底关闭该判定。";
 		},
@@ -121,7 +133,7 @@
 		{
 			cell = PSGroupCell;
 			label = "功能说明";
-			footerText = "1. 自定义搜索引擎：注入自建 SearchEngineInfo 并强制作为默认引擎（默认元宝搜索）。\n2. 弹窗拦截：只保留精准命中，Safari 自绘的 SFDialogView 按文本拆除，网页自己的 JS 对话框不受影响。\n3. 推广横幅：JS 清网页自绘「App 内打开」浮层 + 移除 apple-itunes-app meta + 原生 Smart App Banner 直接拆除。\n4. 阅读器：白名单精准命中已实测确认的可用性判定，压成 NO。\n5. 返回：iOS 16 无 bfcache SPI，改为后退窗口内吞掉多余 reload + JS 复位页面滚动锁。\n6. App Store：拦截 itms* scheme 与 apps.apple.com / itunes.apple.com / testflight.apple.com，杜绝网站强跳商店。\n\n日志：容器 Documents/Safari16Enhance.log（超 2MB 轮转为 .1）。";
+			footerText = "1. 自定义搜索引擎：注入自建 SearchEngineInfo 并强制作为默认引擎（默认元宝搜索）。\n2. 弹窗拦截：只保留精准命中，Safari 自绘的 SFDialogView 按文本拆除，网页自己的 JS 对话框不受影响。\n3. 推广横幅：JS 清网页自绘「App 内打开」浮层 + 移除 apple-itunes-app meta。\n4. 阅读器：白名单精准命中已实测确认的可用性判定，压成 NO。\n5. 返回：后退窗口内吞掉多余 reload + JS 复位页面滚动锁。\n6. App Store：拦截 itms* scheme 与 apps.apple.com / itunes.apple.com / testflight.apple.com。\n7. 地址栏手势：禁用底部地址栏上的左右滑动切页，防误触。\n\n日志：容器 Documents/Safari16Enhance.log（超 2MB 轮转为 .1）。";
 		}
 	);
 }

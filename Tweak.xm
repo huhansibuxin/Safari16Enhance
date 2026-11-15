@@ -25,7 +25,7 @@
 #import <substrate.h>
 #import <unistd.h>
 
-#define SPEH_VERSION "0.6.0"
+#define SPEH_VERSION "0.6.1"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -583,7 +583,7 @@ static void SPEHApplyOpenInAppJS(id webView)
 }
 
 // Smart App Banner 原生 view：运行时按类名找，统一挂 didMoveToWindow
-static NSMutableDictionary *gBannerOrigMap = nil;
+
 
 // 0.5.0 实测 hooked=0：iOS 16 的类名不含 "SmartAppBanner"，猜不出就得探。
 // 这里做三层探针，一次拿全：
@@ -645,69 +645,18 @@ static void SPEHDumpBannerCandidates(UIView *anchor)
 	SPEHLog(@"[smartbanner] 视图树(%d 节点):%@", 120 - budget, tree);
 }
 
-static void SPEHSmartBannerDidMoveToWindow(UIView *self, SEL _cmd)
+// 0.6.0 崩溃复盘（IPS 实证）：
+//   把类名匹配从 "SmartAppBanner" 放宽到 "Banner" 后，同时命中了父子类，
+//   MSHookMessageEx 对父子两个类各 hook 一次 didMoveToWindow，子类那次的 orig
+//   直接指向父类被替换后的 IMP（也就是本函数自己），于是 A→A 自调，
+//   栈帧全是 SPEHSmartBannerDidMoveToWindow +216，最终 KERN_PROTECTION_FAILURE 爆栈。
+// 结论：这种「按类名通扫 + 循环 hook 同一 selector」的做法本身不可靠，整体移除。
+// 顶部横幅改由「JS 删 apple-itunes-app meta」从源头断掉，原生侧只保留只读探针。
+
+static void SPEHInstallSmartAppBannerProbe(void)
 {
-	NSString *cls = NSStringFromClass(object_getClass(self));
-	IMP orig = (IMP)[gBannerOrigMap[cls] pointerValue];
-	if (orig) ((void (*)(id, SEL))orig)(self, _cmd);
-
-	if (!self.window) return;
-
-	static char kRemoved;
-	if (objc_getAssociatedObject(self, &kRemoved)) return;
-	objc_setAssociatedObject(self, &kRemoved, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-	__weak UIView *weakSelf = self;
-	dispatch_async(dispatch_get_main_queue(), ^{
-		UIView *strong = weakSelf;
-		if (!strong) return;
-		SPEHLog(@"[smartbanner] 拆除 %@ frame=%@", cls, NSStringFromCGRect(strong.frame));
-		@try {
-			strong.hidden = YES;
-			[strong removeFromSuperview];
-		} @catch (NSException *e) { }
-	});
-}
-
-static void SPEHInstallSmartAppBannerHooks(void)
-{
-	unsigned int count = 0;
-	Class *classes = objc_copyClassList(&count);
-	int hooked = 0;
-
-	gBannerOrigMap = [NSMutableDictionary dictionary];
-
-	for (unsigned int i = 0; i < count; i++) {
-		Class cls = classes[i];
-		const char *name = class_getName(cls);
-		if (!name) continue;
-		if (!strstr(name, "Banner") && !strstr(name, "AppLink")) continue;
-		if (!class_getSuperclass(cls)) continue;
-
-		// 只要 UIView 子类（横幅本体）
-		BOOL isView = NO;
-		Class c = cls;
-		int guard = 0;
-		while (c && guard++ < 24) {
-			if (c == [UIView class]) { isView = YES; break; }
-			c = class_getSuperclass(c);
-		}
-		if (!isView) continue;
-
-		Method m = class_getInstanceMethod(cls, @selector(didMoveToWindow));
-		if (!m) continue;
-
-		IMP old = NULL;
-		MSHookMessageEx(cls, @selector(didMoveToWindow), (IMP)SPEHSmartBannerDidMoveToWindow, &old);
-		if (old) {
-			gBannerOrigMap[[NSString stringWithUTF8String:name]] = [NSValue valueWithPointer:(void *)old];
-			SPEHLog(@"[smartbanner] hook %s", name);
-			hooked++;
-		}
-	}
-	free(classes);
-
-	SPEHLog(@"[smartbanner] hooked=%d", hooked);
+	// 不做任何 hook，只记录当前策略，避免再次踩同一个坑
+	SPEHLog(@"[smartbanner] 原生 hook 已移除（0.6.0 曾因父子类重复 hook 自递归崩溃）");
 }
 
 static IMP gOrigWVDidMoveToWindow = NULL;
@@ -755,7 +704,7 @@ static void SPEHInstallOpenInAppHooks(void)
 	SPEHPatchInstanceMethod(wkCls, @selector(didMoveToWindow), (IMP)SPEHWVDidMoveToWindowHook, &gOrigWVDidMoveToWindow);
 	SPEHLog(@"[openinapp] hook didMoveToWindow=%s", gOrigWVDidMoveToWindow ? "ok" : "FAILED");
 
-	SPEHInstallSmartAppBannerHooks();
+	SPEHInstallSmartAppBannerProbe();
 }
 
 // MARK: - 拦截跳转 App Store
@@ -1110,6 +1059,78 @@ static void SPEHInstallBackScrollHooks(void)
 			gOrigWKLoadRequest ? "ok" : "FAILED");
 }
 
+// MARK: - 禁用底部地址栏左右滑动切页
+//
+// 老板实测：在底部输入网址/搜索的地址栏上左右滑，会切到上一页/下一页，极易误触。
+// 做法：hook -[UIView addGestureRecognizer:]，只对「地址栏/工具栏」这一类 host 上的
+// 滑动手势生效（UISwipeGestureRecognizer，以及 URL 输入区上的 UIPanGestureRecognizer），
+// 直接不挂 + 置 disabled。页面滚动用的是 WKWebView 内部 scrollView 的 pan，
+// 不经过这里，所以不影响网页滚动。
+
+static BOOL SPEHURLBarSwipeKillEnabled(void) { return SPEHBoolPref(@"killURLBarSwipe", YES); }
+
+static BOOL SPEHHostLooksLikeURLBar(NSString *cls)
+{
+	if (!cls.length) return NO;
+	static NSString *const kws[] = { @"URL", @"Address", @"UnifiedBar", @"Toolbar", @"TextBar", @"LocationBar" };
+	for (unsigned i = 0; i < sizeof(kws) / sizeof(kws[0]); i++) {
+		if ([cls rangeOfString:kws[i]].location != NSNotFound) return YES;
+	}
+	return NO;
+}
+
+static IMP gOrigAddGesture = NULL;
+
+static void SPEHEnhanceAddGestureHook(UIView *self, SEL _cmd, UIGestureRecognizer *gr)
+{
+	// 先按手势类型快速过滤（绝大多数调用在这里就返回，开销可忽略），
+	// 再做类名字符串匹配。
+	if (SPEHURLBarSwipeKillEnabled() && gr &&
+		([gr isKindOfClass:[UISwipeGestureRecognizer class]] ||
+		 [gr isKindOfClass:[UIPanGestureRecognizer class]])) {
+		@try {
+			NSString *hostCls = NSStringFromClass(object_getClass(self));
+			if (SPEHHostLooksLikeURLBar(hostCls)) {
+				BOOL isSwipe = [gr isKindOfClass:[UISwipeGestureRecognizer class]];
+				// pan 只在明确的地址输入控件上禁，避免误伤工具栏其它交互
+				BOOL isPanOnURL = [gr isKindOfClass:[UIPanGestureRecognizer class]] &&
+					([hostCls rangeOfString:@"URL"].location != NSNotFound ||
+					 [hostCls rangeOfString:@"Address"].location != NSNotFound);
+
+				if (isSwipe || isPanOnURL) {
+					gr.enabled = NO;
+					SPEHLog(@"[urlswipe] 已禁用 %@ on %@",
+							NSStringFromClass(object_getClass(gr)), hostCls);
+					return;   // 不转发 = 手势根本没挂上
+				}
+			}
+			if (SPEHProbeEnabled() && [gr isKindOfClass:[UISwipeGestureRecognizer class]]) {
+				// 只记一次，用来确认地址栏的真实类名（下一版可按真名收紧）
+				static NSMutableSet *seen = nil;
+				static dispatch_once_t once;
+				dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
+				NSString *key = [NSString stringWithFormat:@"%@|%ld", hostCls,
+					(long)((UISwipeGestureRecognizer *)gr).direction];
+				if (![seen containsObject:key] && seen.count < 40) {
+					[seen addObject:key];
+					SPEHLog(@"[urlswipe] 探针 swipe 挂到 %@ direction=%ld（未拦截）",
+							hostCls, (long)((UISwipeGestureRecognizer *)gr).direction);
+				}
+			}
+		} @catch (NSException *e) { }
+	}
+	if (gOrigAddGesture) ((void (*)(id, SEL, id))gOrigAddGesture)(self, _cmd, gr);
+}
+
+static void SPEHInstallURLBarSwipeHooks(void)
+{
+	if (!SPEHURLBarSwipeKillEnabled()) { SPEHLog(@"[urlswipe] disabled by prefs"); return; }
+
+	SPEHPatchInstanceMethod([UIView class], NSSelectorFromString(@"addGestureRecognizer:"),
+		(IMP)SPEHEnhanceAddGestureHook, &gOrigAddGesture);
+	SPEHLog(@"[urlswipe] hook addGestureRecognizer=%s", gOrigAddGesture ? "ok" : "FAILED");
+}
+
 // MARK: - 入口
 
 %ctor
@@ -1129,6 +1150,7 @@ static void SPEHInstallBackScrollHooks(void)
 		SPEHInstallOpenInAppHooks();
 		SPEHInstallBackScrollHooks();
 		SPEHInstallAppStoreHooks();
+		SPEHInstallURLBarSwipeHooks();
 		SPEHScheduleSearchEngineHookInstall();
 	}
 }
