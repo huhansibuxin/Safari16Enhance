@@ -1,8 +1,8 @@
 Package: com.huhansibuxin.safari16enhance
 Name: Safari16Enhance
-Version: 0.7.1
+Version: 0.8.0
 Architecture: iphoneos-arm64
-Description: Safari 双功能增强（独立实现，非 SafariPlus / 非 SafariX）。① 自定义默认搜索引擎：注入自建 SearchEngineInfo 并强制 defaultSearchEngine 返回它，内置元宝搜索 https://so.qq.com/isearch?query={searchTerms}（免登录可用），可在设置里改成任意 URL 模板。② 拦截「Safari 打不开该网页」强制弹窗：hook UIViewController 的 presentViewController，命中错误文案即丢弃并改成底部 toast，不再强制点「好」阻断操作。③ 运行时探针（可关）：dump 搜索引擎相关类/方法、记录每次弹窗文案与发起类，用于 iOS 版本适配。日志固定写入 Safari 自身容器 Documents/Safari16Enhance.log（多级路径兜底 + 真实写入校验，超 2MB 自动轮转）。
+Description: Safari 16 增强（独立实现，非 SafariPlus / 非 SafariX，仅注入 MobileSafari）。① 搜索引擎：把内置 Ecosia 槽位的搜索地址改写成元宝 https://so.qq.com/isearch?query={searchTerms}，设置里选 Ecosia 即元宝、选其它引擎照常，默认引擎交还系统可自由切换。② 拦截「打不开该网页」弹窗：按文本精准命中 Safari 自绘的 SFDialogView 并拆除，改底部 toast。③ 移除网页自绘「App 内打开」浮层与顶部 Smart App Banner（JS 删 apple-itunes-app meta + 吞 TabDocument/BrowserController 横幅链路）。④ 关闭「阅读器可用」判定。⑤ 返回时不重复 reload 并复位页面滚动锁。⑥ 不再弹「在 App 中打开 / 浏览器 继续」卡片（WBSAppLink 判定返回 nil）。⑦ 禁用底部地址栏左右滑动切页。日志固定写入 Safari 自身容器 Documents/Safari16Enhance.log（多级路径兜底 + 超 2MB 轮转）。
 Maintainer: huhansibuxin
 Author: huhansibuxin
 Section: Tweaks

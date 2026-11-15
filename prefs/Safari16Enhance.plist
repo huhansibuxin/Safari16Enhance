@@ -15,19 +15,27 @@
 		},
 		{
 			cell = PSGroupCell;
-			label = "自定义搜索引擎";
-			footerText = "开启后 Safari 地址栏搜索改用下方引擎。搜索 URL 必须包含 {searchTerms}。改动后请上滑杀掉 Safari 再打开。";
+			label = "搜索引擎";
+			footerText = "「设置 → Safari → 搜索引擎」由系统设置进程渲染，插件注入的新引擎不会出现在那里，也无法被选中。所以改用槽位替换：把内置的 Ecosia 一栏的搜索地址改写成元宝。设置里选「Ecosia」＝元宝搜索；选 Google / Bing / 百度 就是原样，随时可以自由切换，默认引擎完全交还系统。改动后请上滑杀掉 Safari 再打开。";
 		},
 		{
 			cell = PSSwitchCell;
-			label = "启用自定义搜索引擎";
+			label = "启用（Ecosia 槽位＝元宝）";
 			defaults = "com.huhansibuxin.safari16enhance";
 			key = "customEngineEnabled";
 			default = YES;
 		},
 		{
 			cell = PSTextFieldCell;
-			label = "引擎名称";
+			label = "接管哪个内置引擎";
+			defaults = "com.huhansibuxin.safari16enhance";
+			key = "hostEngineName";
+			default = "Ecosia";
+			placeholder = "Ecosia";
+		},
+		{
+			cell = PSTextFieldCell;
+			label = "引擎名称（仅日志显示）";
 			defaults = "com.huhansibuxin.safari16enhance";
 			key = "customEngineName";
 			default = "元宝搜索";
@@ -72,14 +80,14 @@
 		},
 		{
 			cell = PSGroupCell;
-			label = "App Store 跳转";
-			footerText = "有些网站一打开就用 itms-apps:// 或 apps.apple.com 直接跳到 App Store。开启后一律拦截，只弹一条 toast，正常网页浏览不受影响。";
+			label = "在 App 中打开";
+			footerText = "用 Bing 搜索时底部会弹「继续搜索 / 微软必应 APP 打开 / 浏览器 继续」，这是 iOS 的 App Link 提示（Safari 发现页面能被某个 App 接住就弹）。开启后让 Safari 认为没有可打开的 App，只会在 Safari 里继续，不再弹这个卡片。";
 		},
 		{
 			cell = PSSwitchCell;
-			label = "拦截跳转 App Store";
+			label = "不弹「打开 App / 继续」提示";
 			defaults = "com.huhansibuxin.safari16enhance";
-			key = "blockAppStore";
+			key = "killAppLinkPrompt";
 			default = YES;
 		},
 		{
@@ -140,7 +148,7 @@
 		{
 			cell = PSGroupCell;
 			label = "功能说明";
-			footerText = "1. 自定义搜索引擎：注入自建 SearchEngineInfo 并强制作为默认引擎（默认元宝搜索）。\n2. 弹窗拦截：只保留精准命中，Safari 自绘的 SFDialogView 按文本拆除，网页自己的 JS 对话框不受影响。\n3. 推广横幅：JS 清网页自绘「App 内打开」浮层 + 移除 apple-itunes-app meta。\n4. 阅读器：白名单精准命中已实测确认的可用性判定，压成 NO。\n5. 返回：后退窗口内吞掉多余 reload + JS 复位页面滚动锁。\n6. App Store：拦截 itms* scheme 与 apps.apple.com / itunes.apple.com / testflight.apple.com。\n7. 地址栏手势：禁用底部地址栏上的左右滑动切页，防误触。\n\n日志：容器 Documents/Safari16Enhance.log（超 2MB 轮转为 .1）。";
+			footerText = "1. 搜索引擎：把内置 Ecosia 的搜索地址换成元宝（https://so.qq.com/isearch?query=…）。设置里选 Ecosia＝元宝，选别的引擎照常，可自由切换。\n2. 弹窗拦截：只保留精准命中，Safari 自绘的 SFDialogView 按文本拆除，网页自己的 JS 对话框不受影响。\n3. 推广横幅：JS 清网页自绘「App 内打开」浮层 + 用 MutationObserver 见到 apple-itunes-app meta 就删 + 吞掉 TabDocument / BrowserController 的 App Banner 链路。\n4. 阅读器：白名单精准命中已实测确认的可用性判定，压成 NO。\n5. 返回：后退窗口内吞掉多余 reload + JS 复位页面滚动锁。\n6. 在 App 中打开：让 Safari 拿不到 WBSAppLink（返回 nil），「微软必应 APP 打开 / 浏览器 继续」这类卡片不再出现。\n7. 地址栏手势：禁用底部地址栏上的左右滑动切页，防误触。\n\n日志：容器 Documents/Safari16Enhance.log（超 2MB 轮转为 .1）。";
 		}
 	);
 }

@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.7.1"
+#define SPEH_VERSION "0.8.0"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -244,7 +244,17 @@ static void SPEHPatchInstanceMethod(Class cls, SEL sel, IMP newImp, IMP *outOld)
 	MSHookMessageEx(cls, sel, newImp, outOld);
 }
 
-// MARK: - 搜索引擎注入（已验证可用）
+// MARK: - 搜索引擎（宿主槽位替换：默认元宝 + 仍可在设置里自由切换）
+//
+// 0.7.x 的做法是「新建一个 _SFSearchEngineInfo 塞进 _searchEngines，再 hook
+// defaultSearchEngine 强制返回它」。真机结论：
+//   ① 「设置 → Safari → 搜索引擎」是 Preferences 进程（com.apple.Preferences）渲染的，
+//      本插件只注入 MobileSafari，所以新建的「元宝搜索」永远不出现在那个列表里；
+//   ② defaultSearchEngine 被强制返回元宝后，用户在设置里选谁都白选 —— 切不动。
+// 现在的做法（老板指定的 fallback 方案）：
+//   不动引擎数组结构，直接借用内置引擎 Ecosia 的槽位，把它的 SearchURLTemplate
+//   改写成元宝的 URL。设置里选「Ecosia」就是元宝搜索，选 Google/Bing/百度 就是原样，
+//   默认引擎完全交还给 Safari 自己的持久化，切换立刻生效。
 
 @protocol SPEHEngineInfoInit <NSObject>
 - (id)initWithDictionary:(NSDictionary *)dict usingContext:(id)context;
@@ -254,11 +264,91 @@ static Class gSearchEngineControllerClass = Nil;
 static Class gSearchEngineInfoClass = Nil;
 static id gCustomSearchEngine = nil;
 static BOOL gEngineHooked = NO;
+static BOOL gEngineListDumped = NO;
+static BOOL gNeedForceDefault = NO;      // 只有「列表里找不到宿主引擎、只能追加」时才为 YES
 static int gEngineRetryCount = 0;
 
 static IMP gOrigPopulateSearchEngines = NULL;
 static IMP gOrigDefaultSearchEngine = NULL;
 static IMP gOrigDefaultSearchEngineIfPopulated = NULL;
+
+static BOOL SPEHForceDefaultEnabled(void) { return SPEHBoolPref(@"forceDefaultEngine", NO); }
+
+// 宿主引擎：默认 Ecosia，取不到再按这个顺序找（都取不到才退回「追加 + 强制默认」）
+static NSArray<NSString *> *SPEHHostEngineCandidates(void)
+{
+	return @[ @"Ecosia", @"Bing", @"必应", @"Yahoo", @"DuckDuckGo", @"Google", @"Baidu", @"百度" ];
+}
+
+static NSArray *SPEHGetEnginesArray(id controller)
+{
+	id engines = nil;
+	@try { engines = [controller valueForKey:@"_searchEngines"]; } @catch (NSException *e) { }
+	if (!engines) { @try { engines = [controller valueForKey:@"engines"]; } @catch (NSException *e) { } }
+	return [engines isKindOfClass:[NSArray class]] ? (NSArray *)engines : nil;
+}
+
+static NSString *SPEHEngineNameOf(id engine)
+{
+	for (NSString *k in @[ @"name", @"shortName", @"displayName", @"scriptingName" ]) {
+		@try {
+			id v = [engine valueForKey:k];
+			if ([v isKindOfClass:[NSString class]] && ((NSString *)v).length) return (NSString *)v;
+		} @catch (NSException *e) { }
+	}
+	return @"";
+}
+
+static NSString *SPEHEngineTemplateOf(id engine)
+{
+	for (NSString *k in @[ @"searchURLTemplate", @"searchURLTemplateString", @"URLTemplate" ]) {
+		@try {
+			id v = [engine valueForKey:k];
+			if ([v isKindOfClass:[NSString class]]) return (NSString *)v;
+		} @catch (NSException *e) { }
+	}
+	return nil;
+}
+
+static BOOL SPEHSetEngineTemplate(id engine, NSString *tpl)
+{
+	if (!engine || !tpl.length) return NO;
+
+	BOOL wrote = NO;
+	for (NSString *k in @[ @"searchURLTemplate", @"searchURLTemplateString" ]) {
+		@try {
+			[engine setValue:tpl forKey:k];
+			wrote = YES;
+			break;
+		} @catch (NSException *e) { }
+	}
+	if (!wrote) {
+		Ivar iv = class_getInstanceVariable([engine class], "_searchURLTemplate");
+		if (!iv) iv = class_getInstanceVariable([engine class], "_URLTemplate");
+		if (iv) {
+			@try {
+				object_setIvarWithStrongDefault(engine, iv, tpl);
+				wrote = YES;
+			} @catch (NSException *e) { }
+		}
+	}
+	if (!wrote) return NO;
+
+	NSString *now = SPEHEngineTemplateOf(engine);
+	return [now isEqualToString:tpl];
+}
+
+static void SPEHLogEngineList(NSArray *engines)
+{
+	NSMutableArray *desc = [NSMutableArray array];
+	for (id e in engines) {
+		NSString *n = SPEHEngineNameOf(e);
+		NSString *t = SPEHEngineTemplateOf(e) ?: @"(no-template)";
+		[desc addObject:[NSString stringWithFormat:@"%@<%s>=%@", n.length ? n : @"?", object_getClassName(e), t]];
+	}
+	SPEHLog(@"[engine] 内置引擎 %lu 个: %@", (unsigned long)engines.count,
+			[desc componentsJoinedByString:@" | "]);
+}
 
 static id SPEHCreateCustomSearchEngine(id controller)
 {
@@ -294,49 +384,104 @@ static id SPEHCreateCustomSearchEngine(id controller)
 	return engine;
 }
 
+// 兜底路径专用：列表里一个宿主引擎都认不出来时，才追加自建引擎（设置页里看不到它）
+static BOOL SPEHAppendCustomEngine(id controller, id engine)
+{
+	@try {
+		id engines = nil;
+		@try { engines = [controller valueForKey:@"_searchEngines"]; } @catch (NSException *e) { }
+		if (!engines) { @try { engines = [controller valueForKey:@"engines"]; } @catch (NSException *e) { } }
+		if (!engines) return NO;
+
+		if ([engines isKindOfClass:[NSMutableArray class]]) {
+			NSMutableArray *arr = (NSMutableArray *)engines;
+			if ([arr containsObject:engine]) return YES;
+			[arr addObject:engine];
+			return YES;
+		}
+		if ([engines isKindOfClass:[NSArray class]]) {
+			NSArray *arr = (NSArray *)engines;
+			if ([arr containsObject:engine]) return YES;
+			NSArray *newArr = [arr arrayByAddingObject:engine];
+			@try { [controller setValue:newArr forKey:@"_searchEngines"]; } @catch (NSException *e) { }
+			@try { [controller setValue:newArr forKey:@"engines"]; } @catch (NSException *e) { }
+			return YES;
+		}
+	} @catch (NSException *e) {
+		SPEHLog(@"[engine] append exception: %@", e);
+	}
+	return NO;
+}
+
 static void SPEHPopulateSearchEnginesHook(id self, SEL _cmd)
 {
 	if (gOrigPopulateSearchEngines) ((void (*)(id, SEL))gOrigPopulateSearchEngines)(self, _cmd);
 	if (!SPEHEngineEnabled()) return;
 
+	NSArray *engines = SPEHGetEnginesArray(self);
+	if (!engines.count) { SPEHLog(@"[engine] 引擎列表为空，放弃"); return; }
+
+	if (!gEngineListDumped) {
+		gEngineListDumped = YES;
+		SPEHLogEngineList(engines);
+	}
+
+	NSString *tpl = SPEHEngineURL();
+	if (![tpl containsString:@"{searchTerms}"]) {
+		SPEHLog(@"[engine] 模板缺少 {searchTerms}，放弃：%@", tpl);
+		return;
+	}
+
+	// ① 主路径：找宿主引擎，直接把它的模板换成元宝（设置里选它=元宝，其余引擎原样）
+	id host = nil;
+	NSString *wanted = SPEHStringPref(@"hostEngineName", @"Ecosia");
+	for (id e in engines) {
+		if ([SPEHEngineNameOf(e) caseInsensitiveCompare:wanted] == NSOrderedSame) { host = e; break; }
+	}
+	if (!host) {
+		for (NSString *cand in SPEHHostEngineCandidates()) {
+			for (id e in engines) {
+				if ([SPEHEngineNameOf(e) caseInsensitiveCompare:cand] == NSOrderedSame) { host = e; break; }
+			}
+			if (host) break;
+		}
+	}
+
+	if (host) {
+		if (SPEHSetEngineTemplate(host, tpl)) {
+			gCustomSearchEngine = host;
+			gNeedForceDefault = NO;
+			SPEHLog(@"[engine] 宿主引擎「%@」已指向元宝：%@", SPEHEngineNameOf(host), tpl);
+			return;
+		}
+		SPEHLog(@"[engine] 宿主引擎「%@」模板改写失败，转兜底", SPEHEngineNameOf(host));
+	}
+
+	// ② 兜底：追加自建引擎，并强制默认（否则设置页选不到它）
 	if (!gCustomSearchEngine) gCustomSearchEngine = SPEHCreateCustomSearchEngine(self);
 	if (!gCustomSearchEngine) return;
-
-	@try {
-		id engines = nil;
-		@try { engines = [self valueForKey:@"_searchEngines"]; } @catch (NSException *e) { }
-		if (!engines) { @try { engines = [self valueForKey:@"engines"]; } @catch (NSException *e) { } }
-
-		if ([engines isKindOfClass:[NSMutableArray class]]) {
-			NSMutableArray *arr = (NSMutableArray *)engines;
-			if (![arr containsObject:gCustomSearchEngine]) {
-				[arr addObject:gCustomSearchEngine];
-				SPEHLog(@"[engine] appended, total=%lu", (unsigned long)arr.count);
-			}
-		} else if ([engines isKindOfClass:[NSArray class]]) {
-			NSArray *arr = (NSArray *)engines;
-			if (![arr containsObject:gCustomSearchEngine]) {
-				NSArray *newArr = [arr arrayByAddingObject:gCustomSearchEngine];
-				@try { [self setValue:newArr forKey:@"_searchEngines"]; } @catch (NSException *e) { }
-				@try { [self setValue:newArr forKey:@"engines"]; } @catch (NSException *e) { }
-				SPEHLog(@"[engine] replaced immutable array, total=%lu", (unsigned long)newArr.count);
-			}
-		}
-	} @catch (NSException *e) {
-		SPEHLog(@"[engine] populate exception: %@", e);
+	if (SPEHAppendCustomEngine(self, gCustomSearchEngine)) {
+		gNeedForceDefault = YES;
+		SPEHLog(@"[engine] 兜底追加自建引擎（设置页不可见，靠强制默认生效）");
 	}
+}
+
+static BOOL SPEHShouldForceDefault(void)
+{
+	if (!SPEHEngineEnabled() || !gCustomSearchEngine) return NO;
+	return gNeedForceDefault || SPEHForceDefaultEnabled();
 }
 
 static id SPEHDefaultSearchEngineHook(id self, SEL _cmd)
 {
-	if (SPEHEngineEnabled() && gCustomSearchEngine) return gCustomSearchEngine;
+	if (SPEHShouldForceDefault()) return gCustomSearchEngine;
 	if (gOrigDefaultSearchEngine) return ((id (*)(id, SEL))gOrigDefaultSearchEngine)(self, _cmd);
 	return nil;
 }
 
 static id SPEHDefaultSearchEngineIfPopulatedHook(id self, SEL _cmd)
 {
-	if (SPEHEngineEnabled() && gCustomSearchEngine) return gCustomSearchEngine;
+	if (SPEHShouldForceDefault()) return gCustomSearchEngine;
 	if (gOrigDefaultSearchEngineIfPopulated) return ((id (*)(id, SEL))gOrigDefaultSearchEngineIfPopulated)(self, _cmd);
 	return nil;
 }
@@ -544,8 +689,16 @@ static NSString *SPEHOpenInAppJS(void)
 	static dispatch_once_t once;
 	dispatch_once(&once, ^{
 		js = @"(function(){try{var r={m:0,e:0,i:0};"
-			 "var ms=document.querySelectorAll('meta[name=apple-itunes-app]');"
-			 "for(var i=0;i<ms.length;i++){if(ms[i].parentNode)ms[i].parentNode.removeChild(ms[i]);r.m++;}"
+			 "var killMeta=function(){var ms=document.querySelectorAll('meta[name=apple-itunes-app],meta[name=smartbanner]');"
+			 "for(var i=0;i<ms.length;i++){try{ms[i].parentNode.removeChild(ms[i]);r.m++;}catch(q){}}};"
+			 "killMeta();"
+			 // 文档开始时 meta 可能还没解析出来，挂 MutationObserver 见到就删（GitHub 横幅就靠这条）
+			 // 只查新插入的 META 节点，不做整树遍历，避免长页面上的 CPU 开销
+			 "try{var mo=new MutationObserver(function(muts){for(var a=0;a<muts.length;a++){var ad=muts[a].addedNodes;"
+			 "for(var b=0;b<ad.length;b++){var n=ad[b];if(!n||n.tagName!=='META')continue;"
+			 "var nm=String((n.getAttribute&&n.getAttribute('name'))||'').toLowerCase();"
+			 "if(nm==='apple-itunes-app'||nm==='smartbanner'){try{n.parentNode.removeChild(n);r.m++;}catch(q){}}}}});"
+			 "mo.observe(document.documentElement||document,{childList:true,subtree:true});}catch(o){}"
 			 // ① 拦 itms / itunes scheme 的点击（网页跳 App Store 最常见的一条）
 			 "var bad=function(h){return /^(itms|itunes)/i.test(String(h||''));};"
 			 "document.addEventListener('click',function(e){try{var t=e.target;"
@@ -748,6 +901,21 @@ static void SPEHSweepBannerViews(UIView *anchor, NSString *tag)
 	} @catch (NSException *e) { }
 }
 
+// 扫所有窗口（不依赖某个 webView 的锚点）
+static void SPEHSweepAllWindows(NSString *tag)
+{
+	@try {
+		int total = 0;
+		for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+			if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+			for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+				total += SPEHKillBannerViews(w, 0, w.bounds);
+			}
+		}
+		if (total > 0) SPEHLog(@"[smartbanner] %@ 拆掉 %d 个", tag, total);
+	} @catch (NSException *e) { }
+}
+
 // 横幅类名到现在还没确定（0.7.0 里有 didFindAppBanner 被丢弃 21 次，但用户仍看到横幅，
 // 说明那个横幅视图的类名既不含 Banner 也不含 AppLink）。
 // 这里把「页面顶部、条状」的所有视图类名打出来，一次拿真名。
@@ -794,6 +962,13 @@ static void SPEHSetAppSuggestionBannerHook(id self, SEL _cmd, id banner, BOOL pi
 	// 不转发
 }
 
+static IMP gOrigAppBannerGetter = NULL;
+static IMP gOrigBCDidCompleteCheck = NULL;
+static IMP gOrigBCPinTop = NULL;
+static IMP gOrigBCRemoveBanner = NULL;
+
+static void SPEHSweepAllWindows(NSString *tag);
+
 static void SPEHDidFindAppBannerHook(id self, SEL _cmd, id content)
 {
 	// 不转发：Safari 认为「没发现 app banner」，不会再建视图
@@ -801,6 +976,34 @@ static void SPEHDidFindAppBannerHook(id self, SEL _cmd, id content)
 		SPEHLog(@"[smartbanner] 拦截 didFindAppBannerWithContent: 丢弃 %@",
 				content ? NSStringFromClass(object_getClass(content)) : @"(nil)");
 	}
+	// 有些版本即使这里不转发，BrowserController 那边也会补建一次视图，顺手再扫一遍
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+		dispatch_get_main_queue(), ^{
+			SPEHSweepAllWindows(@"didFind 后");
+		});
+}
+
+// appBanner getter 一律返回 nil：任何读它的渲染路径都拿不到 banner 对象
+static id SPEHAppBannerGetterHook(id self, SEL _cmd)
+{
+	return nil;
+}
+
+// BrowserController 的「检查完成 → 上屏」链路整段掐掉
+static void SPEHBCDidCompleteCheckHook(id self, SEL _cmd, id tabDocument)
+{
+	if (SPEHProbeEnabled()) SPEHLog(@"[smartbanner] 拦截 tabDocumentDidCompleteCheckForAppBanner:");
+	// 不转发
+}
+
+static void SPEHBCPinTopHook(id self, SEL _cmd, BOOL pinned, id tabDocument)
+{
+	// 不转发：不把横幅钉到顶部
+}
+
+static void SPEHBCRemoveBannerHook(id self, SEL _cmd, id tabDocument, BOOL animated)
+{
+	if (gOrigBCRemoveBanner) ((void (*)(id, SEL, id, BOOL))gOrigBCRemoveBanner)(self, _cmd, tabDocument, animated);
 }
 
 static void SPEHSetStoreBannersDisabledHook(id self, SEL _cmd, BOOL value)
@@ -824,12 +1027,26 @@ static void SPEHInstallSmartAppBannerPreciseHooks(void)
 		(IMP)SPEHDidFindAppBannerHook, &gOrigDidFindAppBanner);
 	SPEHPatchInstanceMethod(tabCls, NSSelectorFromString(@"setStoreBannersAreDisabled:"),
 		(IMP)SPEHSetStoreBannersDisabledHook, &gOrigSetStoreBannersDisabled);
+	SPEHPatchInstanceMethod(tabCls, NSSelectorFromString(@"appBanner"),
+		(IMP)SPEHAppBannerGetterHook, &gOrigAppBannerGetter);
 
-	SPEHLog(@"[smartbanner] 精准 hook setAppBanner=%s setAppSuggestionBanner=%s didFindAppBanner=%s storeDisabled=%s",
+	Class bcCls = NSClassFromString(@"BrowserController");
+	if (bcCls) {
+		SPEHPatchInstanceMethod(bcCls, NSSelectorFromString(@"tabDocumentDidCompleteCheckForAppBanner:"),
+			(IMP)SPEHBCDidCompleteCheckHook, &gOrigBCDidCompleteCheck);
+		SPEHPatchInstanceMethod(bcCls, NSSelectorFromString(@"setAppBannerPinnedToTop:forTabDocument:"),
+			(IMP)SPEHBCPinTopHook, &gOrigBCPinTop);
+		SPEHPatchInstanceMethod(bcCls, NSSelectorFromString(@"removeAppBannerFromTabDocument:animated:"),
+			(IMP)SPEHBCRemoveBannerHook, &gOrigBCRemoveBanner);
+	}
+
+	SPEHLog(@"[smartbanner] 精准 hook setAppBanner=%s appBanner(nil)=%s didFind=%s storeDisabled=%s bcCheck=%s bcPin=%s",
 			gOrigSetAppBanner ? "ok" : "missing",
-			gOrigSetAppSuggestionBanner ? "ok" : "missing",
+			gOrigAppBannerGetter ? "ok" : "missing",
 			gOrigDidFindAppBanner ? "ok" : "missing",
-			gOrigSetStoreBannersDisabled ? "ok" : "missing");
+			gOrigSetStoreBannersDisabled ? "ok" : "missing",
+			gOrigBCDidCompleteCheck ? "ok" : "missing",
+			gOrigBCPinTop ? "ok" : "missing");
 }
 
 static IMP gOrigWVDidMoveToWindow = NULL;
@@ -862,8 +1079,8 @@ static void SPEHWVDidMoveToWindowHook(UIView *self, SEL _cmd)
 		}
 	}
 
-	// 横幅视图清扫：三个时间点，横幅有时在页面加载完后才插进来
-	for (NSNumber *d in @[ @1.0, @2.5, @4.0 ]) {
+	// 横幅视图清扫：多个时间点，横幅有时在页面加载完后才插进来
+	for (NSNumber *d in @[ @1.0, @2.5, @4.0, @6.0 ]) {
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
 			dispatch_get_main_queue(), ^{
 				SPEHSweepBannerViews(weakSelf, [NSString stringWithFormat:@"%@s", d]);
@@ -909,280 +1126,140 @@ static void SPEHInstallOpenInAppHooks(void)
 	SPEHInstallSmartAppBannerPreciseHooks();
 }
 
-// MARK: - 拦截跳转 App Store
+// MARK: - 「在 App 中打开 / 继续」提示（Bing 等通用链接）
 //
-// 老板要求：任何网站都不允许跳 App Store。
-// 网页跳 App Store 只有两种形态：
-//   ① itms / itms-apps / itms-appss / itms-services 这些 scheme
-//   ② apps.apple.com / itunes.apple.com / testflight.apple.com 这些苹果域名
-// 拦截点：进程内 UIApplication.openURL 系列 + LaunchServices 兜底。
-// 正常网页 https 一律放行，不碰任何非苹果域。
+// 老板实测：用 Bing 搜索时 Safari 会从底部弹一张「继续搜索」卡片，
+// 一行「微软必应 APP → 打开」，一行「浏览器 → 继续」。这是 iOS 的 App Link 提示，
+// 由 Safari 在「当前页面对应某个 App 的 universal link」时主动弹出，跟网页自身无关。
+// 处理思路：从判定源头掐掉 —— 让 Safari 认为「这个 URL 没有可打开的 App」，
+// 它就不会有「打开 / 继续」可选，只能继续用 Safari。
 
-static BOOL SPEHAppStoreKillEnabled(void) { return SPEHBoolPref(@"blockAppStore", YES); }
+static BOOL SPEHAppLinkKillEnabled(void) { return SPEHBoolPref(@"killAppLinkPrompt", YES); }
 
-static BOOL SPEHURLTargetsAppStore(NSURL *url)
+static IMP gOrigAppLinkWithURL = NULL;
+static IMP gOrigAppLinkWithCache = NULL;
+static IMP gOrigAppLinkIsEnabledURL = NULL;
+static IMP gOrigIncludeAppLinkActions = NULL;
+static int gAppLinkLogCount = 0;
+
+static void SPEHPatchClassMethod(Class cls, SEL sel, IMP newImp, IMP *outOld)
 {
-	if (!url) return NO;
-	@try {
-		NSString *scheme = url.scheme.lowercaseString ?: @"";
-		if ([scheme hasPrefix:@"itms"]) return YES;
-		NSString *host = url.host.lowercaseString ?: @"";
-		if (host.length) {
-			if ([host hasSuffix:@"apps.apple.com"] ||
-				[host hasSuffix:@"itunes.apple.com"] ||
-				[host hasSuffix:@"testflight.apple.com"]) return YES;
+	if (!cls) return;
+	MSHookMessageEx(object_getClass(cls), sel, newImp, outOld);
+}
+
+static id SPEHAppLinkWithURLHook(id self, SEL _cmd, id url)
+{
+	if (SPEHAppLinkKillEnabled()) {
+		if (SPEHProbeEnabled() && gAppLinkLogCount < 20) {
+			gAppLinkLogCount++;
+			SPEHLog(@"[applink] 判定 %@ → nil（当作没有对应 App）", url);
 		}
-	} @catch (NSException *e) { }
-	return NO;
+		return nil;
+	}
+	if (gOrigAppLinkWithURL) return ((id (*)(id, SEL, id))gOrigAppLinkWithURL)(self, _cmd, url);
+	return nil;
 }
 
-static IMP gOrigOpenURLOptions = NULL;
-static IMP gOrigOpenURL = NULL;
-static IMP gOrigLSWorkspaceOpen = NULL;
-
-static void SPEHOpenURLOptionsHook(id self, SEL _cmd, NSURL *url, NSDictionary *options, id completion)
+static id SPEHAppLinkWithCacheHook(id self, SEL _cmd, id url, BOOL cache)
 {
-	if (SPEHAppStoreKillEnabled() && SPEHURLTargetsAppStore(url)) {
-		SPEHLog(@"[appstore] 拦截跳转 %@", url.absoluteString);
-		SPEHShowToast(@"已拦截跳转 App Store");
-		if (completion) {
-			void (^cb)(BOOL) = completion;
-			@try { cb(NO); } @catch (NSException *e) { }
+	if (SPEHAppLinkKillEnabled()) {
+		if (SPEHProbeEnabled() && gAppLinkLogCount < 20) {
+			gAppLinkLogCount++;
+			SPEHLog(@"[applink] 判定(cache) %@ → nil", url);
 		}
-		return;
+		return nil;
 	}
-	if (gOrigOpenURLOptions) {
-		((void (*)(id, SEL, NSURL *, NSDictionary *, id))gOrigOpenURLOptions)(self, _cmd, url, options, completion);
-	}
+	if (gOrigAppLinkWithCache) return ((id (*)(id, SEL, id, BOOL))gOrigAppLinkWithCache)(self, _cmd, url, cache);
+	return nil;
 }
 
-static BOOL SPEHOpenURLHook(id self, SEL _cmd, NSURL *url)
+static BOOL SPEHAppLinkIsEnabledURLHook(id self, SEL _cmd, id url)
 {
-	if (SPEHAppStoreKillEnabled() && SPEHURLTargetsAppStore(url)) {
-		SPEHLog(@"[appstore] 拦截跳转(legacy) %@", url.absoluteString);
-		SPEHShowToast(@"已拦截跳转 App Store");
-		return NO;
-	}
-	if (gOrigOpenURL) return ((BOOL (*)(id, SEL, NSURL *))gOrigOpenURL)(self, _cmd, url);
+	if (SPEHAppLinkKillEnabled()) return NO;
+	if (gOrigAppLinkIsEnabledURL) return ((BOOL (*)(id, SEL, id))gOrigAppLinkIsEnabledURL)(self, _cmd, url);
 	return NO;
 }
 
-static BOOL SPEHLSWorkspaceOpenHook(id self, SEL _cmd, NSURL *url, NSDictionary *options)
+static BOOL SPEHIncludeAppLinkActionsHook(id self, SEL _cmd, id webView, id element)
 {
-	if (SPEHAppStoreKillEnabled() && SPEHURLTargetsAppStore(url)) {
-		SPEHLog(@"[appstore] 拦截 LaunchServices %@", url.absoluteString);
-		return NO;
-	}
-	if (gOrigLSWorkspaceOpen) {
-		return ((BOOL (*)(id, SEL, NSURL *, NSDictionary *))gOrigLSWorkspaceOpen)(self, _cmd, url, options);
-	}
+	if (SPEHAppLinkKillEnabled()) return NO;   // 分享菜单里也不出现「在 App 中打开」
+	if (gOrigIncludeAppLinkActions) return ((BOOL (*)(id, SEL, id, id))gOrigIncludeAppLinkActions)(self, _cmd, webView, element);
 	return NO;
 }
 
-// 0.6.1 日志实证：两参 openURL:withOptions: hook 成功但零命中，
-// 说明 Safari 走的是三参版本（或 openSensitiveURL:）。这两条必须一起补上。
-static IMP gOrigLSOpen3 = NULL;
-static IMP gOrigLSOpenSensitive = NULL;
-
-static BOOL SPEHLSOpen3Hook(id self, SEL _cmd, NSURL *url, NSDictionary *options, NSError **error)
+static void SPEHDumpAppLinkClasses(void)
 {
-	if (SPEHAppStoreKillEnabled() && SPEHURLTargetsAppStore(url)) {
-		SPEHLog(@"[appstore] 拦截 LaunchServices(3参) %@", url.absoluteString);
-		return NO;
-	}
-	if (gOrigLSOpen3) {
-		return ((BOOL (*)(id, SEL, NSURL *, NSDictionary *, NSError **))gOrigLSOpen3)(self, _cmd, url, options, error);
-	}
-	return NO;
-}
-
-static BOOL SPEHLSOpenSensitiveHook(id self, SEL _cmd, NSURL *url, NSDictionary *options)
-{
-	if (SPEHAppStoreKillEnabled() && SPEHURLTargetsAppStore(url)) {
-		SPEHLog(@"[appstore] 拦截 LaunchServices(sensitive) %@", url.absoluteString);
-		return NO;
-	}
-	if (gOrigLSOpenSensitive) {
-		return ((BOOL (*)(id, SEL, NSURL *, NSDictionary *))gOrigLSOpenSensitive)(self, _cmd, url, options);
-	}
-	return NO;
-}
-
-// 0.6.2 日志实证：4 条 URL 拦截 hook 全 ok 但零命中 → Safari 打开 App 走的不是这些。
-// 补三条更底层的路径：
-//   ① -[LSApplicationWorkspace openApplicationWithBundleID:]  ← 最终启动 App 的那一步
-//   ② -[LSApplicationWorkspace openSensitiveURL:withOptions:error:]（3 参带 error）
-//   ③ -[LSAppLink openWithCompletionHandler:]  ← universal link（apps.apple.com 走这条）
-static IMP gOrigOpenAppByBundle = NULL;
-static IMP gOrigLSOpenSensitive3 = NULL;
-static IMP gOrigAppLinkOpen = NULL;
-static IMP gOrigAppLinkOpenStrategy = NULL;
-
-static BOOL SPEHBundleIsAppStore(NSString *bundleID)
-{
-	if (!bundleID.length) return NO;
-	NSString *b = bundleID.lowercaseString;
-	return ([b hasPrefix:@"com.apple.appstore"] ||
-			[b hasPrefix:@"com.apple.store"] ||
-			[b containsString:@"appstore"]);
-}
-
-static BOOL SPEHOpenAppByBundleHook(id self, SEL _cmd, NSString *bundleID)
-{
-	if (SPEHAppStoreKillEnabled() && SPEHBundleIsAppStore(bundleID)) {
-		SPEHLog(@"[appstore] 拦截启动 App bundle=%@", bundleID);
-		SPEHShowToast(@"已拦截跳转 App Store");
-		return NO;
-	}
-	if (gOrigOpenAppByBundle) {
-		return ((BOOL (*)(id, SEL, NSString *))gOrigOpenAppByBundle)(self, _cmd, bundleID);
-	}
-	return NO;
-}
-
-static BOOL SPEHLSOpenSensitive3Hook(id self, SEL _cmd, NSURL *url, NSDictionary *options, NSError **error)
-{
-	if (SPEHAppStoreKillEnabled() && SPEHURLTargetsAppStore(url)) {
-		SPEHLog(@"[appstore] 拦截 LaunchServices(sensitive3) %@", url.absoluteString);
-		SPEHShowToast(@"已拦截跳转 App Store");
-		return NO;
-	}
-	if (gOrigLSOpenSensitive3) {
-		return ((BOOL (*)(id, SEL, NSURL *, NSDictionary *, NSError **))gOrigLSOpenSensitive3)(self, _cmd, url, options, error);
-	}
-	return NO;
-}
-
-static void SPEHAppLinkOpenHook(id self, SEL _cmd, id completion)
-{
-	if (SPEHAppStoreKillEnabled()) {
-		NSString *desc = @"";
-		@try { desc = [[self valueForKey:@"URL"] absoluteString] ?: @""; } @catch (NSException *e) { }
-		SPEHLog(@"[appstore] 拦截 LSAppLink 打开 %@", desc.length ? desc : @"(unknown)");
-		SPEHShowToast(@"已拦截打开外部 App");
-		if (completion) {
-			void (^cb)(BOOL, NSError *) = completion;
-			@try { cb(NO, nil); } @catch (NSException *e) { }
+	for (NSString *cn in @[ @"WBSAppLink", @"SFAppLink", @"_LSAppLink", @"LSAppLink" ]) {
+		Class c = NSClassFromString(cn);
+		if (!c) { SPEHLog(@"[applink] %@ 未加载", cn); continue; }
+		NSMutableArray *cls = [NSMutableArray array];
+		NSMutableArray *ins = [NSMutableArray array];
+		unsigned int n = 0;
+		Method *cm = class_copyMethodList(object_getClass(c), &n);
+		for (unsigned int i = 0; i < n; i++) {
+			const char *sn = sel_getName(method_getName(cm[i]));
+			if (strstr(sn, "appLink") || strstr(sn, "AppLink") || strstr(sn, "Enabled") || strstr(sn, "Open")) {
+				[cls addObject:[NSString stringWithUTF8String:sn]];
+			}
 		}
-		return;
-	}
-	if (gOrigAppLinkOpen) ((void (*)(id, SEL, id))gOrigAppLinkOpen)(self, _cmd, completion);
-}
-
-// 8 条 URL / LaunchServices hook 全 ok 但零命中 ⇒ Safari 打开外部 App 根本不经这些 API。
-// 换到真正的「决策点」：WebKit 导航回调。网页跳 itms:// 时，WebKit 先问宿主
-// "这次导航准不准"，Safari 在回调里决定「交给系统打开」。在这里直接 Cancel，
-// 后面无论它走哪条私有路径都不会发生。
-static IMP gOrigPolicy4 = NULL;
-static IMP gOrigPolicy3 = NULL;
-static int gPolicyHooked = 0;
-
-static BOOL SPEHNavActionTargetsAppStore(id action)
-{
-	if (!SPEHAppStoreKillEnabled() || !action) return NO;
-	@try {
-		NSURL *u = nil;
-		id req = [action valueForKey:@"request"];
-		if (req) u = [req valueForKey:@"URL"];
-		if (!u) u = [action valueForKey:@"URL"];
-		if (u && SPEHURLTargetsAppStore(u)) {
-			SPEHLog(@"[appstore] 拦截导航 %@", u.absoluteString);
-			SPEHShowToast(@"已拦截跳转 App Store");
-			return YES;
+		free(cm);
+		n = 0;
+		Method *im = class_copyMethodList(c, &n);
+		for (unsigned int i = 0; i < n; i++) {
+			const char *sn = sel_getName(method_getName(im[i]));
+			if (strstr(sn, "appLink") || strstr(sn, "AppLink") || strstr(sn, "Enabled") || strstr(sn, "Open")) {
+				[ins addObject:[NSString stringWithUTF8String:sn]];
+			}
 		}
-	} @catch (NSException *e) { }
-	return NO;
-}
-
-static void SPEHPolicy4Hook(id self, SEL _cmd, id webView, id action, id prefs, id handler)
-{
-	if (SPEHNavActionTargetsAppStore(action)) {
-		if (handler) { void (^h)(NSInteger) = handler; h(1); }   // WKNavigationActionPolicyCancel
-		return;
+		free(im);
+		SPEHLog(@"[applink] %@ 类方法: %@ / 实例方法: %@", cn,
+				cls.count ? [cls componentsJoinedByString:@", "] : @"(无)",
+				ins.count ? [ins componentsJoinedByString:@", "] : @"(无)");
 	}
-	if (gOrigPolicy4) ((void (*)(id, SEL, id, id, id, id))gOrigPolicy4)(self, _cmd, webView, action, prefs, handler);
 }
 
-static void SPEHPolicy3Hook(id self, SEL _cmd, id webView, id action, id handler)
+static void SPEHInstallAppLinkHooks(void)
 {
-	if (SPEHNavActionTargetsAppStore(action)) {
-		if (handler) { void (^h)(NSInteger) = handler; h(1); }
-		return;
-	}
-	if (gOrigPolicy3) ((void (*)(id, SEL, id, id, id))gOrigPolicy3)(self, _cmd, webView, action, handler);
-}
+	if (!SPEHAppLinkKillEnabled()) { SPEHLog(@"[applink] disabled by prefs"); return; }
 
-static void SPEHInstallNavigationPolicyHooks(void)
-{
-	if (!SPEHAppStoreKillEnabled()) return;
-
-	NSArray *classes = @[ @"BrowserController", @"TabDocument", @"_SFTabDocument",
-						  @"_SFWebView", @"SFWebView", @"BrowserViewController" ];
-	NSArray *sels = @[ @"webView:decidePolicyForNavigationAction:preferences:decisionHandler:",
-					   @"webView:decidePolicyForNavigationAction:decisionHandler:",
-					   @"_webView:decidePolicyForNavigationAction:preferences:decisionHandler:" ];
-	for (NSString *cn in classes) {
+	NSMutableArray *hit = [NSMutableArray array];
+	for (NSString *cn in @[ @"WBSAppLink", @"SFAppLink" ]) {
 		Class c = NSClassFromString(cn);
 		if (!c) continue;
-		for (NSString *sn in sels) {
-			SEL sel = NSSelectorFromString(sn);
-			Method m = class_getInstanceMethod(c, sel);
-			if (!m) continue;
-			BOOL is4 = ([sn rangeOfString:@"preferences"].location != NSNotFound);
-			if (is4) {
-				MSHookMessageEx(c, sel, (IMP)SPEHPolicy4Hook, &gOrigPolicy4);
-			} else {
-				MSHookMessageEx(c, sel, (IMP)SPEHPolicy3Hook, &gOrigPolicy3);
-			}
-			gPolicyHooked++;
-			SPEHLog(@"[appstore] hook 导航决策 %@ -%@", cn, sn);
+
+		SEL s1 = NSSelectorFromString(@"appLinkWithURL:");
+		if (class_getClassMethod(c, s1)) {
+			SPEHPatchClassMethod(c, s1, (IMP)SPEHAppLinkWithURLHook, &gOrigAppLinkWithURL);
+			[hit addObject:[NSString stringWithFormat:@"%@ +appLinkWithURL:", cn]];
+		}
+		SEL s2 = NSSelectorFromString(@"appLinkWithURL:useCacheIfRecent:");
+		if (class_getClassMethod(c, s2)) {
+			SPEHPatchClassMethod(c, s2, (IMP)SPEHAppLinkWithCacheHook, &gOrigAppLinkWithCache);
+			[hit addObject:[NSString stringWithFormat:@"%@ +appLinkWithURL:useCacheIfRecent:", cn]];
+		}
+		SEL s3 = NSSelectorFromString(@"isEnabledForURL:");
+		if (class_getInstanceMethod(c, s3)) {
+			SPEHPatchInstanceMethod(c, s3, (IMP)SPEHAppLinkIsEnabledURLHook, &gOrigAppLinkIsEnabledURL);
+			[hit addObject:[NSString stringWithFormat:@"%@ -isEnabledForURL:", cn]];
 		}
 	}
-	if (gPolicyHooked == 0) SPEHLog(@"[appstore] 导航决策 hook 未命中任何类（需再探真实 delegate 类）");
-}
 
-static void SPEHInstallAppStoreHooks(void)
-{
-	if (!SPEHAppStoreKillEnabled()) { SPEHLog(@"[appstore] disabled by prefs"); return; }
-
-	SPEHPatchInstanceMethod([UIApplication class],
-		NSSelectorFromString(@"openURL:options:completionHandler:"),
-		(IMP)SPEHOpenURLOptionsHook, &gOrigOpenURLOptions);
-	SPEHPatchInstanceMethod([UIApplication class],
-		NSSelectorFromString(@"openURL:"),
-		(IMP)SPEHOpenURLHook, &gOrigOpenURL);
-
-	Class lsCls = NSClassFromString(@"LSApplicationWorkspace");
-	if (lsCls) {
-		SPEHPatchInstanceMethod(lsCls, NSSelectorFromString(@"openURL:withOptions:"),
-			(IMP)SPEHLSWorkspaceOpenHook, &gOrigLSWorkspaceOpen);
-		SPEHPatchInstanceMethod(lsCls, NSSelectorFromString(@"openURL:withOptions:error:"),
-			(IMP)SPEHLSOpen3Hook, &gOrigLSOpen3);
-		SPEHPatchInstanceMethod(lsCls, NSSelectorFromString(@"openSensitiveURL:withOptions:"),
-			(IMP)SPEHLSOpenSensitiveHook, &gOrigLSOpenSensitive);
-		SPEHPatchInstanceMethod(lsCls, NSSelectorFromString(@"openSensitiveURL:withOptions:error:"),
-			(IMP)SPEHLSOpenSensitive3Hook, &gOrigLSOpenSensitive3);
-		SPEHPatchInstanceMethod(lsCls, NSSelectorFromString(@"openApplicationWithBundleID:"),
-			(IMP)SPEHOpenAppByBundleHook, &gOrigOpenAppByBundle);
+	Class tabCls = NSClassFromString(@"TabDocument");
+	if (tabCls) {
+		for (NSString *sn in @[ @"_webView:shouldIncludeAppLinkActionsForElement:",
+								@"webView:shouldIncludeAppLinkActionsForElement:" ]) {
+			SEL sel = NSSelectorFromString(sn);
+			if (class_getInstanceMethod(tabCls, sel)) {
+				SPEHPatchInstanceMethod(tabCls, sel, (IMP)SPEHIncludeAppLinkActionsHook, &gOrigIncludeAppLinkActions);
+				[hit addObject:[NSString stringWithFormat:@"TabDocument -%@", sn]];
+			}
+		}
 	}
 
-	Class appLinkCls = NSClassFromString(@"LSAppLink");
-	if (appLinkCls) {
-		SPEHPatchInstanceMethod(appLinkCls, NSSelectorFromString(@"openWithCompletionHandler:"),
-			(IMP)SPEHAppLinkOpenHook, &gOrigAppLinkOpen);
-	}
-
-	SPEHLog(@"[appstore] hooks optionsHandler=%s legacyOpenURL=%s ls2=%s ls3=%s lssensitive=%s sensitive3=%s openAppBundle=%s appLink=%s",
-			gOrigOpenURLOptions ? "ok" : "FAILED",
-			gOrigOpenURL ? "ok" : "FAILED",
-			gOrigLSWorkspaceOpen ? "ok" : "missing",
-			gOrigLSOpen3 ? "ok" : "missing",
-			gOrigLSOpenSensitive ? "ok" : "missing",
-			gOrigLSOpenSensitive3 ? "ok" : "missing",
-			gOrigOpenAppByBundle ? "ok" : "missing",
-			gOrigAppLinkOpen ? "ok" : "missing");
-
-	SPEHInstallNavigationPolicyHooks();
+	SPEHLog(@"[applink] hook %lu 条: %@", (unsigned long)hit.count,
+			hit.count ? [hit componentsJoinedByString:@" | "] : @"(未命中任何方法)");
+	if (SPEHProbeEnabled()) SPEHDumpAppLinkClasses();
 }
 
 // MARK: - 返回缓存：WKProcessPool 原生接口探针
@@ -1593,15 +1670,15 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 		SPEHLog(@"==============================================");
 		SPEHLog(@"Safari16Enhance " SPEH_VERSION " loaded, pid=%d", getpid());
 		SPEHLog(@"log file = %@", SPEHLogPath());
-		SPEHLog(@"engine=%d(%@) dialog=%d reader=%d openinapp=%d backscroll=%d appstore=%d probe=%d",
+		SPEHLog(@"engine=%d(%@) dialog=%d reader=%d openinapp=%d backscroll=%d probe=%d",
 				SPEHEngineEnabled(), SPEHEngineName(), SPEHDialogKillEnabled(), SPEHReaderKillEnabled(),
-				SPEHOpenInAppKillEnabled(), SPEHBackScrollFixEnabled(), SPEHAppStoreKillEnabled(), SPEHProbeEnabled());
+				SPEHOpenInAppKillEnabled(), SPEHBackScrollFixEnabled(), SPEHProbeEnabled());
 
 		SPEHInstallSFDialogHooks();
 		SPEHInstallReaderHooks();
 		SPEHInstallOpenInAppHooks();
 		SPEHInstallBackScrollHooks();
-		SPEHInstallAppStoreHooks();
+		SPEHInstallAppLinkHooks();
 		SPEHInstallURLBarSwipeHooks();
 		SPEHScheduleSearchEngineHookInstall();
 	}
