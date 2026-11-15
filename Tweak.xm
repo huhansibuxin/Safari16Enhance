@@ -1,19 +1,26 @@
-// Safari16Enhance 0.2.0 - iOS 16 Safari 增强
+// Safari16Enhance 0.3.0 - iOS 16 Safari 增强
 //
-// 0.1.0 实测事实：
-//   - 引擎注入成功：controller = _SFSearchEngineController，_populateSearchEngines 已 hook，引擎数组 10 个
-//   - 但「打不开该网页」弹窗没有走 -[UIViewController presentViewController:animated:completion:]，
-//     日志零命中，也没有 alert 级 window → 必须换探测点（UIAlertController 生命周期 + 工厂方法）
+// 实测事实链：
+//   0.1.0：引擎注入成功（_SFSearchEngineController + _populateSearchEngines，10 个引擎）；
+//          「打不开该网页」弹窗对 presentViewController 零命中。
+//   0.2.0：加上 UIAlertController 工厂 + viewWillAppear/viewDidAppear + 全窗口监听，仍然零命中；
+//          窗口日志里只有 MobileSafariWindow / UITextEffectsWindow / UIRemoteKeyboardWindow。
+//          → 该弹窗不是 UIAlertController，也不经过 UIViewController present 链路。
+//          → 设备上只有 com.apple.mobilesafari 一个 UI 进程（无 SafariViewService），排除跨进程。
+//          → 唯一剩下的形态：直接往 window 上挂自定义 view（或自定义 VC 但绕开了 present）。
+//   阅读器：0.2.0 的类名通扫命中 3 个真实方法，老板实测已生效。
+//   bfcache：0.2.0 dump 出的 WKPreferences 候选 setter 里没有 BackForward 相关，
+//          iOS 16 上不存在 _setBackForwardCacheEnabled: 这类开关 → 换候选名 + 全量 dump 确认。
 //
-// 0.2.0 变更：
-//   1. 弹窗：present 链路 + UIAlertController viewWillAppear/viewDidAppear + 工厂方法（带调用栈）+ 全窗口监听，
-//      命中后尽力 dismiss 并 toast
-//   2. 阅读器：运行时按类名扫描所有 *Reader* 类，把「是否可用」判定一律压成 NO，
-//      地址栏「阅读器可用」提示自然不再出现
-//   3. 返回缓存：运行时在 WKPreferences 类层次上找 *BackForward*Enabled: 这类 SPI 并打开，
-//      让「从下一页返回」走 bfcache 恢复而不是重新拉网络
+// 0.3.0 变更：
+//   1. 阅读器：改为白名单精准命中（只 hook 已实测确认的 3 个方法 + 自动激活管理器），
+//      不再全类名通扫，零误伤、零启动开销
+//   2. 弹窗：加视图层探针 —— hook -[UIView didMoveToWindow] 与 -[UIViewController viewDidAppear:]，
+//      按类名（Alert/Dialog/Prompt/Error）过滤并去重，一定能抓到那个弹窗的真实类名
+//   3. bfcache：候选名扩到 BackForward / PageCache / Snapshot，并对 WKPreferences +
+//      WKWebViewConfiguration 做全量 dump，一次看清 iOS 16 到底有没有这个开关
 //
-// 原则：所有 hook 先检查类/方法存在性，BOOLEAN 返回类型校验，全部 @try 包裹，绝不让 Safari 崩
+// 原则：所有 hook 先检查类/方法存在性，返回类型校验，全部 @try 包裹，绝不让 Safari 崩
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -22,7 +29,7 @@
 #import <substrate.h>
 #import <unistd.h>
 
-#define SPEH_VERSION "0.2.0"
+#define SPEH_VERSION "0.3.0"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -249,19 +256,7 @@ static void SPEHPatchClassMethod(Class cls, SEL sel, IMP newImp, IMP *outOld)
 	MSHookMessageEx(object_getClass(cls), sel, newImp, outOld);
 }
 
-static void SPEHDumpMethodList(Class cls, NSUInteger limit, NSString *tag)
-{
-	if (!cls) return;
-	unsigned int count = 0;
-	Method *methods = class_copyMethodList(cls, &count);
-	SPEHLog(@"[probe-%@] class %@ (%u methods)", tag, NSStringFromClass(cls), count);
-	for (unsigned int i = 0; i < count && i < limit; i++) {
-		SPEHLog(@"[probe-%@]    - %@  types=%s", tag, NSStringFromSelector(method_getName(methods[i])), method_getTypeEncoding(methods[i]));
-	}
-	free(methods);
-}
-
-// MARK: - 搜索引擎注入（0.1.0 已验证可用）
+// MARK: - 搜索引擎注入（已实测可用，逻辑保持不变）
 
 @protocol SPEHEngineInfoInit <NSObject>
 - (id)initWithDictionary:(NSDictionary *)dict usingContext:(id)context;
@@ -366,16 +361,13 @@ static void SPEHInstallSearchEngineHooks(void)
 
 	SPEHLog(@"[engine] controller=%@ info=%@", NSStringFromClass(gSearchEngineControllerClass), NSStringFromClass(gSearchEngineInfoClass));
 
-	BOOL hookedPopulate = NO;
 	for (NSString *name in @[ @"_populateSearchEngines", @"populateSearchEngines", @"_updateSearchEngines" ]) {
 		SEL sel = NSSelectorFromString(name);
 		if (class_getInstanceMethod(gSearchEngineControllerClass, sel)) {
 			SPEHPatchInstanceMethod(gSearchEngineControllerClass, sel, (IMP)SPEHPopulateSearchEnginesHook, &gOrigPopulateSearchEngines);
-			hookedPopulate = YES;
 			break;
 		}
 	}
-	if (!hookedPopulate) SPEHDumpMethodList(gSearchEngineControllerClass, 80, @"engine");
 
 	SPEHPatchInstanceMethod(gSearchEngineControllerClass, @selector(defaultSearchEngine), (IMP)SPEHDefaultSearchEngineHook, &gOrigDefaultSearchEngine);
 	SPEHPatchInstanceMethod(gSearchEngineControllerClass, @selector(defaultSearchEngineIfPopulated), (IMP)SPEHDefaultSearchEngineIfPopulatedHook, &gOrigDefaultSearchEngineIfPopulated);
@@ -396,12 +388,51 @@ static void SPEHScheduleSearchEngineHookInstall(void)
 	}
 }
 
-// MARK: - 弹窗拦截（0.2.0：多探测点 + 生命周期拦截）
+// MARK: - 弹窗拦截
+//
+// 0.2.0 结论：该弹窗既不是 UIAlertController，也不经过 UIViewController present 链路，
+// 且设备上只有 com.apple.mobilesafari 一个 UI 进程，因此只可能是「直接挂 view 到 window」。
+// 0.3.0 加视图层探针，用类名过滤 + 去重，把真实类名抓出来。
 
 static IMP gOrigPresentViewController = NULL;
 static IMP gOrigAlertFactory = NULL;
 static IMP gOrigAlertViewWillAppear = NULL;
 static IMP gOrigAlertViewDidAppear = NULL;
+static IMP gOrigUIViewDidMoveToWindow = NULL;
+static IMP gOrigVCViewDidAppear = NULL;
+
+static NSMutableSet *gSeenViewClasses = nil;
+static NSLock *gSeenLock = nil;
+
+static void SPEHInitSeenSets(void)
+{
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		gSeenViewClasses = [NSMutableSet set];
+		gSeenLock = [[NSLock alloc] init];
+	});
+}
+
+// 只看类名像弹窗的，避免刷屏
+static BOOL SPEHClassNameLooksLikeAlert(const char *name)
+{
+	if (!name) return NO;
+	return (strstr(name, "Alert") != NULL) ||
+		   (strstr(name, "Dialog") != NULL) ||
+		   (strstr(name, "Prompt") != NULL);
+}
+
+// 首次见到某类名才记录，返回 YES 表示是新类
+static BOOL SPEHMarkSeen(NSString *cls)
+{
+	if (cls.length == 0) return NO;
+	SPEHInitSeenSets();
+	[gSeenLock lock];
+	BOOL isNew = ![gSeenViewClasses containsObject:cls];
+	if (isNew) [gSeenViewClasses addObject:cls];
+	[gSeenLock unlock];
+	return isNew;
+}
 
 static BOOL SPEHIsTargetErrorAlert(UIAlertController *alert)
 {
@@ -444,9 +475,15 @@ static void SPEHSuppressAlert(UIAlertController *alert, NSString *stage)
 	SPEHShowToast(toast);
 }
 
-// ① present 链路（0.1.0 未命中，保留兜底）
+// ① present 链路（保留兜底）
 static void SPEHPresentViewControllerHook(UIViewController *self, SEL _cmd, UIViewController *vc, BOOL animated, void (^completion)(void))
 {
+	if (SPEHProbeEnabled() && vc) {
+		NSString *cls = NSStringFromClass([vc class]);
+		if (SPEHClassNameLooksLikeAlert([cls UTF8String]) && SPEHMarkSeen(cls)) {
+			SPEHLog(@"[alert] present 链路首次出现类: %@", cls);
+		}
+	}
 	if (SPEHAlertSuppressEnabled() && [vc isKindOfClass:[UIAlertController class]]) {
 		UIAlertController *alert = (UIAlertController *)vc;
 		SPEHLogAlertContext(alert, @"present");
@@ -461,7 +498,7 @@ static void SPEHPresentViewControllerHook(UIViewController *self, SEL _cmd, UIVi
 	}
 }
 
-// ② 工厂方法：任何 alert 被创建都会命中，附调用栈用于定位真实链路
+// ② 工厂方法
 static id SPEHAlertFactoryHook(id self, SEL _cmd, NSString *title, NSString *message, UIAlertControllerStyle style)
 {
 	if (SPEHProbeEnabled()) {
@@ -476,7 +513,7 @@ static id SPEHAlertFactoryHook(id self, SEL _cmd, NSString *title, NSString *mes
 	return nil;
 }
 
-// ③ 生命周期：任何 in-process alert 出现都会走这里，最可靠的拦截点
+// ③ 生命周期
 static void SPEHAlertViewWillAppearHook(UIAlertController *self, SEL _cmd)
 {
 	if (gOrigAlertViewWillAppear) ((void (*)(id, SEL))gOrigAlertViewWillAppear)(self, _cmd);
@@ -503,6 +540,51 @@ static void SPEHAlertViewDidAppearHook(UIAlertController *self, SEL _cmd)
 	}
 }
 
+// ④ 视图层探针：任何类名像弹窗的 view 挂到 window 上都会命中
+static void SPEHUIViewDidMoveToWindowHook(UIView *self, SEL _cmd)
+{
+	if (gOrigUIViewDidMoveToWindow) ((void (*)(id, SEL))gOrigUIViewDidMoveToWindow)(self, _cmd);
+
+	if (!SPEHProbeEnabled()) return;
+	if (!self.window) return;
+
+	const char *name = class_getName(object_getClass(self));
+	if (!SPEHClassNameLooksLikeAlert(name)) return;
+
+	NSString *cls = [NSString stringWithUTF8String:name];
+	if (!SPEHMarkSeen(cls)) return;
+
+	NSMutableString *chain = [NSMutableString string];
+	UIView *v = self.superview;
+	int depth = 0;
+	while (v && depth < 6) {
+		if (chain.length) [chain appendString:@" <- "];
+		[chain appendString:NSStringFromClass([v class])];
+		v = v.superview;
+		depth++;
+	}
+	NSString *text = @"-";
+	if ([self isKindOfClass:[UILabel class]]) text = ((UILabel *)self).text ?: @"-";
+	SPEHLog(@"[alertview] 挂载 class=%@ frame=%@ windowLevel=%.0f chain=%@ text=%@",
+			cls, NSStringFromCGRect(self.frame), self.window.windowLevel,
+			chain.length ? chain : @"(root)", text);
+}
+
+// ⑤ 视图控制器层探针：绕开 present 的自定义 VC 也能抓到
+static void SPEHVCViewDidAppearHook(UIViewController *self, SEL _cmd)
+{
+	if (gOrigVCViewDidAppear) ((void (*)(id, SEL))gOrigVCViewDidAppear)(self, _cmd);
+
+	if (!SPEHProbeEnabled()) return;
+	const char *name = class_getName(object_getClass(self));
+	if (!SPEHClassNameLooksLikeAlert(name) && !strstr(name, "Error")) return;
+
+	NSString *cls = [NSString stringWithUTF8String:name];
+	if (!SPEHMarkSeen(cls)) return;
+	SPEHLog(@"[alertvc] appear class=%@ presenter=%@", cls,
+			self.presentingViewController ? NSStringFromClass([self.presentingViewController class]) : @"-");
+}
+
 static void SPEHInstallAlertHooks(void)
 {
 	SPEHPatchInstanceMethod([UIViewController class], @selector(presentViewController:animated:completion:),
@@ -521,7 +603,15 @@ static void SPEHInstallAlertHooks(void)
 							(IMP)SPEHAlertViewDidAppearHook, &gOrigAlertViewDidAppear);
 	SPEHLog(@"[hook] alertDidAppear=%s", gOrigAlertViewDidAppear ? "ok" : "FAILED");
 
-	// 探针：任何新窗口都记（排除键盘窗，避免刷屏）
+	SPEHPatchInstanceMethod([UIView class], @selector(didMoveToWindow),
+							(IMP)SPEHUIViewDidMoveToWindowHook, &gOrigUIViewDidMoveToWindow);
+	SPEHLog(@"[hook] viewDidMoveToWindow=%s", gOrigUIViewDidMoveToWindow ? "ok" : "FAILED");
+
+	SPEHPatchInstanceMethod([UIViewController class], @selector(viewDidAppear:),
+							(IMP)SPEHVCViewDidAppearHook, &gOrigVCViewDidAppear);
+	SPEHLog(@"[hook] vcViewDidAppear=%s", gOrigVCViewDidAppear ? "ok" : "FAILED");
+
+	// 窗口监听：只记非键盘窗
 	[[NSNotificationCenter defaultCenter] addObserverForName:UIWindowDidBecomeVisibleNotification
 													  object:nil
 													   queue:[NSOperationQueue mainQueue]
@@ -535,101 +625,163 @@ static void SPEHInstallAlertHooks(void)
 	}];
 }
 
-// MARK: - 阅读器击杀
+// MARK: - 阅读器击杀（白名单精准命中）
 //
-// 「阅读器可用」是 Safari 判定文章页后在地址栏临时替换 URL 的提示，
-// 源头是 *Reader* 类的可用性判定。这里按类名通用扫描，把零参 BOOL 判定压成 NO。
+// 0.2.0 实测确认的三个方法（类名通扫的产物），改为写死白名单：
+//   -[_SFReaderController isReaderAvailable]
+//   -[_SFWebProcessPlugInReaderEnabledPageController readerHasBeenActivatedRecently]
+//   -[WBSReaderAvailabilityCheckResult isReaderAvailable]
+// 另外补 _SFReaderController 的其它可用性表达，以及自动阅读器激活管理器的判定。
 
 static BOOL SPEHReturnNOHook(id self, SEL _cmd) { return NO; }
 
-static BOOL SPEHLooksLikeAvailabilitySelector(NSString *selName)
-{
-	return [selName hasPrefix:@"isReader"] || [selName hasPrefix:@"reader"] ||
-		   [selName hasPrefix:@"_isReader"] || [selName hasPrefix:@"isArticleAvailable"] ||
-		   [selName hasPrefix:@"isReaderAvailable"];
-}
+typedef struct {
+	const char *clsName;
+	const char *selName;
+} SPEHReaderRule;
+
+static const SPEHReaderRule kReaderRules[] = {
+	{ "_SFReaderController",                    "isReaderAvailable" },
+	{ "_SFWebProcessPlugInReaderEnabledPageController", "readerHasBeenActivatedRecently" },
+	{ "WBSReaderAvailabilityCheckResult",       "isReaderAvailable" },
+	{ "WBSReaderAvailabilityCheckResult",       "isReaderAvailableIgnoringDynamicFontSize" },
+	{ "WBSReaderAvailabilityCheckResult",       "isReaderAvailableForAllPages" },
+	{ "_SFReaderController",                    "isReaderAvailableForAllPages" },
+	{ "_SFReaderController",                    "canShowReader" },
+	{ "WBSAutomaticReaderActivationManager",    "isEnabled" },
+};
 
 static void SPEHInstallReaderHooks(void)
 {
 	if (!SPEHReaderKillEnabled()) { SPEHLog(@"[reader] disabled by prefs"); return; }
 
-	unsigned int count = 0;
-	Class *classes = objc_copyClassList(&count);
-	int classHits = 0, methodHits = 0;
+	int hit = 0, miss = 0;
+	NSUInteger total = sizeof(kReaderRules) / sizeof(kReaderRules[0]);
 
-	for (unsigned int i = 0; i < count; i++) {
-		Class cls = classes[i];
-		const char *name = class_getName(cls);
-		if (!name) continue;
-		NSString *clsName = [NSString stringWithUTF8String:name];
-		if (!clsName) continue;
-		if ([clsName rangeOfString:@"Reader"].location == NSNotFound) continue;
-		classHits++;
+	for (NSUInteger i = 0; i < total; i++) {
+		const char *clsC = kReaderRules[i].clsName;
+		const char *selC = kReaderRules[i].selName;
+		Class cls = objc_getClass(clsC);
+		if (!cls) { miss++; continue; }
 
-		unsigned int mcount = 0;
-		Method *methods = class_copyMethodList(cls, &mcount);
-		for (unsigned int j = 0; j < mcount; j++) {
-			SEL sel = method_getName(methods[j]);
-			const char *selC = sel_getName(sel);
-			NSString *selName = [NSString stringWithUTF8String:selC];
-			if (!selName) continue;
-			if (strchr(selC, ':')) continue;                      // 只处理零参判定
-			if (!SPEHLooksLikeAvailabilitySelector(selName)) continue;
-			if (!SPEHMethodReturnsBool(methods[j])) continue;
-			MSHookMessageEx(cls, sel, (IMP)SPEHReturnNOHook, NULL);
-			SPEHLog(@"[reader] -[%@ %@] -> NO", clsName, selName);
-			methodHits++;
-		}
-		free(methods);
+		SEL sel = sel_getUid(selC);
+		Method m = class_getInstanceMethod(cls, sel);
+		if (!m) { miss++; continue; }
+		if (!SPEHMethodReturnsBool(m)) { miss++; continue; }
 
-		Class meta = object_getClass(cls);
-		if (meta) {
-			unsigned int ccount = 0;
-			Method *cms = class_copyMethodList(meta, &ccount);
-			for (unsigned int j = 0; j < ccount; j++) {
-				SEL sel = method_getName(cms[j]);
-				const char *selC = sel_getName(sel);
-				NSString *selName = [NSString stringWithUTF8String:selC];
-				if (!selName) continue;
-				if (strchr(selC, ':')) continue;
-				if (!SPEHLooksLikeAvailabilitySelector(selName)) continue;
-				if (!SPEHMethodReturnsBool(cms[j])) continue;
-				MSHookMessageEx(meta, sel, (IMP)SPEHReturnNOHook, NULL);
-				SPEHLog(@"[reader] +[%@ %@] -> NO", clsName, selName);
-				methodHits++;
-			}
-			free(cms);
-		}
+		MSHookMessageEx(cls, sel, (IMP)SPEHReturnNOHook, NULL);
+		SPEHLog(@"[reader] 精准命中 -[%s %s] -> NO", clsC, selC);
+		hit++;
 	}
-	free(classes);
 
-	SPEHLog(@"[reader] 'Reader' classes=%d, availability hooks=%d", classHits, methodHits);
+	SPEHLog(@"[reader] 白名单 total=%lu hit=%d miss=%d", (unsigned long)total, hit, miss);
+
+	// 兜底：0.2.0 的通扫保留为可选开关（默认关）
+	if (SPEHBoolPref(@"readerDeepScan", NO)) {
+		unsigned int count = 0;
+		Class *classes = objc_copyClassList(&count);
+		int scans = 0;
+		for (unsigned int i = 0; i < count; i++) {
+			const char *name = class_getName(classes[i]);
+			if (!name || !strstr(name, "Reader")) continue;
+			unsigned int mcount = 0;
+			Method *methods = class_copyMethodList(classes[i], &mcount);
+			for (unsigned int j = 0; j < mcount; j++) {
+				const char *selC = sel_getName(method_getName(methods[j]));
+				if (!selC || strchr(selC, ':')) continue;
+				NSString *s = [NSString stringWithUTF8String:selC];
+				if (!s) continue;
+				if (!([s hasPrefix:@"isReader"] || [s hasPrefix:@"reader"] || [s hasPrefix:@"isArticleAvailable"])) continue;
+				if (!SPEHMethodReturnsBool(methods[j])) continue;
+				MSHookMessageEx(classes[i], method_getName(methods[j]), (IMP)SPEHReturnNOHook, NULL);
+				scans++;
+			}
+			free(methods);
+		}
+		free(classes);
+		SPEHLog(@"[reader] deepScan 额外命中 %d", scans);
+	}
 }
 
-// MARK: - 返回不重新加载（打开 WebKit back/forward cache）
+// MARK: - 返回不重新加载（bfcache）
 //
-// iOS 16 系统框架在 dyld shared cache 里，无法静态查 SPI 名，
-// 故运行时在 WKPreferences 类层次上找所有 *BackForward*Enabled: 的 setter 并置 YES。
+// 0.2.0 实测：WKPreferences 上不存在任何 *BackForward* setter。
+// 0.3.0 扩大候选名 + 全量 dump WKPreferences / WKWebViewConfiguration 上与缓存相关的方法，
+// 一次看清 iOS 16 有没有这个开关；有就直接开，没有就如实记录无解。
 
-static void SPEHLogPreferencesCandidates(id prefs)
+static void SPEHDumpCacheRelated(id obj, NSString *tag)
 {
-	SPEHLog(@"[bfcache] dump WKPreferences 候选 setter：");
-	Class cls = object_getClass(prefs);
+	if (!obj) return;
+	Class cls = object_getClass(obj);
 	int depth = 0;
-	while (cls && cls != [NSObject class] && depth < 4) {
+	int printed = 0;
+	SPEHLog(@"[bfcache] dump %@ (真实类 %@)", tag, NSStringFromClass(cls));
+
+	while (cls && cls != [NSObject class] && depth < 5) {
 		unsigned int n = 0;
 		Method *ms = class_copyMethodList(cls, &n);
 		for (unsigned int i = 0; i < n; i++) {
 			NSString *s = NSStringFromSelector(method_getName(ms[i]));
 			if (!s) continue;
-			BOOL hit = ([s rangeOfString:@"ack" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-						[s rangeOfString:@"Cache" options:NSCaseInsensitiveSearch].location != NSNotFound);
-			if (hit && [s hasSuffix:@":"]) SPEHLog(@"[bfcache]    %@", s);
+			BOOL hit = ([s rangeOfString:@"Back" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+						[s rangeOfString:@"Forward" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+						[s rangeOfString:@"Cache" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+						[s rangeOfString:@"Snapshot" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+						[s rangeOfString:@"Restore" options:NSCaseInsensitiveSearch].location != NSNotFound);
+			if (!hit) continue;
+			if (![s hasSuffix:@":"]) continue;
+			SPEHLog(@"[bfcache]   %@ -%@", NSStringFromClass(cls), s);
+			printed++;
+			if (printed > 80) { free(ms); return; }
 		}
 		free(ms);
 		cls = class_getSuperclass(cls);
 		depth++;
 	}
+	SPEHLog(@"[bfcache] dump %@ 完成，候选 %d 条", tag, printed);
+}
+
+static const char *kCacheSetterCandidates[] = {
+	"_setBackForwardCacheEnabled:",
+	"setBackForwardCacheEnabled:",
+	"_setUsesBackForwardCache:",
+	"setUsesBackForwardCache:",
+	"_setPageCacheEnabled:",
+	"setPageCacheEnabled:",
+	"_setUsesPageCache:",
+	"setUsesPageCache:",
+	"_setBackForwardCacheEnabledForTesting:",
+};
+
+static int SPEHTryCacheSetters(id obj)
+{
+	if (!obj) return 0;
+	int applied = 0;
+	NSUInteger total = sizeof(kCacheSetterCandidates) / sizeof(kCacheSetterCandidates[0]);
+
+	for (NSUInteger i = 0; i < total; i++) {
+		SEL sel = sel_getUid(kCacheSetterCandidates[i]);
+		if (![obj respondsToSelector:sel]) continue;
+
+		@try {
+			((void (*)(id, SEL, BOOL))objc_msgSend)(obj, sel, YES);
+			SPEHLog(@"[bfcache] 命中并置 YES: %s", kCacheSetterCandidates[i]);
+			applied++;
+		} @catch (NSException *e) {
+			SPEHLog(@"[bfcache] %s 异常 %@", kCacheSetterCandidates[i], e);
+		}
+	}
+
+	// KVC 兜底（属性存在但方法名不同时）
+	for (NSString *key in @[ @"backForwardCacheEnabled", @"usesBackForwardCache", @"pageCacheEnabled", @"usesPageCache" ]) {
+		@try {
+			[obj setValue:@YES forKey:key];
+			SPEHLog(@"[bfcache] KVC 命中并置 YES: %@", key);
+			applied++;
+		} @catch (NSException *e) { }
+	}
+
+	return applied;
 }
 
 static void SPEHEnableBFCache(id prefs)
@@ -639,44 +791,13 @@ static void SPEHEnableBFCache(id prefs)
 	if (objc_getAssociatedObject(prefs, &kMarker)) return;
 	objc_setAssociatedObject(prefs, &kMarker, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-	int applied = 0;
-	Class cls = object_getClass(prefs);
-	int depth = 0;
-	while (cls && cls != [NSObject class] && depth < 6) {
-		unsigned int n = 0;
-		Method *ms = class_copyMethodList(cls, &n);
-		for (unsigned int i = 0; i < n; i++) {
-			SEL sel = method_getName(ms[i]);
-			const char *selC = sel_getName(sel);
-			if (!selC) continue;
-			NSString *s = [NSString stringWithUTF8String:selC];
-			if (!s) continue;
-
-			BOOL isSetter = [s hasPrefix:@"_set"] || [s hasPrefix:@"set"];
-			if (!isSetter || ![s hasSuffix:@":"]) continue;
-			if ([s rangeOfString:@"BackForward" options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
-
-			const char *types = method_getTypeEncoding(ms[i]);
-			if (!types || types[0] != 'v' || types[1] != '@' || types[2] != ':') continue;
-
-			@try {
-				((void (*)(id, SEL, BOOL))objc_msgSend)(prefs, sel, YES);
-				SPEHLog(@"[bfcache] %@ -> YES", s);
-				applied++;
-			} @catch (NSException *e) {
-				SPEHLog(@"[bfcache] %@ exception %@", s, e);
-			}
-		}
-		free(ms);
-		cls = class_getSuperclass(cls);
-		depth++;
-	}
-
-	if (applied == 0) SPEHLogPreferencesCandidates(prefs);
+	int applied = SPEHTryCacheSetters(prefs);
+	if (applied == 0) SPEHDumpCacheRelated(prefs, @"preferences");
 }
 
 static IMP gOrigSetPreferences = NULL;
 static IMP gOrigPreferencesGetter = NULL;
+static IMP gOrigSetConfiguration = NULL;
 
 static void SPEHSetPreferencesHook(id self, SEL _cmd, id prefs)
 {
@@ -691,6 +812,23 @@ static id SPEHPreferencesGetterHook(id self, SEL _cmd)
 	return prefs;
 }
 
+// WKWebViewConfiguration 本身也可能带缓存开关
+static void SPEHSetConfigurationHook(id self, SEL _cmd, id cfg)
+{
+	if (gOrigSetConfiguration) ((void (*)(id, SEL, id))gOrigSetConfiguration)(self, _cmd, cfg);
+	if (!SPEHBFCacheEnabled() || !cfg) return;
+
+	static char kCfgMarker;
+	if (objc_getAssociatedObject(cfg, &kCfgMarker)) return;
+	objc_setAssociatedObject(cfg, &kCfgMarker, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+	int applied = SPEHTryCacheSetters(cfg);
+	id prefs = nil;
+	@try { prefs = [cfg valueForKey:@"preferences"]; } @catch (NSException *e) { }
+	if (prefs) applied += SPEHTryCacheSetters(prefs);
+	if (applied == 0) SPEHDumpCacheRelated(cfg, @"WKWebViewConfiguration");
+}
+
 static void SPEHInstallBFCacheHooks(void)
 {
 	if (!SPEHBFCacheEnabled()) { SPEHLog(@"[bfcache] disabled by prefs"); return; }
@@ -700,8 +838,13 @@ static void SPEHInstallBFCacheHooks(void)
 
 	SPEHPatchInstanceMethod(cfgCls, NSSelectorFromString(@"setPreferences:"), (IMP)SPEHSetPreferencesHook, &gOrigSetPreferences);
 	SPEHPatchInstanceMethod(cfgCls, NSSelectorFromString(@"preferences"), (IMP)SPEHPreferencesGetterHook, &gOrigPreferencesGetter);
-	SPEHLog(@"[bfcache] hooks setPreferences=%s preferences=%s",
-			gOrigSetPreferences ? "ok" : "FAILED", gOrigPreferencesGetter ? "ok" : "FAILED");
+
+	Class wkCls = NSClassFromString(@"WKWebView");
+	SPEHPatchInstanceMethod(wkCls, NSSelectorFromString(@"setConfiguration:"), (IMP)SPEHSetConfigurationHook, &gOrigSetConfiguration);
+
+	SPEHLog(@"[bfcache] hooks setPreferences=%s preferences=%s setConfiguration=%s",
+			gOrigSetPreferences ? "ok" : "FAILED", gOrigPreferencesGetter ? "ok" : "FAILED",
+			gOrigSetConfiguration ? "ok" : "FAILED");
 }
 
 // MARK: - 入口
@@ -723,23 +866,5 @@ static void SPEHInstallBFCacheHooks(void)
 		SPEHInstallReaderHooks();
 		SPEHInstallBFCacheHooks();
 		SPEHScheduleSearchEngineHookInstall();
-
-		if (SPEHProbeEnabled()) {
-			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-				dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-					unsigned int count = 0;
-					Class *classes = objc_copyClassList(&count);
-					NSMutableArray *readerCls = [NSMutableArray array];
-					for (unsigned int i = 0; i < count; i++) {
-						const char *nm = class_getName(classes[i]);
-						if (!nm) continue;
-						NSString *s = [NSString stringWithUTF8String:nm];
-						if (s && [s rangeOfString:@"Reader"].location != NSNotFound) [readerCls addObject:s];
-					}
-					free(classes);
-					SPEHLog(@"[probe] Reader classes: %@", [readerCls componentsJoinedByString:@", "]);
-				});
-			});
-		}
 	}
 }

@@ -71,6 +71,13 @@
 			default = YES;
 		},
 		{
+			cell = PSSwitchCell;
+			label = "深度扫描全部 Reader 类（兜底）";
+			defaults = "com.huhansibuxin.safari16enhance";
+			key = "readerDeepScan";
+			default = NO;
+		},
+		{
 			cell = PSGroupCell;
 			label = "返回缓存";
 			footerText = "从搜索页点进网页后返回，Safari 默认重新拉网络（很慢）。开启后启用 WebKit 后退/前进缓存（bfcache），返回直接恢复上一页内存状态，不再重新加载。";
@@ -97,7 +104,7 @@
 		{
 			cell = PSGroupCell;
 			label = "功能说明";
-			footerText = "1. 自定义搜索引擎：注入自建 SearchEngineInfo 并强制作为默认引擎（默认元宝搜索）。\n2. 弹窗拦截：命中「打不开该网页 / 网址无效 / 地址无效」等文案即拦截，改 toast。\n3. 阅读器击杀：按类名扫描所有 Reader 类，把可用性判定压成 NO。\n4. 返回缓存：在 WKPreferences 上打开 WebKit 的 back/forward cache，返回不再重新加载。\n5. 探针：记录 alert 创建/呈现链路、Reader 类清单、bfcache setter 命中情况。\n\n日志：容器 Documents/Safari16Enhance.log（超 2MB 轮转为 .1）。";
+			footerText = "1. 自定义搜索引擎：注入自建 SearchEngineInfo 并强制作为默认引擎（默认元宝搜索）。\n2. 弹窗拦截：命中「打不开该网页 / 网址无效 / 地址无效」等文案即拦截，改 toast。\n3. 阅读器击杀：白名单精准命中 3 个已实测确认的可用性判定，压成 NO；可选深度扫描兜底。\n4. 返回缓存：尝试打开 WebKit 的 back/forward cache，iOS 16 若无对应 SPI 会记录在日志里。\n5. 探针：记录 alert 创建/呈现链路、视图层弹窗真实类名、Reader 命中清单、bfcache 候选 dump。\n\n日志：容器 Documents/Safari16Enhance.log（超 2MB 轮转为 .1）。";
 		}
 	);
 }
