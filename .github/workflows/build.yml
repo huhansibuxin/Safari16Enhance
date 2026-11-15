@@ -59,20 +59,22 @@ jobs:
           echo "== $DYLIB =="
           otool -L "$DYLIB"
           STRINGS=$(strings -a "$DYLIB")
+          VER=$(grep '^Version:' control | awk '{print $2}')
           for NEEDLE in \
-            'Safari16Enhance 0.7.1 loaded' \
+            "Safari16Enhance $VER loaded" \
             'Safari16Enhance.log' \
             'https://so.qq.com/isearch?query={searchTerms}' \
             'SearchEngineController' \
             '_populateSearchEngines' \
             'defaultSearchEngineIfPopulated' \
+            'hostEngineName' \
             'SFDialogView' \
             'killOpenInApp' \
             'fixBackScroll' \
-            'blockAppStore' \
+            'killAppLinkPrompt' \
+            'appLinkWithURL' \
+            'appBanner' \
             'killURLBarSwipe' \
-            'openURL:options:completionHandler:' \
-            'apps.apple.com' \
             'WKProcessPool' \
             'Documents' ; do
             if ! echo "$STRINGS" | grep -qF "$NEEDLE"; then
