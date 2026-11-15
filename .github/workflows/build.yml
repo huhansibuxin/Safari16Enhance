@@ -60,16 +60,17 @@ jobs:
           otool -L "$DYLIB"
           STRINGS=$(strings -a "$DYLIB")
           for NEEDLE in \
-            'Safari16Enhance 0.4.0 loaded' \
+            'Safari16Enhance 0.5.0 loaded' \
             'Safari16Enhance.log' \
             'https://so.qq.com/isearch?query={searchTerms}' \
             'SearchEngineController' \
             '_populateSearchEngines' \
             'defaultSearchEngineIfPopulated' \
-            'presentViewController:animated:completion:' \
             'SFDialogView' \
-            'blockReloadOnBack' \
-            'SUPPRESSED' \
+            'smartbanner' \
+            'apple-itunes-app' \
+            'killOpenInApp' \
+            'fixBackScroll' \
             'Documents' ; do
             if ! echo "$STRINGS" | grep -qF "$NEEDLE"; then
               echo "::error::required string missing from dylib: $NEEDLE"

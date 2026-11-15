@@ -48,8 +48,8 @@
 		},
 		{
 			cell = PSGroupCell;
-			label = "错误弹窗";
-			footerText = "Safari 打不开网页时强制弹「打不开该网页 / 因为网址无效」对话框，必须点「好」。开启后拦截并改成底部 toast。";
+			label = "弹窗";
+			footerText = "Safari 打不开网页时会弹「打不开该网页 / 因为网址无效」，必须点「好」。开启后按文本精准命中该对话框并拆除，改底部 toast。";
 		},
 		{
 			cell = PSSwitchCell;
@@ -60,8 +60,20 @@
 		},
 		{
 			cell = PSGroupCell;
+			label = "推广横幅";
+			footerText = "「App 内打开」绿色浮层是网页自己画的；顶部 Smart App Banner 是 Safari 原生横幅。开启后两者都清掉。";
+		},
+		{
+			cell = PSSwitchCell;
+			label = "移除「App 内打开」与 Smart App Banner";
+			defaults = "com.huhansibuxin.safari16enhance";
+			key = "killOpenInApp";
+			default = YES;
+		},
+		{
+			cell = PSGroupCell;
 			label = "阅读器";
-			footerText = "Safari 检测到文章页时会在地址栏临时把网址换成「阅读器可用」，并显示阅读器按钮。开启后彻底关闭该判定，提示与按钮都不再出现。";
+			footerText = "Safari 检测到文章页时会在地址栏临时把网址换成「阅读器可用」，并显示阅读器按钮。开启后彻底关闭该判定。";
 		},
 		{
 			cell = PSSwitchCell;
@@ -71,29 +83,15 @@
 			default = YES;
 		},
 		{
-			cell = PSSwitchCell;
-			label = "深度扫描全部 Reader 类（兜底）";
-			defaults = "com.huhansibuxin.safari16enhance";
-			key = "readerDeepScan";
-			default = NO;
-		},
-		{
 			cell = PSGroupCell;
-			label = "返回缓存";
-			footerText = "从搜索页点进网页后返回，Safari 默认重新拉网络（很慢）。开启后启用 WebKit 后退/前进缓存（bfcache），返回直接恢复上一页内存状态，不再重新加载。";
+			label = "返回";
+			footerText = "iOS 16 的 WebKit 无 bfcache 开关（已实测确认）。此开关在返回后主动复位滚动视图，缓解返回上一页后前几次滑动不响应的问题。";
 		},
 		{
 			cell = PSSwitchCell;
-			label = "返回时使用缓存（不重新加载）";
+			label = "返回后修复滑动";
 			defaults = "com.huhansibuxin.safari16enhance";
-			key = "backForwardCache";
-			default = YES;
-		},
-		{
-			cell = PSSwitchCell;
-			label = "返回后抑制多余重载";
-			defaults = "com.huhansibuxin.safari16enhance";
-			key = "blockReloadOnBack";
+			key = "fixBackScroll";
 			default = YES;
 		},
 		{
@@ -111,7 +109,7 @@
 		{
 			cell = PSGroupCell;
 			label = "功能说明";
-			footerText = "1. 自定义搜索引擎：注入自建 SearchEngineInfo 并强制作为默认引擎（默认元宝搜索）。\n2. 弹窗拦截：Safari 自绘的 SFDialogView（打不开该网页 / 网址无效）按文本精准拆除，改 toast；网页自己的 JS 对话框不受影响。\n3. 阅读器击杀：白名单精准命中已实测确认的可用性判定，压成 NO；可选深度扫描兜底。\n4. 返回缓存：iOS 16 的 WKPreferences 无 bfcache 开关（已实测确认），改为在后退窗口内抑制多余 reload。\n5. 探针：记录 SFDialog 文本、alert 链路、Reader 命中清单、bfcache 候选 dump。\n\n日志：容器 Documents/Safari16Enhance.log（超 2MB 轮转为 .1）。";
+			footerText = "1. 自定义搜索引擎：注入自建 SearchEngineInfo 并强制作为默认引擎（默认元宝搜索）。\n2. 弹窗拦截：只保留精准命中，Safari 自绘的 SFDialogView 按文本拆除，网页自己的 JS 对话框不受影响。\n3. 推广横幅：JS 清网页自绘「App 内打开」浮层 + 移除 apple-itunes-app meta + 原生 Smart App Banner 直接拆除。\n4. 阅读器：白名单精准命中已实测确认的可用性判定，压成 NO。\n5. 返回：iOS 16 无 bfcache SPI，改为返回后主动复位滚动视图。\n\n日志：容器 Documents/Safari16Enhance.log（超 2MB 轮转为 .1）。";
 		}
 	);
 }
