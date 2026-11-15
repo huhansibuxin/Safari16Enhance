@@ -558,11 +558,15 @@ static NSString *SPEHOpenInAppJS(void)
 	return js;
 }
 
+@protocol SPEHWebViewJS <NSObject>
+- (void)evaluateJavaScript:(NSString *)script completionHandler:(void (^)(id result, NSError *error))handler;
+@end
+
 static void SPEHApplyOpenInAppJS(id webView)
 {
 	if (!webView) return;
 	@try {
-		[webView evaluateJavaScript:SPEHOpenInAppJS() completionHandler:^(id result, NSError *error) {
+		[(id<SPEHWebViewJS>)webView evaluateJavaScript:SPEHOpenInAppJS() completionHandler:^(id result, NSError *error) {
 			if (error) return;
 			NSString *r = [result isKindOfClass:[NSString class]] ? (NSString *)result : nil;
 			if (!r || [r isEqualToString:@"meta=0 el=0"]) return;
@@ -628,7 +632,7 @@ static void SPEHInstallSmartAppBannerHooks(void)
 		IMP old = NULL;
 		MSHookMessageEx(cls, @selector(didMoveToWindow), (IMP)SPEHSmartBannerDidMoveToWindow, &old);
 		if (old) {
-			gBannerOrigMap[[NSString stringWithUTF8String:name]] = [NSValue valueWithPointer:old];
+			gBannerOrigMap[[NSString stringWithUTF8String:name]] = [NSValue valueWithPointer:(void *)old];
 			SPEHLog(@"[smartbanner] hook %s", name);
 			hooked++;
 		}
