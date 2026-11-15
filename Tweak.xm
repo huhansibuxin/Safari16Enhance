@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.9.1"
+#define SPEH_VERSION "0.9.2"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -156,6 +156,7 @@ static BOOL SPEHEnabled(void)              { return SPEHBoolPref(@"enabled", YES
 static BOOL SPEHDialogKillEnabled(void)    { return SPEHBoolPref(@"suppressErrorAlert", YES); }
 static BOOL SPEHReaderKillEnabled(void)    { return SPEHBoolPref(@"killReader", YES); }
 static BOOL SPEHOpenInAppKillEnabled(void) { return SPEHBoolPref(@"killOpenInApp", YES); }
+static BOOL SPEHSmartBannerKillEnabled(void) { return SPEHBoolPref(@"killSmartBanner", YES); }
 static BOOL SPEHBackScrollFixEnabled(void) { return SPEHBoolPref(@"fixBackScroll", YES); }
 static BOOL SPEHProbeEnabled(void)         { return SPEHBoolPref(@"probeEnabled", YES); }
 
@@ -394,26 +395,50 @@ static NSString *SPEHOpenInAppJS(void)
 	static NSString *js = nil;
 	static dispatch_once_t once;
 	dispatch_once(&once, ^{
-		js = @"(function(){try{var r={m:0,e:0};"
+		js = @"(function(){try{"
+			 // 每个页面只做「一次性初始化」，重复注入不会重复挂监听器
+			 "if(!window.__speh)window.__speh={ready:0,click:0,s:0};"
+			 "var first=!window.__speh.ready;window.__speh.ready=1;"
+			 "var r={m:0,e:0,link:0};"
+			 // ① 删 apple-itunes-app / smartbanner meta（Smart App Banner 的触发源头）
 			 "var killMeta=function(){var ms=document.querySelectorAll('meta[name=apple-itunes-app],meta[name=smartbanner]');"
 			 "for(var i=0;i<ms.length;i++){try{ms[i].parentNode.removeChild(ms[i]);r.m++;}catch(q){}}};"
 			 "killMeta();"
-			 // 文档开始时 meta 可能还没解析出来，挂 MutationObserver 见到就删（GitHub 横幅就靠这条）
-			 // 只查新插入的 META 节点，不做整树遍历，避免长页面上的 CPU 开销
-			 "try{var mo=new MutationObserver(function(muts){for(var a=0;a<muts.length;a++){var ad=muts[a].addedNodes;"
+			 // meta 可能在文档开始时还没解析出来：只观察新插入的 META 节点，不做整树遍历
+			 "if(!window.__speh.mo){try{var mo=new MutationObserver(function(muts){"
+			 "for(var a=0;a<muts.length;a++){var ad=muts[a].addedNodes;"
 			 "for(var b=0;b<ad.length;b++){var n=ad[b];if(!n||n.tagName!=='META')continue;"
 			 "var nm=String((n.getAttribute&&n.getAttribute('name'))||'').toLowerCase();"
-			 "if(nm==='apple-itunes-app'||nm==='smartbanner'){try{n.parentNode.removeChild(n);r.m++;}catch(q){}}}}});"
-			 "mo.observe(document.documentElement||document,{childList:true,subtree:true});}catch(o){}"
-			 "var kws=['App 内打开','App内打开','在App内打开','在 App 内打开','打开App','打开 App'];"
-			 "var els=document.querySelectorAll('body *');"
+			 "if(nm==='apple-itunes-app'||nm==='smartbanner'){try{n.parentNode.removeChild(n);}catch(q){}}}}});"
+			 "mo.observe(document.documentElement||document,{childList:true,subtree:true});"
+			 "window.__speh.mo=mo;}catch(o){}}"
+			 // ② 自定义 scheme 白名单：只有这些放行，其余（itms-apps/ms-bing/bingapp/weixin...）一律算「跳 App」
+			 "var ok=function(h){var m=/^([a-z][a-z0-9+.\\-]*):/i.exec(String(h||''));"
+			 "if(!m)return true;var sc=m[1].toLowerCase();"
+			 "return sc==='http'||sc==='https'||sc==='about'||sc==='data'||sc==='blob'||sc==='file'"
+			 "||sc==='javascript'||sc==='tel'||sc==='mailto'||sc==='sms'||sc==='facetime';};"
+			 // ③ 统计当前页面里「会跳 App」的链接数量 —— 这个数是预判它会不会弹卡片的证据
+			 "try{var as=document.querySelectorAll('a[href]');var lim=Math.min(as.length,300);"
+			 "for(var i2=0;i2<lim;i2++){if(!ok(as[i2].getAttribute('href')))r.link++;}}catch(z){}"
+			 // ④ 点击拦截：捕获阶段只读判断，命中才 preventDefault（不改网页其它行为）
+			 "if(!window.__speh.click){window.__speh.click=1;"
+			 "document.addEventListener('click',function(e){try{var t=e.target;"
+			 "while(t&&t.tagName!=='A'){t=t.parentNode;}if(!t)return;"
+			 "var h=t.getAttribute&&t.getAttribute('href');if(!ok(h)){"
+			 "e.preventDefault();e.stopPropagation();window.__speh.s=(window.__speh.s||0)+1;}}catch(x){}},true);}"
+			 // ⑤ 清网页自绘的「App 内打开」浮层（中英双关键字 + 只认 fixed/sticky/absolute + 宽度够宽）
+			 "var kws=['App 内打开','App内打开','在App内打开','在 App 内打开','打开App','打开 App','open in app','Open in App','OPEN IN APP'];"
+			 "var els=document.querySelectorAll('body *');var wlim=Math.max(240,window.innerWidth*0.6);"
 			 "for(var j=0;j<els.length;j++){var el=els[j];if(!el.parentNode)continue;"
-			 "var t=(el.textContent||'').replace(/^\\s+|\\s+$/g,'');if(!t||t.length>40)continue;"
+			 "var t=(el.textContent||'').replace(/^\\s+|\\s+$/g,'');if(!t||t.length>60)continue;"
 			 "var hit=false;for(var k=0;k<kws.length;k++){if(t.indexOf(kws[k])>=0){hit=true;break;}}"
 			 "if(!hit)continue;"
 			 "var cs=getComputedStyle(el);"
-			 "if(cs.position==='fixed'||cs.position==='sticky'||cs.position==='absolute'){el.parentNode.removeChild(el);r.e++;}}"
-			 "return 'meta='+r.m+' el='+r.e;}catch(err){return 'ERR:'+err;}})()";
+			 "if((cs.position==='fixed'||cs.position==='sticky')&&el.getBoundingClientRect().width>=wlim){"
+			 "el.parentNode.removeChild(el);r.e++;}}"
+			 "return 'first='+(first?1:0)+' meta='+r.m+' el='+r.e+' link='+r.link"
+			 "+' click='+window.__speh.click+' s='+(window.__speh.s||0);"
+			 "}catch(err){return 'ERR:'+err;}})()";
 	});
 	return js;
 }
@@ -421,6 +446,25 @@ static NSString *SPEHOpenInAppJS(void)
 @protocol SPEHWebViewJS <NSObject>
 - (void)evaluateJavaScript:(NSString *)script completionHandler:(void (^)(id result, NSError *error))handler;
 @end
+
+// 解析 JS 回报字符串里的整数
+static int SPEHJSInt(NSString *s, NSString *key)
+{
+	if (!s || !key) return -1;
+	NSString *pat = [key stringByAppendingString:@"="];
+	NSRange r = [s rangeOfString:pat];
+	if (r.location == NSNotFound) return -1;
+	NSUInteger i = r.location + r.length;
+	int v = 0; BOOL got = NO;
+	while (i < s.length) {
+		unichar c = [s characterAtIndex:i];
+		if (c < '0' || c > '9') break;
+		v = v * 10 + (int)(c - '0');
+		got = YES;
+		i++;
+	}
+	return got ? v : -1;
+}
 
 static void SPEHApplyOpenInAppJS(id webView)
 {
@@ -432,8 +476,23 @@ static void SPEHApplyOpenInAppJS(id webView)
 				return;
 			}
 			NSString *r = [result isKindOfClass:[NSString class]] ? (NSString *)result : nil;
-			if (!r || [r isEqualToString:@"meta=0 el=0"]) return;   // 没啥可清，不刷日志
-			SPEHLog(@"[openinapp] 清理结果 %@", r);
+			if (!r) return;
+
+			int first = SPEHJSInt(r, @"first");
+			int meta  = SPEHJSInt(r, @"meta");
+			int elems = SPEHJSInt(r, @"el");
+			int link  = SPEHJSInt(r, @"link");
+			int click = SPEHJSInt(r, @"click");
+			int blocked = SPEHJSInt(r, @"s");
+
+			// 每个新页面打一条「就绪」：这是「JS 侧防线真的装上了」的直接证据
+			if (first == 1) {
+				SPEHLog(@"[openinapp] 就绪 link=%d meta=%d click=%d", link, meta, click);
+			}
+			// 有清理动作 / 有拦截动作才追加，避免刷屏
+			if (meta > 0 || elems > 0 || blocked > 0) {
+				SPEHLog(@"[openinapp] 清理 meta=%d el=%d 已拦点击=%d", meta, elems, blocked);
+			}
 		}];
 	} @catch (NSException *e) { }
 }
@@ -446,6 +505,142 @@ static void SPEHApplyOpenInAppJS(id webView)
 // 换 processPool）是非法的，会打乱 Safari 自己的注入管线（扩展 content script 走同一套）。
 // 结论：绝不碰 configuration / userContentController / processPool。
 // 删 meta 改用 evaluateJavaScript 在各时间点执行；横幅本身已由原生 hook 拦住。
+
+// ─── Smart App Banner：精准命中（0.9.2 恢复）─────────────────────────────
+//
+// 0.9.1 曾把这段整体删除，怀疑它与「扩展权限反复弹窗」有关。现已证实那次弹窗来自
+// Extensions.plist / Neo-Noir local.db 里的畸形 origin（huayuarc.xn--cn -928...），
+// 与本模块无关，因此按老板要求「只保留精准命中」原样恢复。
+//
+// 精准原则：只 hook 下面这 8 个**明确存在、明确语义**的方法，
+// 绝不按类名通扫（0.6.0 的父子类重复 hook 曾导致自递归爆栈闪退）。
+// 运行时会先 class_getInstanceMethod 判存在再挂，缺哪个就少挂哪个，不会挂错。
+
+static IMP gOrigSetAppBanner = NULL;
+static IMP gOrigSetAppSuggestionBanner = NULL;
+static IMP gOrigDidFindAppBanner = NULL;
+static IMP gOrigSetStoreBannersDisabled = NULL;
+static IMP gOrigAppBannerGetter = NULL;
+static IMP gOrigBCDidCompleteCheck = NULL;
+static IMP gOrigBCPinTop = NULL;
+static IMP gOrigBCRemoveBanner = NULL;
+
+// 计数：证明这条链到底有没有被调用（老板要看"命中证据"）
+static int gBannerHitSet = 0;
+static int gBannerHitDidFind = 0;
+static int gBannerHitBCCheck = 0;
+
+static void SPEHSetAppBannerHook(id self, SEL _cmd, id banner)
+{
+	if (banner) {
+		if (gBannerHitSet < 10) {
+			gBannerHitSet++;
+			SPEHLog(@"[smartbanner] 命中 setAppBanner: 丢弃 %@",
+					NSStringFromClass(object_getClass(banner)));
+		}
+	}
+	// 不转发：banner 对象永远进不了 TabDocument
+}
+
+static void SPEHSetAppSuggestionBannerHook(id self, SEL _cmd, id banner, BOOL pinned)
+{
+	if (banner && gBannerHitSet < 10) {
+		gBannerHitSet++;
+		SPEHLog(@"[smartbanner] 命中 setAppSuggestionBanner:isPinned: 丢弃 %@",
+				NSStringFromClass(object_getClass(banner)));
+	}
+	// 不转发
+}
+
+static void SPEHDidFindAppBannerHook(id self, SEL _cmd, id content)
+{
+	if (gBannerHitDidFind < 10) {
+		gBannerHitDidFind++;
+		SPEHLog(@"[smartbanner] 命中 didFindAppBannerWithContent: 丢弃 %@",
+				content ? NSStringFromClass(object_getClass(content)) : @"(nil)");
+	}
+	// 不转发：Safari 认为「没发现 app banner」
+}
+
+// appBanner getter 一律返回 nil：任何读它的渲染路径都拿不到 banner 对象
+static id SPEHAppBannerGetterHook(id self, SEL _cmd)
+{
+	return nil;
+}
+
+static void SPEHSetStoreBannersDisabledHook(id self, SEL _cmd, BOOL value)
+{
+	// 无论 Safari 传什么，一律 YES
+	if (gOrigSetStoreBannersDisabled) {
+		((void (*)(id, SEL, BOOL))gOrigSetStoreBannersDisabled)(self, _cmd, YES);
+	}
+}
+
+// BrowserController「检查完成 → 上屏」链路掐掉
+static void SPEHBCDidCompleteCheckHook(id self, SEL _cmd, id tabDocument)
+{
+	if (gBannerHitBCCheck < 10) {
+		gBannerHitBCCheck++;
+		SPEHLog(@"[smartbanner] 命中 tabDocumentDidCompleteCheckForAppBanner:");
+	}
+	// 不转发
+}
+
+static void SPEHBCPinTopHook(id self, SEL _cmd, BOOL pinned, id tabDocument)
+{
+	// 不转发：不把横幅钉到顶部
+}
+
+static void SPEHBCRemoveBannerHook(id self, SEL _cmd, id tabDocument, BOOL animated)
+{
+	if (gOrigBCRemoveBanner) {
+		((void (*)(id, SEL, id, BOOL))gOrigBCRemoveBanner)(self, _cmd, tabDocument, animated);
+	}
+}
+
+static void SPEHInstallSmartAppBannerPreciseHooks(void)
+{
+	NSMutableArray *hit = [NSMutableArray array];
+
+	Class tabCls = NSClassFromString(@"TabDocument");
+	if (!tabCls) {
+		SPEHLog(@"[smartbanner] TabDocument 未加载，跳过");
+	} else {
+		struct { const char *sel; IMP imp; IMP *orig; const char *label; } items[] = {
+			{ "setAppBanner:",                    (IMP)SPEHSetAppBannerHook,            &gOrigSetAppBanner,           "setAppBanner:" },
+			{ "setAppSuggestionBanner:isPinned:", (IMP)SPEHSetAppSuggestionBannerHook,  &gOrigSetAppSuggestionBanner, "setAppSuggestionBanner:isPinned:" },
+			{ "didFindAppBannerWithContent:",     (IMP)SPEHDidFindAppBannerHook,        &gOrigDidFindAppBanner,       "didFindAppBannerWithContent:" },
+			{ "setStoreBannersAreDisabled:",      (IMP)SPEHSetStoreBannersDisabledHook, &gOrigSetStoreBannersDisabled, "setStoreBannersAreDisabled:" },
+			{ "appBanner",                        (IMP)SPEHAppBannerGetterHook,         &gOrigAppBannerGetter,        "appBanner" },
+		};
+		for (size_t i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
+			SEL sel = NSSelectorFromString([NSString stringWithUTF8String:items[i].sel]);
+			if (class_getInstanceMethod(tabCls, sel)) {
+				SPEHPatchInstanceMethod(tabCls, sel, items[i].imp, items[i].orig);
+				[hit addObject:[NSString stringWithFormat:@"TabDocument -%s", items[i].label]];
+			}
+		}
+	}
+
+	Class bcCls = NSClassFromString(@"BrowserController");
+	if (bcCls) {
+		struct { const char *sel; IMP imp; IMP *orig; const char *label; } items[] = {
+			{ "tabDocumentDidCompleteCheckForAppBanner:", (IMP)SPEHBCDidCompleteCheckHook, &gOrigBCDidCompleteCheck, "tabDocumentDidCompleteCheckForAppBanner:" },
+			{ "setAppBannerPinnedToTop:forTabDocument:",  (IMP)SPEHBCPinTopHook,          &gOrigBCPinTop,          "setAppBannerPinnedToTop:forTabDocument:" },
+			{ "removeAppBannerFromTabDocument:animated:", (IMP)SPEHBCRemoveBannerHook,    &gOrigBCRemoveBanner,    "removeAppBannerFromTabDocument:animated:" },
+		};
+		for (size_t i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
+			SEL sel = NSSelectorFromString([NSString stringWithUTF8String:items[i].sel]);
+			if (class_getInstanceMethod(bcCls, sel)) {
+				SPEHPatchInstanceMethod(bcCls, sel, items[i].imp, items[i].orig);
+				[hit addObject:[NSString stringWithFormat:@"BrowserController -%s", items[i].label]];
+			}
+		}
+	}
+
+	SPEHLog(@"[smartbanner] 精准 hook %lu 条: %@", (unsigned long)hit.count,
+			hit.count ? [hit componentsJoinedByString:@" | "] : @"(一条都没挂上)");
+}
 
 // MARK: - 「App 内打开」浮层的注入时机
 //
@@ -481,12 +676,38 @@ static void SPEHWVDidMoveToWindowHook(UIView *self, SEL _cmd)
 		}
 	}
 
+	// 装 banner 的精准 hook：只装一次（TabDocument 是单例级，重复装会重复 hook）
+	if (first && SPEHSmartBannerKillEnabled()) {
+		SPEHInstallSmartAppBannerPreciseHooks();
+	}
+
 	// 清「App 内打开」浮层与 apple-itunes-app meta（纯 JS，不碰原生）
 	NSArray *delays = @[ @0.8, @2.5, @5.0 ];
 	for (NSNumber *d in delays) {
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 			SPEHApplyOpenInAppJS(weakSelf);
 		});
+	}
+}
+
+// 关键缺口修复（0.9.2）：
+//   Safari 只有一个 WKWebView 反复复用，`didMoveToWindow` 只在第一次挂载时触发一次。
+//   所以「导航到新页面后」上面的 JS 根本不会重跑 —— 这也是以前 JS 侧拦截时灵时不灵的根因。
+//   TabDocument 自己是 webView 的 navigationDelegate，这里只做「转发 + 加载完成后跑一次 JS」，
+//   不涉及任何 completion handler（0.8.2 崩溃是 decisionHandler 的 PAC 问题，这里没有）。
+static IMP gOrigTabDidFinishNav = NULL;
+
+static void SPEHTabDidFinishNavigationHook(id self, SEL _cmd, id webView, id navigation)
+{
+	if (gOrigTabDidFinishNav) {
+		((void (*)(id, SEL, id, id))gOrigTabDidFinishNav)(self, _cmd, webView, navigation);
+	}
+	if (webView) {
+		__weak id weakWV = webView;
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+			dispatch_get_main_queue(), ^{
+				SPEHApplyOpenInAppJS(weakWV);
+			});
 	}
 }
 
@@ -498,8 +719,24 @@ static void SPEHInstallOpenInAppHooks(void)
 	if (!wkCls) { SPEHLog(@"[openinapp] WKWebView 未加载"); return; }
 
 	SPEHPatchInstanceMethod(wkCls, @selector(didMoveToWindow), (IMP)SPEHWVDidMoveToWindowHook, &gOrigWVDidMoveToWindow);
-	SPEHLog(@"[openinapp] hook didMoveToWindow=%s（Smart App Banner 原生拦截已全部移除）",
-			gOrigWVDidMoveToWindow ? "ok" : "FAILED");
+
+	// 每次页面加载完成都补一次 JS（webView 被复用，didMoveToWindow 不会再触发）
+	NSMutableArray *navHit = [NSMutableArray array];
+	Class tabCls = NSClassFromString(@"TabDocument");
+	if (tabCls) {
+		for (NSString *sn in @[ @"webView:didFinishNavigation:", @"_webView:didFinishNavigation:" ]) {
+			SEL sel = NSSelectorFromString(sn);
+			if (class_getInstanceMethod(tabCls, sel)) {
+				SPEHPatchInstanceMethod(tabCls, sel, (IMP)SPEHTabDidFinishNavigationHook, &gOrigTabDidFinishNav);
+				[navHit addObject:sn];
+				break;   // 只挂一个，避免同一 selector 重复替换
+			}
+		}
+	}
+
+	SPEHLog(@"[openinapp] hook didMoveToWindow=%s nav=%@",
+			gOrigWVDidMoveToWindow ? "ok" : "FAILED",
+			navHit.count ? [navHit componentsJoinedByString:@","] : @"(无 didFinishNavigation)");
 }
 
 // MARK: - 「在 App 中打开 / 继续」提示（Bing 等通用链接）
@@ -530,15 +767,17 @@ static void SPEHPatchClassMethod(Class cls, SEL sel, IMP newImp, IMP *outOld)
 	MSHookMessageEx(object_getClass(cls), sel, newImp, outOld);
 }
 
+// 老板要求：这个卡片是「偶尔才弹」，必须能确定拦截是否真的命中。
+// 所以 AppLink 这层的日志**不受 probe 开关限制**，永远记录（上限 40 条防刷屏）。
 static void SPEHAppLinkLog(NSString *fmt, ...)
 {
-	if (!SPEHProbeEnabled() || gAppLinkLogCount >= 20) return;
+	if (gAppLinkLogCount >= 40) return;
 	gAppLinkLogCount++;
 	va_list ap;
 	va_start(ap, fmt);
 	NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
 	va_end(ap);
-	SPEHLog(@"[applink] %@", msg);
+	SPEHLog(@"[applink] #%d %@", gAppLinkLogCount, msg);
 }
 
 // -[WBSAppLink _synchronouslyFetchAppLinkWithError:] -> nil
@@ -974,10 +1213,10 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 		SPEHLog(@"==============================================");
 		SPEHLog(@"Safari16Enhance " SPEH_VERSION " loaded, pid=%d", getpid());
 		SPEHLog(@"log file = %@", SPEHLogPath());
-		SPEHLog(@"dialog=%d reader=%d openinapp=%d backscroll=%d applink=%d probe=%d",
+		SPEHLog(@"dialog=%d reader=%d openinapp=%d smartbanner=%d backscroll=%d applink=%d probe=%d",
 				SPEHDialogKillEnabled(), SPEHReaderKillEnabled(),
-				SPEHOpenInAppKillEnabled(), SPEHBackScrollFixEnabled(),
-				SPEHAppLinkKillEnabled(), SPEHProbeEnabled());
+				SPEHOpenInAppKillEnabled(), SPEHSmartBannerKillEnabled(),
+				SPEHBackScrollFixEnabled(), SPEHAppLinkKillEnabled(), SPEHProbeEnabled());
 
 		SPEHInstallSFDialogHooks();
 		SPEHInstallReaderHooks();

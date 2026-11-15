@@ -1,8 +1,8 @@
 Package: com.huhansibuxin.safari16enhance
 Name: Safari16Enhance
-Version: 0.9.1
+Version: 0.9.2
 Architecture: iphoneos-arm64
-Description: Safari 16 增强（独立实现，非 SafariPlus / 非 SafariX，仅注入 MobileSafari）。① 拦截「打不开该网页」弹窗：按文本精准命中 Safari 自绘的 SFDialogView 并拆除，改底部 toast。② 移除网页自绘的「App 内打开」绿色浮层并用 JS 删 apple-itunes-app meta。③ 关闭「阅读器可用」判定。④ 返回时不重复 reload 并复位页面滚动锁。⑤ 不再弹「在 App 中打开 / 浏览器 继续」卡片（让 Safari 拿不到 WBSAppLink）。⑥ 禁用底部地址栏左右滑动切页。不修改 WKWebView 的 configuration / processPool，不 hook WebKit 导航决策，也不 hook 任何 App Banner 相关方法 —— 避免干扰第三方 Safari 扩展的脚本注入与权限流程。日志固定写入 Safari 自身容器 Documents/Safari16Enhance.log（多级路径兜底 + 超 2MB 轮转）。
+Description: Safari 16 增强（独立实现，非 SafariPlus / 非 SafariX，仅注入 MobileSafari）。① 拦截「打不开该网页」弹窗：按文本精准命中 Safari 自绘的 SFDialogView 并拆除，改底部 toast。② Smart App Banner：精准 hook TabDocument 的 setAppBanner: / appBanner / didFindAppBannerWithContent: / setAppSuggestionBanner:isPinned: / setStoreBannersAreDisabled: 与 BrowserController 的检查完成 / 钉顶 / 移除共 8 个方法，不做类名通扫；同时 JS 删 apple-itunes-app meta。③ 移除网页自绘的「App 内打开 / Open in app」浮层。④ 关闭「阅读器可用」判定。⑤ 返回时不重复 reload 并复位页面滚动锁。⑥ 不再弹「在 App 中打开 / 浏览器 继续」卡片（让 Safari 拿不到 WBSAppLink）。⑦ 捕获阶段拦掉网页里非 http(s) scheme 的点击（itms-apps / ms-bing 等），每次页面加载完成自动补注入。⑧ 禁用底部地址栏左右滑动切页。不修改 WKWebView 的 configuration / userContentController / processPool，也不 hook WebKit 导航决策并手工回调 decisionHandler（该做法会导致 PAC 失效崩溃）。日志固定写入 Safari 自身容器 Documents/Safari16Enhance.log（多级路径兜底 + 超 2MB 轮转）。
 Maintainer: huhansibuxin
 Author: huhansibuxin
 Section: Tweaks
