@@ -66,13 +66,6 @@
 			default = YES;
 		},
 		{
-			cell = PSSwitchCell;
-			label = "硬模式（彻底禁用胶囊滚动）";
-			defaults = "com.huhansibuxin.safari16enhance";
-			key = "urlBarSwipeHardMode";
-			default = NO;
-		},
-		{
 			cell = PSGroupCell;
 			label = "阅读器";
 			footerText = "Safari 检测到文章页时会在地址栏临时把网址换成「阅读器可用」，并显示阅读器按钮。开启后彻底关闭该判定。";

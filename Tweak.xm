@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.9.4"
+#define SPEH_VERSION "0.9.5"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -466,17 +466,68 @@ static int SPEHJSInt(NSString *s, NSString *key)
 	return got ? v : -1;
 }
 
+static char kOpenInAppInjectStamp = 0;
+
+// 0.9.5：同一 webView、同一 URL、300ms 内的重复调用合并成一次。
+// didMoveToWindow 和 webView:didFinishNavigation: 会紧挨着触发，原来会连注入两遍。
+// 超过 300ms 的照常注入 —— reload 同 URL 时是新文档，必须重注入，不能按 URL 永久跳过。
+static BOOL SPEHShouldSkipInject(id webView)
+{
+	NSMutableDictionary *st = objc_getAssociatedObject(webView, &kOpenInAppInjectStamp);
+	if (!st) return NO;
+	NSString *lastURL = st[@"url"];
+	NSTimeInterval last = [st[@"t"] doubleValue];
+	if (!lastURL.length) return NO;
+	NSString *curURL = nil;
+	@try { curURL = [[webView valueForKey:@"URL"] absoluteString]; } @catch (NSException *e) { }
+	return [lastURL isEqualToString:(curURL ?: @"")] &&
+		   (CFAbsoluteTimeGetCurrent() - last) < 0.3;
+}
+
+static void SPEHMarkInjected(id webView)
+{
+	NSString *curURL = nil;
+	@try { curURL = [[webView valueForKey:@"URL"] absoluteString]; } @catch (NSException *e) { }
+	if (!curURL) return;
+	objc_setAssociatedObject(webView, &kOpenInAppInjectStamp,
+		[@{ @"url": curURL, @"t": @(CFAbsoluteTimeGetCurrent()) } mutableCopy],
+		OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void SPEHApplyOpenInAppJSAttempt(id webView, int attempt);
+
 static void SPEHApplyOpenInAppJS(id webView)
 {
+	SPEHApplyOpenInAppJSAttempt(webView, 0);
+}
+
+static void SPEHApplyOpenInAppJSAttempt(id webView, int attempt)
+{
 	if (!webView) return;
+	if (SPEHShouldSkipInject(webView)) return;
 
 	// 0.9.3：日志里那串「JS 执行失败 执行JavaScript返回结果的类型不受支持」全是
 	// 快速连按返回时的空注入 —— webView 正在换页/已脱离窗口，evaluateJavaScript 会返回
-	// WKErrorCode 5（结果类型不支持）。这种注入本来就没意义，直接跳过，既省一次 IPC 也不刷屏。
+	// WKErrorCode 5（结果类型不支持）。
+	// 0.9.5：不再一丢了之 —— 刚上屏 / 刚换页的那一次补一次 0.35s 后的重试，
+	// 否则这一页就整页没有 JS 防线（Bing 那几张卡片正好是这时候漏的）。
+	BOOL notReady = NO;
 	@try {
-		if ([webView isKindOfClass:[UIView class]] && !((UIView *)webView).window) return;
-		if ([webView respondsToSelector:@selector(isLoading)] && [webView isLoading]) return;
+		if ([webView isKindOfClass:[UIView class]] && !((UIView *)webView).window) notReady = YES;
+		if ([webView respondsToSelector:@selector(isLoading)] && [webView isLoading]) notReady = YES;
 	} @catch (NSException *e) { }
+
+	if (notReady) {
+		if (attempt == 0) {
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+						   dispatch_get_main_queue(), ^{
+				SPEHApplyOpenInAppJSAttempt(webView, attempt + 1);
+			});
+		}
+		return;
+	}
+
+	SPEHMarkInjected(webView);
 
 	@try {
 		[(id<SPEHWebViewJS>)webView evaluateJavaScript:SPEHOpenInAppJS() completionHandler:^(id result, NSError *error) {
@@ -799,9 +850,48 @@ static BOOL SPEHURLIsBing(id url)
 	return s ? ([s rangeOfString:@"bing." options:NSCaseInsensitiveSearch].location != NSNotFound) : NO;
 }
 
+// 0.9.5：日志去噪。日志实测 Bing 每翻一页会对**同一个结果页**重复查 2~6 次
+// （first=19 连查 6 次），每次都要把 200+ 字符的长 URL 格式化成 NSString，这才是这块的主要开销。
+// 改成按「接口 + URL 去掉 query」去重：同 key 只写首条，之后每累计 10 次写一行汇总。
+// 证据力不变 —— 「这个域名查过、并且返回 nil」这条事实仍然完整保留。
+static NSMutableSet *gAppLinkSeen = nil;
+static int gAppLinkSuppress = 0;
+
+static NSString *SPEHAppLinkKey(NSString *kind, id url)
+{
+	NSString *s = @"";
+	@try {
+		if ([url isKindOfClass:[NSURL class]]) s = [(NSURL *)url absoluteString];
+		else if ([url isKindOfClass:[NSString class]]) s = url;
+		else if ([url respondsToSelector:@selector(absoluteString)]) s = [url valueForKey:@"absoluteString"];
+	} @catch (NSException *e) { }
+	NSRange q = [s rangeOfString:@"?"];
+	if (q.location != NSNotFound) s = [s substringToIndex:q.location];
+	if (s.length > 120) s = [s substringToIndex:120];
+	return [(kind ?: @"") stringByAppendingString:s];
+}
+
+// 返回 YES 表示「这一条是新页面，值得写日志」；NO 表示同一页的重复查询，已合并计数。
+static BOOL SPEHAppLinkLogOnce(NSString *kind, id url)
+{
+	if (!gAppLinkSeen) gAppLinkSeen = [NSMutableSet set];
+	NSString *key = SPEHAppLinkKey(kind, url);
+	if ([gAppLinkSeen containsObject:key]) {
+		gAppLinkSuppress++;
+		if (gAppLinkSuppress % 10 == 0) {
+			SPEHLog(@"[applink] 同页重复查询累计 %d 次（明细已省略）", gAppLinkSuppress);
+		}
+		return NO;
+	}
+	if (gAppLinkSeen.count > 200) [gAppLinkSeen removeAllObjects];   // 防无限增长
+	[gAppLinkSeen addObject:key];
+	gAppLinkSuppress = 0;
+	return YES;
+}
+
 static void SPEHAppLinkLog(NSString *fmt, ...)
 {
-	if (gAppLinkLogCount >= 40) return;
+	if (gAppLinkLogCount >= 200) return;
 	gAppLinkLogCount++;
 	va_list ap;
 	va_start(ap, fmt);
@@ -814,7 +904,9 @@ static void SPEHAppLinkLog(NSString *fmt, ...)
 static id SPEHFetchAppLinkSyncHook(id self, SEL _cmd, NSError **error)
 {
 	if (SPEHAppLinkKillEnabled()) {
-		if (SPEHProbeEnabled()) SPEHAppLinkLog(@"同步取 AppLink → nil");
+		if (SPEHProbeEnabled()) {
+			if (SPEHAppLinkLogOnce(@"sync", self)) SPEHAppLinkLog(@"同步取 AppLink → nil");
+		}
 		return nil;
 	}
 	if (gOrigFetchAppLinkSync) return ((id (*)(id, SEL, NSError **))gOrigFetchAppLinkSync)(self, _cmd, error);
@@ -825,7 +917,9 @@ static id SPEHFetchAppLinkSyncHook(id self, SEL _cmd, NSError **error)
 static id SPEHAppLinksWithURLHook(id self, SEL _cmd, id url, NSUInteger limit, NSError **error)
 {
 	if (SPEHAppLinkKillEnabled()) {
-		if (SPEHProbeEnabled()) SPEHAppLinkLog(@"查询 AppLink 列表 %@ → 空", url);
+		if (SPEHProbeEnabled()) {
+			if (SPEHAppLinkLogOnce(@"list", url)) SPEHAppLinkLog(@"查询 AppLink 列表 %@ → 空", url);
+		}
 		return @[];
 	}
 	if (gOrigAppLinksWithURL) return ((id (*)(id, SEL, id, NSUInteger, NSError **))gOrigAppLinksWithURL)(self, _cmd, url, limit, error);
@@ -835,7 +929,9 @@ static id SPEHAppLinksWithURLHook(id self, SEL _cmd, id url, NSUInteger limit, N
 static id SPEHAppLinksWithURL2Hook(id self, SEL _cmd, id url, NSUInteger limit, BOOL includeCurrent, NSError **error)
 {
 	if (SPEHAppLinkKillEnabled()) {
-		if (SPEHProbeEnabled()) SPEHAppLinkLog(@"查询 AppLink 列表(含当前App) %@ → 空", url);
+		if (SPEHProbeEnabled()) {
+			if (SPEHAppLinkLogOnce(@"list2", url)) SPEHAppLinkLog(@"查询 AppLink 列表(含当前App) %@ → 空", url);
+		}
 		return @[];
 	}
 	if (gOrigAppLinksWithURL2) return ((id (*)(id, SEL, id, NSUInteger, BOOL, NSError **))gOrigAppLinksWithURL2)(self, _cmd, url, limit, includeCurrent, error);
@@ -846,7 +942,11 @@ static id SPEHAppLinksWithURL2Hook(id self, SEL _cmd, id url, NSUInteger limit, 
 static void SPEHGetAppLinkHook(id self, SEL _cmd, id url, id completion)
 {
 	if (SPEHAppLinkKillEnabled()) {
-		if (SPEHProbeEnabled() || SPEHURLIsBing(url)) {
+		// 0.9.5：先走过去重（一次字典查表），只有「新页面」才继续算域名 / 格式化长 URL。
+		// 同一页的重复查询到这里就结束 —— 不再做 rangeOfString，也不再拼 200+ 字符的日志串。
+		BOOL fresh = SPEHAppLinkLogOnce(@"async", url);
+		// Bing 的查询永远留证（那张「微软必应 APP / 浏览器 继续」卡片的来源）。
+		if (fresh && (SPEHProbeEnabled() || SPEHURLIsBing(url))) {
 			SPEHAppLinkLog(@"异步取 AppLink %@ → nil", url);
 		}
 		if (completion) {
@@ -949,6 +1049,31 @@ static BOOL SPEHHostLooksLikeURLBar(NSString *cls)
 
 static IMP gOrigAddGesture = NULL;
 
+// 0.9.5：addGestureRecognizer: 是 UIView 级别的全局 hook，Safari 里调用非常频繁。
+// 原来每次都调 NSStringFromClass + 最多 8 次 rangeOfString 做类名匹配 —— 现在按 Class 缓存结果，
+// 命中缓存后只剩一次字典查表（探针关闭时连类名字符串都不构造）。
+// flags: bit0 = 类名像地址栏；bit1 = 类名含 URL / Address（pan 只在这些类上禁）
+static NSMutableDictionary *gHostClsFlags = nil;
+
+static int SPEHHostClsFlags(Class c)
+{
+	if (!c) return 0;
+	if (!gHostClsFlags) gHostClsFlags = [NSMutableDictionary dictionary];
+	NSValue *key = [NSValue valueWithPointer:(__bridge const void *)c];
+	NSNumber *cached = gHostClsFlags[key];
+	if (cached) return cached.intValue;
+
+	NSString *name = NSStringFromClass(c);
+	int flags = 0;
+	if (SPEHHostLooksLikeURLBar(name)) flags |= 1;
+	if ([name rangeOfString:@"URL"].location != NSNotFound ||
+		[name rangeOfString:@"Address"].location != NSNotFound) flags |= 2;
+
+	if (gHostClsFlags.count > 300) [gHostClsFlags removeAllObjects];
+	gHostClsFlags[key] = @(flags);
+	return flags;
+}
+
 // 胶囊栏 pan 标记 + 横向分量清零（保留纵向）
 static char kCapsulePanTag = 0;
 static IMP gOrigPanSetTranslation = NULL;
@@ -966,24 +1091,23 @@ static void SPEHPanSetTranslationHook(UIPanGestureRecognizer *self, SEL _cmd, CG
 static void SPEHEnhanceAddGestureHook(UIView *self, SEL _cmd, UIGestureRecognizer *gr)
 {
 	// 先按手势类型快速过滤（绝大多数调用在这里就返回，开销可忽略），
-	// 再做类名字符串匹配。
+	// 再做类名匹配（已按 Class 缓存）。
 	if (SPEHURLBarSwipeKillEnabled() && gr &&
 		([gr isKindOfClass:[UISwipeGestureRecognizer class]] ||
 		 [gr isKindOfClass:[UIPanGestureRecognizer class]])) {
 		@try {
-			NSString *hostCls = NSStringFromClass(object_getClass(self));
-			if (SPEHHostLooksLikeURLBar(hostCls)) {
+			Class hostC = object_getClass(self);
+			int flags = SPEHHostClsFlags(hostC);
+			if (flags & 1) {
 				BOOL isSwipe = [gr isKindOfClass:[UISwipeGestureRecognizer class]];
 				// pan 只在明确的地址输入控件上禁，避免误伤工具栏其它交互
-				BOOL isPanOnURL = [gr isKindOfClass:[UIPanGestureRecognizer class]] &&
-					([hostCls rangeOfString:@"URL"].location != NSNotFound ||
-					 [hostCls rangeOfString:@"Address"].location != NSNotFound);
+				BOOL isPanOnURL = [gr isKindOfClass:[UIPanGestureRecognizer class]] && (flags & 2);
 
 				if (isSwipe || isPanOnURL) {
 					gr.enabled = NO;
 					if (SPEHProbeEnabled()) {
 						SPEHLog(@"[urlswipe] 已禁用 %@ on %@",
-								NSStringFromClass(object_getClass(gr)), hostCls);
+								NSStringFromClass(object_getClass(gr)), NSStringFromClass(hostC));
 					}
 					return;   // 不转发 = 手势根本没挂上
 				}
@@ -993,12 +1117,12 @@ static void SPEHEnhanceAddGestureHook(UIView *self, SEL _cmd, UIGestureRecognize
 				static NSMutableSet *seen = nil;
 				static dispatch_once_t once;
 				dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
-				NSString *key = [NSString stringWithFormat:@"%@|%ld", hostCls,
+				NSString *key = [NSString stringWithFormat:@"%@|%ld", NSStringFromClass(hostC),
 					(long)((UISwipeGestureRecognizer *)gr).direction];
 				if (![seen containsObject:key] && seen.count < 40) {
 					[seen addObject:key];
 					SPEHLog(@"[urlswipe] 探针 swipe 挂到 %@ direction=%ld（未拦截）",
-							hostCls, (long)((UISwipeGestureRecognizer *)gr).direction);
+							NSStringFromClass(hostC), (long)((UISwipeGestureRecognizer *)gr).direction);
 				}
 			}
 		} @catch (NSException *e) { }

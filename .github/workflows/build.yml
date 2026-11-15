@@ -71,6 +71,7 @@ jobs:
             'didFinishNavigation' \
             'killURLBarSwipe' \
             'didMoveToWindow' \
+            '明细已省略' \
             'Documents' ; do
             if ! echo "$STRINGS" | grep -qF "$NEEDLE"; then
               echo "::error::required string missing from dylib: $NEEDLE"
