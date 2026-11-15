@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.7.0"
+#define SPEH_VERSION "0.7.1"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -543,9 +543,16 @@ static NSString *SPEHOpenInAppJS(void)
 	static NSString *js = nil;
 	static dispatch_once_t once;
 	dispatch_once(&once, ^{
-		js = @"(function(){try{var r={m:0,e:0};"
+		js = @"(function(){try{var r={m:0,e:0,i:0};"
 			 "var ms=document.querySelectorAll('meta[name=apple-itunes-app]');"
 			 "for(var i=0;i<ms.length;i++){if(ms[i].parentNode)ms[i].parentNode.removeChild(ms[i]);r.m++;}"
+			 // ① 拦 itms / itunes scheme 的点击（网页跳 App Store 最常见的一条）
+			 "var bad=function(h){return /^(itms|itunes)/i.test(String(h||''));};"
+			 "document.addEventListener('click',function(e){try{var t=e.target;"
+			 "while(t&&t.tagName!=='A'){t=t.parentNode;}if(!t)return;"
+			 "if(bad(t.getAttribute&&t.getAttribute('href'))){e.preventDefault();e.stopPropagation();r.i++;}}catch(x){}},true);"
+			 // ② 拦 window.open
+			 "try{var _o=window.open;window.open=function(u){if(bad(u)){r.i++;return null;}return _o.apply(window,arguments);};}catch(x2){}"
 			 "var kws=['App 内打开','App内打开','在App内打开','在 App 内打开','打开App','打开 App'];"
 			 "var els=document.querySelectorAll('body *');"
 			 "for(var j=0;j<els.length;j++){var el=els[j];if(!el.parentNode)continue;"
@@ -554,7 +561,7 @@ static NSString *SPEHOpenInAppJS(void)
 			 "if(!hit)continue;"
 			 "var cs=getComputedStyle(el);"
 			 "if(cs.position==='fixed'||cs.position==='sticky'||cs.position==='absolute'){el.parentNode.removeChild(el);r.e++;}}"
-			 "return 'meta='+r.m+' el='+r.e;}catch(err){return 'ERR:'+err;}})()";
+			 "return 'meta='+r.m+' el='+r.e+' itms='+r.i;}catch(err){return 'ERR:'+err;}})()";
 	});
 	return js;
 }
@@ -741,6 +748,35 @@ static void SPEHSweepBannerViews(UIView *anchor, NSString *tag)
 	} @catch (NSException *e) { }
 }
 
+// 横幅类名到现在还没确定（0.7.0 里有 didFindAppBanner 被丢弃 21 次，但用户仍看到横幅，
+// 说明那个横幅视图的类名既不含 Banner 也不含 AppLink）。
+// 这里把「页面顶部、条状」的所有视图类名打出来，一次拿真名。
+static void SPEHDumpTopAreaRec(UIView *v, int depth, UIView *win, NSMutableArray *out)
+{
+	if (!v || depth > 9 || out.count >= 24) return;
+	CGRect r = v.bounds;
+	@try { if (win) r = [v convertRect:v.bounds toView:win]; } @catch (NSException *e) { }
+	CGFloat winH = win.bounds.size.height;
+	if (r.size.height > 18 && r.size.height <= 260 && r.size.width > 180 && r.origin.y < winH * 0.42) {
+		[out addObject:[NSString stringWithFormat:@"%@%@", NSStringFromClass(object_getClass(v)),
+			NSStringFromCGRect(r)]];
+	}
+	for (UIView *s in [v subviews]) SPEHDumpTopAreaRec(s, depth + 1, win, out);
+}
+
+static void SPEHDumpTopArea(UIView *anchor, NSString *tag)
+{
+	if (!anchor || !SPEHProbeEnabled()) return;
+	UIView *root = anchor.window ?: anchor;
+	if (!root) return;
+	@try {
+		NSMutableArray *out = [NSMutableArray array];
+		SPEHDumpTopAreaRec(root, 0, root, out);
+		SPEHLog(@"[smartbanner] %@ 顶部条状视图 %lu 个: %@", tag, (unsigned long)out.count,
+				out.count ? [out componentsJoinedByString:@" | "] : @"(无)");
+	} @catch (NSException *e) { }
+}
+
 static void SPEHSetAppBannerHook(id self, SEL _cmd, id banner)
 {
 	if (banner && SPEHProbeEnabled()) {
@@ -832,6 +868,16 @@ static void SPEHWVDidMoveToWindowHook(UIView *self, SEL _cmd)
 			dispatch_get_main_queue(), ^{
 				SPEHSweepBannerViews(weakSelf, [NSString stringWithFormat:@"%@s", d]);
 			});
+	}
+
+	// 顶部条状视图类名探针（只在装了 probe 时跑，拿来定位横幅真身）
+	if (SPEHProbeEnabled()) {
+		for (NSNumber *d in @[ @1.5, @3.2 ]) {
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
+				dispatch_get_main_queue(), ^{
+					SPEHDumpTopArea(weakSelf, [NSString stringWithFormat:@"%@s", d]);
+				});
+		}
 	}
 
 	// 条状手势禁用：每次挂载都跑（标签栏会重建），两个时间点兜住懒加载出来的视图
@@ -1023,6 +1069,78 @@ static void SPEHAppLinkOpenHook(id self, SEL _cmd, id completion)
 	if (gOrigAppLinkOpen) ((void (*)(id, SEL, id))gOrigAppLinkOpen)(self, _cmd, completion);
 }
 
+// 8 条 URL / LaunchServices hook 全 ok 但零命中 ⇒ Safari 打开外部 App 根本不经这些 API。
+// 换到真正的「决策点」：WebKit 导航回调。网页跳 itms:// 时，WebKit 先问宿主
+// "这次导航准不准"，Safari 在回调里决定「交给系统打开」。在这里直接 Cancel，
+// 后面无论它走哪条私有路径都不会发生。
+static IMP gOrigPolicy4 = NULL;
+static IMP gOrigPolicy3 = NULL;
+static int gPolicyHooked = 0;
+
+static BOOL SPEHNavActionTargetsAppStore(id action)
+{
+	if (!SPEHAppStoreKillEnabled() || !action) return NO;
+	@try {
+		NSURL *u = nil;
+		id req = [action valueForKey:@"request"];
+		if (req) u = [req valueForKey:@"URL"];
+		if (!u) u = [action valueForKey:@"URL"];
+		if (u && SPEHURLTargetsAppStore(u)) {
+			SPEHLog(@"[appstore] 拦截导航 %@", u.absoluteString);
+			SPEHShowToast(@"已拦截跳转 App Store");
+			return YES;
+		}
+	} @catch (NSException *e) { }
+	return NO;
+}
+
+static void SPEHPolicy4Hook(id self, SEL _cmd, id webView, id action, id prefs, id handler)
+{
+	if (SPEHNavActionTargetsAppStore(action)) {
+		if (handler) { void (^h)(NSInteger) = handler; h(1); }   // WKNavigationActionPolicyCancel
+		return;
+	}
+	if (gOrigPolicy4) ((void (*)(id, SEL, id, id, id, id))gOrigPolicy4)(self, _cmd, webView, action, prefs, handler);
+}
+
+static void SPEHPolicy3Hook(id self, SEL _cmd, id webView, id action, id handler)
+{
+	if (SPEHNavActionTargetsAppStore(action)) {
+		if (handler) { void (^h)(NSInteger) = handler; h(1); }
+		return;
+	}
+	if (gOrigPolicy3) ((void (*)(id, SEL, id, id, id))gOrigPolicy3)(self, _cmd, webView, action, handler);
+}
+
+static void SPEHInstallNavigationPolicyHooks(void)
+{
+	if (!SPEHAppStoreKillEnabled()) return;
+
+	NSArray *classes = @[ @"BrowserController", @"TabDocument", @"_SFTabDocument",
+						  @"_SFWebView", @"SFWebView", @"BrowserViewController" ];
+	NSArray *sels = @[ @"webView:decidePolicyForNavigationAction:preferences:decisionHandler:",
+					   @"webView:decidePolicyForNavigationAction:decisionHandler:",
+					   @"_webView:decidePolicyForNavigationAction:preferences:decisionHandler:" ];
+	for (NSString *cn in classes) {
+		Class c = NSClassFromString(cn);
+		if (!c) continue;
+		for (NSString *sn in sels) {
+			SEL sel = NSSelectorFromString(sn);
+			Method m = class_getInstanceMethod(c, sel);
+			if (!m) continue;
+			BOOL is4 = ([sn rangeOfString:@"preferences"].location != NSNotFound);
+			if (is4) {
+				MSHookMessageEx(c, sel, (IMP)SPEHPolicy4Hook, &gOrigPolicy4);
+			} else {
+				MSHookMessageEx(c, sel, (IMP)SPEHPolicy3Hook, &gOrigPolicy3);
+			}
+			gPolicyHooked++;
+			SPEHLog(@"[appstore] hook 导航决策 %@ -%@", cn, sn);
+		}
+	}
+	if (gPolicyHooked == 0) SPEHLog(@"[appstore] 导航决策 hook 未命中任何类（需再探真实 delegate 类）");
+}
+
 static void SPEHInstallAppStoreHooks(void)
 {
 	if (!SPEHAppStoreKillEnabled()) { SPEHLog(@"[appstore] disabled by prefs"); return; }
@@ -1063,6 +1181,8 @@ static void SPEHInstallAppStoreHooks(void)
 			gOrigLSOpenSensitive3 ? "ok" : "missing",
 			gOrigOpenAppByBundle ? "ok" : "missing",
 			gOrigAppLinkOpen ? "ok" : "missing");
+
+	SPEHInstallNavigationPolicyHooks();
 }
 
 // MARK: - 返回缓存：WKProcessPool 原生接口探针
