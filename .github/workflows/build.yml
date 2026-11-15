@@ -42,9 +42,9 @@ jobs:
             exit 1
           fi
           grep -q 'com.apple.mobilesafari' Safari16Enhance.plist
-          grep -q 'so.qq.com/isearch' Tweak.xm
+          grep -q 'SFDialogView' Tweak.xm
           grep -q 'DISPATCH_QUEUE_SERIAL' Tweak.xm
-          echo "OK: source discipline + engine template present"
+          echo "OK: source discipline present"
 
       - name: Build
         run: make package
