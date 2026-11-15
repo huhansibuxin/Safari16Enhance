@@ -66,8 +66,8 @@ jobs:
             'SearchEngineController' \
             '_populateSearchEngines' \
             'defaultSearchEngineIfPopulated' \
-            '打不开该网页' \
             'presentViewController:animated:completion:' \
+            'SUPPRESSED' \
             'Documents' ; do
             if ! echo "$STRINGS" | grep -qF "$NEEDLE"; then
               echo "::error::required string missing from dylib: $NEEDLE"
@@ -75,6 +75,14 @@ jobs:
             fi
           done
           echo "OK: engine + alert + in-container log path all present"
+          # 中文关键词是 UTF-8 多字节，strings(1) 默认会丢弃非 ASCII，必须直接 grep 二进制
+          for CN in '打不开该网页' '无法打开该网页' '网址无效'; do
+            if ! grep -aqF "$CN" "$DYLIB"; then
+              echo "::error::chinese alert keyword missing from dylib: $CN"
+              exit 1
+            fi
+          done
+          echo "OK: chinese alert keywords embedded (utf-8 verified)"
           echo "== deb =="
           ls -l packages/
 
