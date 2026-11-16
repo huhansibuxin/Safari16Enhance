@@ -1,4 +1,4 @@
-// Safari16Enhance 0.9.0 - iOS 16 Safari 增强
+// Safari16Enhance 0.9.8 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -107,11 +107,16 @@ static void SPEHLog(NSString *fmt, ...)
 	NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
 	va_end(args);
 
-	NSDateFormatter *df = [[NSDateFormatter alloc] init];
-	df.dateFormat = @"MM-dd HH:mm:ss.SSS";
-	NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [df stringFromDate:[NSDate date]], msg];
-
 	dispatch_async(SPEHLogQueue(), ^{
+		// 0.9.8 优化：NSDateFormatter 创建昂贵，缓存复用；且全部在串行队列内访问，天然线程安全
+		static NSDateFormatter *df = nil;
+		static dispatch_once_t onceFmt;
+		dispatch_once(&onceFmt, ^{
+			df = [[NSDateFormatter alloc] init];
+			df.dateFormat = @"MM-dd HH:mm:ss.SSS";
+		});
+		NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [df stringFromDate:[NSDate date]], msg];
+
 		static NSUInteger writeCount = 0;
 		NSString *path = SPEHLogPath();
 		NSFileManager *fm = [NSFileManager defaultManager];
@@ -623,7 +628,7 @@ static NSString *SPEHOpenInAppJS(void)
 	dispatch_once(&once, ^{
 		js = @"(function(){try{"
 			 // 每个页面只做「一次性初始化」，重复注入不会重复挂监听器
-			 "if(!window.__speh)window.__speh={ready:0,click:0,s:0};"
+			 "if(!window.__speh)window.__speh={ready:0,click:0,s:0,dirty:1};"
 			 "var first=!window.__speh.ready;window.__speh.ready=1;"
 			 "var r={m:0,e:0,link:0};"
 			 // ① 删 apple-itunes-app / smartbanner meta（Smart App Banner 的触发源头）
@@ -631,12 +636,14 @@ static NSString *SPEHOpenInAppJS(void)
 			 "for(var i=0;i<ms.length;i++){try{ms[i].parentNode.removeChild(ms[i]);r.m++;}catch(q){}}};"
 			 "killMeta();"
 			 // meta 可能在文档开始时还没解析出来：只观察新插入的 META 节点，不做整树遍历
-			 "if(!window.__speh.mo){try{var mo=new MutationObserver(function(muts){"
+			 "if(!window.__speh.mo){try{var mo=new MutationObserver(function(muts){window.__speh.dirty=1;"
 			 "for(var a=0;a<muts.length;a++){var ad=muts[a].addedNodes;"
 			 "for(var b=0;b<ad.length;b++){var n=ad[b];if(!n||n.tagName!=='META')continue;"
 			 "var nm=String((n.getAttribute&&n.getAttribute('name'))||'').toLowerCase();"
 			 "if(nm==='apple-itunes-app'||nm==='smartbanner'){try{n.parentNode.removeChild(n);}catch(q){}}}}});"
-			 "mo.observe(document.documentElement||document,{childList:true,subtree:true});"
+			 // 0.9.8：同时观察 style/class 属性变化——浮层若是预置节点靠 CSS 显示（非动态插入），
+			 // childList 捕获不到，必须靠 attributes 置脏，否则 dirty 方案会漏卡片。回调仅置标志，开销极小。
+			 "mo.observe(document.documentElement||document,{childList:true,subtree:true,attributes:true,attributeFilter:['style','class']});"
 			 "window.__speh.mo=mo;}catch(o){}}"
 			 // ② 自定义 scheme 白名单：只有这些放行，其余（itms-apps/ms-bing/bingapp/weixin...）一律算「跳 App」
 			 "var ok=function(h){var m=/^([a-z][a-z0-9+.\\-]*):/i.exec(String(h||''));"
@@ -653,6 +660,8 @@ static NSString *SPEHOpenInAppJS(void)
 			 "var h=t.getAttribute&&t.getAttribute('href');if(!ok(h)){"
 			 "e.preventDefault();e.stopPropagation();window.__speh.s=(window.__speh.s||0)+1;}}catch(x){}},true);}"
 			 // ⑤ 清网页自绘的「App 内打开」浮层（中英双关键字 + 只认 fixed/sticky/absolute + 宽度够宽）
+			 // 0.9.8：DOM 无变动时跳过全树扫描；卡片延迟插入会由 MutationObserver 重新置脏，不漏（JS 内不用 // 注释以免吃掉拼接行）
+			 "if(window.__speh.dirty){"
 			 "var kws=['App 内打开','App内打开','在App内打开','在 App 内打开','打开App','打开 App','open in app','Open in App','OPEN IN APP'];"
 			 "var els=document.querySelectorAll('body *');var wlim=Math.max(240,window.innerWidth*0.6);"
 			 "for(var j=0;j<els.length;j++){var el=els[j];if(!el.parentNode)continue;"
@@ -662,8 +671,9 @@ static NSString *SPEHOpenInAppJS(void)
 			 "var cs=getComputedStyle(el);"
 			 "if((cs.position==='fixed'||cs.position==='sticky')&&el.getBoundingClientRect().width>=wlim){"
 			 "el.parentNode.removeChild(el);r.e++;}}"
+			 "window.__speh.dirty=0;r.scan=1;}"
 			 "return 'first='+(first?1:0)+' meta='+r.m+' el='+r.e+' link='+r.link"
-			 "+' click='+window.__speh.click+' s='+(window.__speh.s||0);"
+			 "+' scan='+r.scan+' click='+window.__speh.click+' s='+(window.__speh.s||0);"
 			 "}catch(err){return 'ERR:'+err;}})()";
 	});
 	return js;
@@ -770,11 +780,16 @@ static void SPEHApplyOpenInAppJSAttempt(id webView, int attempt)
 			int link  = SPEHJSInt(r, @"link");
 			int click = SPEHJSInt(r, @"click");
 			int blocked = SPEHJSInt(r, @"s");
+			int scanned = SPEHJSInt(r, @"scan");
 
 			// 0.9.3：探针默认关闭。「就绪」是诊断用的每页一条，只在 probe 打开时打；
 			// 「清理」只在真的动过手（删了 meta / 拆了浮层 / 拦了点击）时打，属于真事件，保留。
 			if (first == 1 && SPEHProbeEnabled()) {
 				SPEHLog(@"[openinapp] 就绪 link=%d meta=%d click=%d", link, meta, click);
+			}
+			// 0.9.8：探针打开时记录全树扫描是否真的发生，用于确认 dirty 去噪生效
+			if (scanned == 1 && SPEHProbeEnabled()) {
+				SPEHLog(@"[openinapp] 全树扫描执行 el=%d", elems);
 			}
 			if (meta > 0 || elems > 0 || blocked > 0) {
 				SPEHLog(@"[openinapp] 清理 meta=%d el=%d 已拦点击=%d", meta, elems, blocked);
@@ -1067,6 +1082,9 @@ static void SPEHPatchClassMethod(Class cls, SEL sel, IMP newImp, IMP *outOld)
 // 其它站点每次返回 nil 的记录属探针，默认不写，避免把日志刷满。
 static BOOL SPEHURLIsBing(id url)
 {
+#ifdef SPEH_NO_LOG
+	return NO;   // 只为日志服务，无日志变体直接返回
+#else
 	NSString *s = nil;
 	@try {
 		if ([url isKindOfClass:[NSURL class]]) s = [(NSURL *)url absoluteString];
@@ -1074,6 +1092,7 @@ static BOOL SPEHURLIsBing(id url)
 		else if ([url respondsToSelector:@selector(absoluteString)]) s = [url valueForKey:@"absoluteString"];
 	} @catch (NSException *e) { }
 	return s ? ([s rangeOfString:@"bing." options:NSCaseInsensitiveSearch].location != NSNotFound) : NO;
+#endif
 }
 
 // 0.9.5：日志去噪。日志实测 Bing 每翻一页会对**同一个结果页**重复查 2~6 次
@@ -1100,23 +1119,40 @@ static NSString *SPEHAppLinkKey(NSString *kind, id url)
 // 返回 YES 表示「这一条是新页面，值得写日志」；NO 表示同一页的重复查询，已合并计数。
 static BOOL SPEHAppLinkLogOnce(NSString *kind, id url)
 {
-	if (!gAppLinkSeen) gAppLinkSeen = [NSMutableSet set];
-	NSString *key = SPEHAppLinkKey(kind, url);
-	if ([gAppLinkSeen containsObject:key]) {
-		gAppLinkSuppress++;
-		if (gAppLinkSuppress % 10 == 0) {
-			SPEHLog(@"[applink] 同页重复查询累计 %d 次（明细已省略）", gAppLinkSuppress);
+#ifdef SPEH_NO_LOG
+	return NO;   // 无日志变体：连去重查表的开销一并跳过
+#else
+	// 0.9.8 优化：AppLink 查询可能在后台线程并发，NSMutableSet 读写加锁；
+	// 用固定 token 做锁（gAppLinkSeen 初始为 nil 时 @synchronized(nil) 不加锁，会失效）
+	static dispatch_once_t onceToken;
+	static id seenLock = nil;
+	dispatch_once(&onceToken, ^{
+		gAppLinkSeen = [NSMutableSet set];
+		seenLock = [NSObject new];
+	});
+	@synchronized (seenLock) {
+		NSString *key = SPEHAppLinkKey(kind, url);
+		if ([gAppLinkSeen containsObject:key]) {
+			gAppLinkSuppress++;
+			int sup = gAppLinkSuppress;
+			if (sup % 10 == 0) {
+				SPEHLog(@"[applink] 同页重复查询累计 %d 次（明细已省略）", sup);
+			}
+			return NO;
 		}
-		return NO;
+		if (gAppLinkSeen.count > 200) [gAppLinkSeen removeAllObjects];   // 防无限增长
+		[gAppLinkSeen addObject:key];
+		gAppLinkSuppress = 0;
+		return YES;
 	}
-	if (gAppLinkSeen.count > 200) [gAppLinkSeen removeAllObjects];   // 防无限增长
-	[gAppLinkSeen addObject:key];
-	gAppLinkSuppress = 0;
-	return YES;
+#endif
 }
 
 static void SPEHAppLinkLog(NSString *fmt, ...)
 {
+#ifdef SPEH_NO_LOG
+	return;
+#else
 	if (gAppLinkLogCount >= 200) return;
 	gAppLinkLogCount++;
 	va_list ap;
@@ -1124,6 +1160,7 @@ static void SPEHAppLinkLog(NSString *fmt, ...)
 	NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
 	va_end(ap);
 	SPEHLog(@"[applink] #%d %@", gAppLinkLogCount, msg);
+#endif
 }
 
 // -[WBSAppLink _synchronouslyFetchAppLinkWithError:] -> nil
@@ -1225,7 +1262,11 @@ static void SPEHInstallAppLinkHooks(void)
 		}
 	}
 
+	// 0.9.8：只挂第一个命中，避免 TabDocument / _SFTabDocument 或两个 SEL 同时命中时
+	// 共用一个 gOrigIncludeAppLinkActions 导致 orig 被覆盖（0.6.0 同类自递归隐患）
+	BOOL includeHooked = NO;
 	for (NSString *cn in @[ @"TabDocument", @"_SFTabDocument" ]) {
+		if (includeHooked) break;
 		Class tabCls = NSClassFromString(cn);
 		if (!tabCls) continue;
 		for (NSString *sn in @[ @"_webView:shouldIncludeAppLinkActionsForElement:",
@@ -1234,6 +1275,8 @@ static void SPEHInstallAppLinkHooks(void)
 			if (class_getInstanceMethod(tabCls, sel)) {
 				SPEHPatchInstanceMethod(tabCls, sel, (IMP)SPEHIncludeAppLinkActionsHook, &gOrigIncludeAppLinkActions);
 				[hit addObject:[NSString stringWithFormat:@"%@ -%@", cn, sn]];
+				includeHooked = YES;
+				break;
 			}
 		}
 	}
@@ -1284,20 +1327,29 @@ static NSMutableDictionary *gHostClsFlags = nil;
 static int SPEHHostClsFlags(Class c)
 {
 	if (!c) return 0;
-	if (!gHostClsFlags) gHostClsFlags = [NSMutableDictionary dictionary];
-	NSValue *key = [NSValue valueWithPointer:(__bridge const void *)c];
-	NSNumber *cached = gHostClsFlags[key];
-	if (cached) return cached.intValue;
+	// 0.9.8 优化：addGestureRecognizer: 偶发非主线程调用，NSMutableDictionary 读写加锁。
+	// 同样用固定 token 做锁；命中缓存后一次字典查表即返回，锁粒度极小。
+	static dispatch_once_t onceToken;
+	static id hostLock = nil;
+	dispatch_once(&onceToken, ^{
+		gHostClsFlags = [NSMutableDictionary dictionary];
+		hostLock = [NSObject new];
+	});
+	@synchronized (hostLock) {
+		NSValue *key = [NSValue valueWithPointer:(__bridge const void *)c];
+		NSNumber *cached = gHostClsFlags[key];
+		if (cached) return cached.intValue;
 
-	NSString *name = NSStringFromClass(c);
-	int flags = 0;
-	if (SPEHHostLooksLikeURLBar(name)) flags |= 1;
-	if ([name rangeOfString:@"URL"].location != NSNotFound ||
-		[name rangeOfString:@"Address"].location != NSNotFound) flags |= 2;
+		NSString *name = NSStringFromClass(c);
+		int flags = 0;
+		if (SPEHHostLooksLikeURLBar(name)) flags |= 1;
+		if ([name rangeOfString:@"URL"].location != NSNotFound ||
+			[name rangeOfString:@"Address"].location != NSNotFound) flags |= 2;
 
-	if (gHostClsFlags.count > 300) [gHostClsFlags removeAllObjects];
-	gHostClsFlags[key] = @(flags);
-	return flags;
+		if (gHostClsFlags.count > 300) [gHostClsFlags removeAllObjects];
+		gHostClsFlags[key] = @(flags);
+		return flags;
+	}
 }
 
 // 胶囊栏 pan 标记 + 横向分量清零（保留纵向）
@@ -1306,7 +1358,7 @@ static IMP gOrigPanSetTranslation = NULL;
 
 static void SPEHPanSetTranslationHook(UIPanGestureRecognizer *self, SEL _cmd, CGPoint t, UIView *view)
 {
-	if (SPEHURLBarSwipeKillEnabled() && objc_getAssociatedObject(self, &kCapsulePanTag)) {
+	if (objc_getAssociatedObject(self, &kCapsulePanTag) && SPEHURLBarSwipeKillEnabled()) {
 		if (fabs(t.x) > fabs(t.y)) t.x = 0.0;
 	}
 	if (gOrigPanSetTranslation) {
@@ -1318,9 +1370,10 @@ static void SPEHEnhanceAddGestureHook(UIView *self, SEL _cmd, UIGestureRecognize
 {
 	// 先按手势类型快速过滤（绝大多数调用在这里就返回，开销可忽略），
 	// 再做类名匹配（已按 Class 缓存）。
-	if (SPEHURLBarSwipeKillEnabled() && gr &&
+	if (gr &&
 		([gr isKindOfClass:[UISwipeGestureRecognizer class]] ||
-		 [gr isKindOfClass:[UIPanGestureRecognizer class]])) {
+		 [gr isKindOfClass:[UIPanGestureRecognizer class]]) &&
+		SPEHURLBarSwipeKillEnabled()) {
 		@try {
 			Class hostC = object_getClass(self);
 			int flags = SPEHHostClsFlags(hostC);
