@@ -9,6 +9,10 @@ TWEAK_NAME = Safari16Enhance
 
 Safari16Enhance_FILES = Tweak.xm
 Safari16Enhance_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable
+# SPEH_NO_LOG=1 make package —— 编译期彻底剥离日志（无队列、无文件、无日志字符串）
+ifneq ($(SPEH_NO_LOG),)
+Safari16Enhance_CFLAGS += -DSPEH_NO_LOG
+endif
 Safari16Enhance_FRAMEWORKS = UIKit Foundation
 
 include $(THEOS_MAKE_PATH)/tweak.mk

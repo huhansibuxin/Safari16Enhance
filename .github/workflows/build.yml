@@ -46,7 +46,7 @@ jobs:
           grep -q 'DISPATCH_QUEUE_SERIAL' Tweak.xm
           echo "OK: source discipline present"
 
-      - name: Build
+      - name: Build (with diagnostics)
         run: make package
 
       - name: Verify build contents
@@ -98,8 +98,47 @@ jobs:
           echo "== deb =="
           ls -l packages/
 
+      - name: Save diagnostic deb
+        run: |
+          mkdir -p artifacts
+          cp packages/*.deb artifacts/Safari16Enhance-0.9.7-withlog.deb
+          ls -l artifacts/
+
+      - name: Build no-log variant
+        run: |
+          make clean
+          cp control control.bak
+          sed -i '' 's/^Version: 0.9.7$/Version: 0.9.7-nolog/' control
+          SPEH_NO_LOG=1 make package
+          cp control.bak control
+          cp packages/*.deb artifacts/Safari16Enhance-0.9.7-nolog.deb
+          ls -l artifacts/
+
+      - name: Verify no-log variant
+        run: |
+          DYLIB=$(find .theos -name 'Safari16Enhance.dylib' -type f -not -path '*.dSYM*' | head -1)
+          echo "== no-log dylib: $DYLIB =="
+          STRINGS=$(strings -a "$DYLIB")
+          if echo "$STRINGS" | grep -q 'Safari16Enhance.log'; then
+            echo "::error::no-log build still contains log path string"
+            exit 1
+          fi
+          if echo "$STRINGS" | grep -q 'com.huhansibuxin.speh.log'; then
+            echo "::error::no-log build still contains log queue string"
+            exit 1
+          fi
+          for NEEDLE in 'SFDialogController' 'appLinkRedirect' 'killOpenInApp' \
+                        'killAppLinkPrompt' 'AppLinkWithURL' 'killSmartBanner' \
+                        'didFinishNavigation' 'killURLBarSwipe' 'didMoveToWindow'; do
+            if ! echo "$STRINGS" | grep -qF "$NEEDLE"; then
+              echo "::error::no-log build missing functional string: $NEEDLE"
+              exit 1
+            fi
+          done
+          echo "OK: log fully stripped, all functional hooks present"
+
       - name: Upload deb
         uses: actions/upload-artifact@v4
         with:
           name: Safari16Enhance-roothide
-          path: packages/*.deb
+          path: artifacts/*.deb

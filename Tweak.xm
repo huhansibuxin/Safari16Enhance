@@ -26,13 +26,15 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.9.6"
+#define SPEH_VERSION "0.9.7"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
 #define SPEH_LOG_NAME    @"Safari16Enhance.log"
 
 // MARK: - 日志（写入 Safari 容器 Documents）
+// SPEH_NO_LOG：编译期彻底剥离日志变体（无队列、无文件、无日志字符串进二进制）
+#ifndef SPEH_NO_LOG
 
 static BOOL SPEHPrepareDirectory(NSString *dir)
 {
@@ -136,6 +138,11 @@ static void SPEHLog(NSString *fmt, ...)
 		}
 	});
 }
+
+#else   // SPEH_NO_LOG —— 日志调用整体编译掉，仅保留路径桩供启动代码引用
+#define SPEHLog(...) do { } while (0)
+static NSString *SPEHLogPath(void) { return nil; }
+#endif  // SPEH_NO_LOG
 
 // MARK: - 配置
 
@@ -407,8 +414,52 @@ static void SPEHPresentDialogHook(id self, SEL _cmd, id dialog)
 {
 	NSString *desc = SPEHDialogDescribe(dialog);
 	if (SPEHTextWantsOpenApp(desc)) {
-		SPEHLog(@"[appdlg] 命中并取消 %@", desc);
-		return;   // 不调 orig：对话框对象不进入呈现队列
+		// 0.9.7 修复：不能直接 return。
+		// 这个 dialog 背后挂着一个 WebKit 导航决策，completionHandler 不回调，
+		// 导航就永远 pending —— 表现就是「弹窗没了，但返回按钮也失效了」。
+		// 正确做法：让 orig 把 dialog 正常挂进状态机（handler 已备好），
+		// 再用 SFDialogController 自己的取消方法走完流程，导航随即解锁。
+		if (gOrigPresentDialog) ((void (*)(id, SEL, id))gOrigPresentDialog)(self, _cmd, dialog);
+
+		BOOL canceled = NO;
+		@try {
+			if ([self respondsToSelector:@selector(cancelPresentedDialogIfNeeded)]) {
+				((void (*)(id, SEL))objc_msgSend)(self, @selector(cancelPresentedDialogIfNeeded));
+				canceled = YES;
+			}
+		} @catch (NSException *e) { canceled = NO; }
+
+		// 兜底 1：老方法 _dismissCurrentDialogWithResponse: 仍在 iOS 16 上
+		if (!canceled) {
+			@try {
+				if ([self respondsToSelector:@selector(_dismissCurrentDialogWithResponse:)]) {
+					((void (*)(id, SEL, id))objc_msgSend)(self, @selector(_dismissCurrentDialogWithResponse:),
+							@{@"password": @"", @"selectedActionIndex": @1, @"text": @""});
+					canceled = YES;
+				}
+			} @catch (NSException *e) { canceled = NO; }
+		}
+
+		// 兜底 2：presentDialog: 同步阶段 presentedDialog 可能还没设置，
+		// 0.1s 后再确认一次，仍在才取消（避免误伤下一个 dialog）
+		__weak id weakSelf = self;
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+					   dispatch_get_main_queue(), ^{
+			id s = weakSelf;
+			if (!s) return;
+			@try {
+				if ([s respondsToSelector:@selector(presentedDialog)]) {
+					id cur = ((id (*)(id, SEL))objc_msgSend)(s, @selector(presentedDialog));
+					if (cur == dialog && [s respondsToSelector:@selector(cancelPresentedDialogIfNeeded)]) {
+						((void (*)(id, SEL))objc_msgSend)(s, @selector(cancelPresentedDialogIfNeeded));
+						SPEHLog(@"[appdlg] 0.1s 兜底取消生效");
+					}
+				}
+			} @catch (NSException *e) { }
+		});
+
+		SPEHLog(@"[appdlg] 命中并取消(同步=%d) %@", canceled, desc);
+		return;
 	}
 	if (gAppDlgDiagCount < 30) {
 		gAppDlgDiagCount++;
