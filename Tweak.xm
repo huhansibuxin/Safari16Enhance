@@ -139,9 +139,8 @@ static void SPEHLog(NSString *fmt, ...)
 	});
 }
 
-#else   // SPEH_NO_LOG —— 日志调用整体编译掉，仅保留路径桩供启动代码引用
+#else   // SPEH_NO_LOG —— 日志调用整体编译掉，路径函数也不存在
 #define SPEHLog(...) do { } while (0)
-static NSString *SPEHLogPath(void) { return nil; }
 #endif  // SPEH_NO_LOG
 
 // MARK: - 配置
@@ -1425,7 +1424,9 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 
 		SPEHLog(@"==============================================");
 		SPEHLog(@"Safari16Enhance " SPEH_VERSION " loaded, pid=%d", getpid());
+#ifndef SPEH_NO_LOG
 		SPEHLog(@"log file = %@", SPEHLogPath());
+#endif
 		SPEHLog(@"dialog=%d reader=%d openinapp=%d smartbanner=%d applink=%d probe=%d",
 				SPEHDialogKillEnabled(), SPEHReaderKillEnabled(),
 				SPEHOpenInAppKillEnabled(), SPEHSmartBannerKillEnabled(),
