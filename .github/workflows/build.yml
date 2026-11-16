@@ -98,14 +98,22 @@ jobs:
           echo "== deb =="
           ls -l packages/
 
-      - name: Save diagnostic deb
+      - name: Save and upload diagnostic deb
         run: |
           mkdir -p artifacts
           cp packages/*.deb artifacts/Safari16Enhance-0.9.7-withlog.deb
           ls -l artifacts/
 
+      - name: Upload diagnostic deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: Safari16Enhance-roothide-withlog
+          path: artifacts/Safari16Enhance-0.9.7-withlog.deb
+          if-no-files-found: error
+
       - name: Build no-log variant
         run: |
+          rm -f packages/*.deb
           make clean
           cp control control.bak
           sed -i '' 's/^Version: 0.9.7$/Version: 0.9.7-nolog/' control
@@ -137,8 +145,9 @@ jobs:
           done
           echo "OK: log fully stripped, all functional hooks present"
 
-      - name: Upload deb
+      - name: Upload no-log deb
         uses: actions/upload-artifact@v4
         with:
-          name: Safari16Enhance-roothide
-          path: artifacts/*.deb
+          name: Safari16Enhance-roothide-nolog
+          path: artifacts/Safari16Enhance-0.9.7-nolog.deb
+          if-no-files-found: error
