@@ -64,6 +64,8 @@ jobs:
             "Safari16Enhance $VER loaded" \
             'Safari16Enhance.log' \
             'SFDialogView' \
+            'SFDialogController' \
+            'appLinkRedirect' \
             'killOpenInApp' \
             'killAppLinkPrompt' \
             'AppLinkWithURL' \

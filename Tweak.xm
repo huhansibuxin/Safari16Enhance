@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.9.5"
+#define SPEH_VERSION "0.9.6"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -335,6 +335,140 @@ static void SPEHInstallSFDialogHooks(void)
 	SPEHLog(@"[sfdialog] hooks didMoveToWindow=%s layoutSubviews=%s",
 			gOrigSFDialogDidMoveToWindow ? "ok" : "FAILED",
 			gOrigSFDialogLayoutSubviews ? "ok" : "FAILED");
+}
+
+// MARK: - 「在 App 中打开」确认框（iOS 16 真类，反编译实证）
+//
+// iOS 16.6 (22.6.0) 同型号设备运行时 class-dump（MobileSafari.framework）确认：
+//   SFDialog / SFBasicDialog / SFDialogController / SFDialogView / SFDialogAction 全部存在
+//   -[SFDialogController presentDialog:]                 ← 所有对话框的必经之路
+//   -[SFDialogController cancelPresentedDialogIfNeeded]
+//   -[SFBasicDialog title/message/actions/completionHandler]
+//   +[SFDialog _appLinkRedirectDialogWithMessage:completionHandler:]  ← App 跳转对话框工厂
+//   -[SFWebViewController dialogController:willPresentDialog:]
+// 旧版 SafariPlus 的 _SFDialog / _SFDialogController / finishWithPrimaryAction:text:
+// 在 iOS 16 上【不存在】，照抄旧代码只会毫无效果。
+//
+// 落点：hook presentDialog:，命中「中打开 / Open in」就不调 orig —— dialog 根本不进呈现队列。
+// 另两处只打诊断，不改行为，避免多点拦截互相打架。
+static int gAppDlgDiagCount = 0;
+
+static NSString *SPEHObjString(id obj, SEL sel)
+{
+	if (!obj || ![obj respondsToSelector:sel]) return nil;
+	@try {
+		id v = ((id (*)(id, SEL))objc_msgSend)(obj, sel);
+		return [v isKindOfClass:[NSString class]] ? (NSString *)v : nil;
+	} @catch (NSException *e) { return nil; }
+}
+
+static NSString *SPEHDialogDescribe(id dialog)
+{
+	NSMutableString *s = [NSMutableString stringWithString:@"{"];
+	[s appendFormat:@"class=%@", dialog ? NSStringFromClass([dialog class]) : @"nil"];
+	NSString *t = SPEHObjString(dialog, @selector(title));
+	NSString *m = SPEHObjString(dialog, @selector(message));
+	if (t.length) [s appendFormat:@" title=%@", t.length > 120 ? [t substringToIndex:120] : t];
+	if (m.length) [s appendFormat:@" message=%@", m.length > 180 ? [m substringToIndex:180] : m];
+	@try {
+		if ([dialog respondsToSelector:@selector(actions)]) {
+			id acts = ((id (*)(id, SEL))objc_msgSend)(dialog, @selector(actions));
+			if ([acts isKindOfClass:[NSArray class]]) {
+				NSMutableArray *names = [NSMutableArray array];
+				for (id a in (NSArray *)acts) {
+					NSString *n = SPEHObjString(a, @selector(title));
+					if (n.length) [names addObject:n];
+				}
+				if (names.count) [s appendFormat:@" actions=[%@]", [names componentsJoinedByString:@","]];
+			}
+		}
+	} @catch (NSException *e) { }
+	[s appendString:@"}"];
+	return s;
+}
+
+static BOOL SPEHTextWantsOpenApp(NSString *text)
+{
+	if (!text.length) return NO;
+	static NSArray *kw = nil;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		kw = @[@"中打开", @"应用中打开", @"App中打开", @"APP中打开", @"用抖音打开", @"使用抖音打开",
+		       @"Open in", @"open in", @"Open with", @"Continue in"];
+	});
+	for (NSString *k in kw) {
+		if ([text rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+	}
+	return NO;
+}
+
+static IMP gOrigPresentDialog = NULL;
+static void SPEHPresentDialogHook(id self, SEL _cmd, id dialog)
+{
+	NSString *desc = SPEHDialogDescribe(dialog);
+	if (SPEHTextWantsOpenApp(desc)) {
+		SPEHLog(@"[appdlg] 命中并取消 %@", desc);
+		return;   // 不调 orig：对话框对象不进入呈现队列
+	}
+	if (gAppDlgDiagCount < 30) {
+		gAppDlgDiagCount++;
+		SPEHLog(@"[appdlg] 放行 #%d %@", gAppDlgDiagCount, desc);
+	}
+	if (gOrigPresentDialog) ((void (*)(id, SEL, id))gOrigPresentDialog)(self, _cmd, dialog);
+}
+
+static IMP gOrigAppLinkRedirectDialog = NULL;
+static id SPEHAppLinkRedirectDialogHook(id self, SEL _cmd, NSString *message, id completion)
+{
+	if (gAppDlgDiagCount < 30) {
+		gAppDlgDiagCount++;
+		SPEHLog(@"[appdlg] 工厂 #%d appLinkRedirect message=%@", gAppDlgDiagCount,
+				(message.length > 180) ? [message substringToIndex:180] : (message ?: @""));
+	}
+	if (gOrigAppLinkRedirectDialog) {
+		return ((id (*)(id, SEL, id, id))gOrigAppLinkRedirectDialog)(self, _cmd, message, completion);
+	}
+	return nil;
+}
+
+static IMP gOrigWillPresentDialog = NULL;
+static void SPEHWillPresentDialogHook(id self, SEL _cmd, id controller, id dialog)
+{
+	if (gAppDlgDiagCount < 30) {
+		gAppDlgDiagCount++;
+		SPEHLog(@"[appdlg] 代理 #%d willPresent %@", gAppDlgDiagCount, SPEHDialogDescribe(dialog));
+	}
+	if (gOrigWillPresentDialog) ((void (*)(id, SEL, id, id))gOrigWillPresentDialog)(self, _cmd, controller, dialog);
+}
+
+static void SPEHInstallAppOpenDialogHooks(void)
+{
+	Class dc = NSClassFromString(@"SFDialogController");
+	Class dcls = NSClassFromString(@"SFDialog");
+	Class wc = NSClassFromString(@"SFWebViewController");
+
+	BOOL hasPresent  = (dc && class_getInstanceMethod(dc, @selector(presentDialog:))) ? YES : NO;
+	BOOL hasCancel   = (dc && class_getInstanceMethod(dc, @selector(cancelPresentedDialogIfNeeded))) ? YES : NO;
+	BOOL hasFactory  = (dcls && class_getClassMethod(dcls, @selector(_appLinkRedirectDialogWithMessage:completionHandler:))) ? YES : NO;
+	BOOL hasDelegate = (wc && class_getInstanceMethod(wc, @selector(dialogController:willPresentDialog:))) ? YES : NO;
+
+	SPEHLog(@"[appdlg] iOS16 探测 SFDialogController=%d presentDialog:=%d cancel=%d SFDialog=%d appLinkFactory=%d SFWebViewController=%d willPresentDialog:=%d",
+			dc ? 1 : 0, hasPresent, hasCancel, dcls ? 1 : 0, hasFactory, wc ? 1 : 0, hasDelegate);
+
+	if (hasPresent) {
+		SPEHPatchInstanceMethod(dc, @selector(presentDialog:), (IMP)SPEHPresentDialogHook, &gOrigPresentDialog);
+		SPEHLog(@"[appdlg] hook presentDialog: %s", gOrigPresentDialog ? "ok" : "FAILED");
+	}
+	if (hasFactory) {
+		MSHookMessageEx(object_getClass(dcls), @selector(_appLinkRedirectDialogWithMessage:completionHandler:),
+						(IMP)SPEHAppLinkRedirectDialogHook, &gOrigAppLinkRedirectDialog);
+		SPEHLog(@"[appdlg] hook appLinkFactory %s", gOrigAppLinkRedirectDialog ? "ok" : "FAILED");
+	}
+	if (hasDelegate) {
+		SPEHPatchInstanceMethod(wc, @selector(dialogController:willPresentDialog:),
+								(IMP)SPEHWillPresentDialogHook, &gOrigWillPresentDialog);
+		SPEHLog(@"[appdlg] hook willPresentDialog: %s", gOrigWillPresentDialog ? "ok" : "FAILED");
+	}
 }
 
 // MARK: - 阅读器击杀（白名单精准命中）
@@ -1247,6 +1381,7 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 				SPEHAppLinkKillEnabled(), SPEHProbeEnabled());
 
 		SPEHInstallSFDialogHooks();
+		SPEHInstallAppOpenDialogHooks();
 		SPEHInstallReaderHooks();
 		SPEHInstallOpenInAppHooks();
 		SPEHInstallAppLinkHooks();
