@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.9.7"
+#define SPEH_VERSION "0.9.8"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -396,11 +396,29 @@ static NSString *SPEHDialogDescribe(id dialog)
 static BOOL SPEHTextWantsOpenApp(NSString *text)
 {
 	if (!text.length) return NO;
+
+	// 0.9.8：先排除 Safari 自身的「错误提示框」。这类框必须放行给 sfdialog 精准拆除，
+	// 绝不能被下面的通用规则误伤（它们含「浏览器」字样但不是「选择打开方式」）。
+	static NSArray *exclude = nil;
+	static dispatch_once_t onceEx;
+	dispatch_once(&onceEx, ^{
+		exclude = @[@"打不开", @"网址无效", @"无法打开", @"无法连接到", @"can't open", @"cannot open", @"could not open"];
+	});
+	for (NSString *k in exclude) {
+		if ([text rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) return NO;
+	}
+
 	static NSArray *kw = nil;
 	static dispatch_once_t once;
 	dispatch_once(&once, ^{
-		kw = @[@"中打开", @"应用中打开", @"App中打开", @"APP中打开", @"用抖音打开", @"使用抖音打开",
-		       @"Open in", @"open in", @"Open with", @"Continue in"];
+		kw = @[@"中打开", @"里打开", @"应用中打开", @"App中打开", @"APP中打开", @"用抖音打开", @"使用抖音打开",
+		       @"Open in", @"open in", @"Open with", @"Continue in",
+		       // 0.9.8 通用化：各类「选择用哪个 App / 浏览器打开」的措辞
+		       @"中打开此页", @"里打开此页", @"中继续", @"里继续", @"打开方式", @"选择打开", @"选取打开",
+		       @"在浏览器", @"浏览器中打开", @"浏览器打开", @"用浏览器", @"网页打开", @"用网页",
+		       @"打开App", @"打开APP", @"打开应用", @"App打开", @"APP打开", @"应用打开",
+		       @"用App打开", @"使用App打开", @"用应用打开", @"此App打开", @"该App打开",
+		       @"Open in Safari", @"Continue with", @"Open using", @"Open with Safari"];
 	});
 	for (NSString *k in kw) {
 		if ([text rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
@@ -408,11 +426,35 @@ static BOOL SPEHTextWantsOpenApp(NSString *text)
 	return NO;
 }
 
+// 0.9.8：按对话框按钮判定「选择打开方式」确认框。
+// AppLink 确认框至少 2 个按钮且含「打开」类按钮（如 抖音:[打开,取消]、起点:[在起点读书中打开,在浏览器中打开]）；
+// Safari 错误框只有单个「好」按钮，不会命中 —— 放行给 sfdialog 精准拆除。
+static BOOL SPEHActionWantsOpenApp(id dialog)
+{
+	if (!dialog || ![dialog respondsToSelector:@selector(actions)]) return NO;
+	@try {
+		id acts = ((id (*)(id, SEL))objc_msgSend)(dialog, @selector(actions));
+		if (![acts isKindOfClass:[NSArray class]] || [(NSArray *)acts count] < 2) return NO;
+		for (id a in (NSArray *)acts) {
+			NSString *n = SPEHObjString(a, @selector(title));
+			if (!n.length) continue;
+			// 「打不开」这类否定式不算
+			if ([n rangeOfString:@"打不开"].location != NSNotFound) continue;
+			if ([n rangeOfString:@"打开" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+			    [n rangeOfString:@"open" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+				return YES;
+			}
+		}
+	} @catch (NSException *e) { return NO; }
+	return NO;
+}
+
 static IMP gOrigPresentDialog = NULL;
 static void SPEHPresentDialogHook(id self, SEL _cmd, id dialog)
 {
 	NSString *desc = SPEHDialogDescribe(dialog);
-	if (SPEHTextWantsOpenApp(desc)) {
+	BOOL wantsOpen = SPEHTextWantsOpenApp(desc) || SPEHActionWantsOpenApp(dialog);
+	if (wantsOpen) {
 		// 0.9.7 修复：不能直接 return。
 		// 这个 dialog 背后挂着一个 WebKit 导航决策，completionHandler 不回调，
 		// 导航就永远 pending —— 表现就是「弹窗没了，但返回按钮也失效了」。
