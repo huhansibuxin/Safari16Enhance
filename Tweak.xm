@@ -1,4 +1,4 @@
-// Safari16Enhance 0.10.0 - iOS 16 Safari 增强
+// Safari16Enhance 0.11.0 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -20,13 +20,14 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <substrate.h>
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.10.0"
+#define SPEH_VERSION "0.11.0"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -222,6 +223,9 @@ static void SPEHShowToast(NSString *text)
 		}];
 	});
 }
+
+// 0.11.0 原生栏兜底扫描（定义在深色模块，转发声明供注入时机调用）
+void SPEHScanAndDarkenBarsFromWindow(void);
 
 static BOOL SPEHMethodReturnsBool(Method m)
 {
@@ -813,15 +817,20 @@ static void SPEHApplyOpenInAppJSAttempt(id webView, int attempt)
 // 只走 evaluateJavaScript，绝不碰 configuration / userContentController / processPool
 // （0.8.0 血泪教训：碰了会搞坏 Userscripts / Dark Night 等第三方扩展）。
 
-static NSString *SPEHDarkModeJS(void)
+// 系统深浅色（原生侧）：documentStart 脚本与原生栏 hook 共用
+static BOOL SPEHSystemIsDark(void)
 {
-	BOOL sysDark = NO;
 	@try {
 		UIUserInterfaceStyle st = [[UITraitCollection currentTraitCollection] userInterfaceStyle];
 		if (st == UIUserInterfaceStyleUnspecified)
 			st = [[UIScreen mainScreen] traitCollection].userInterfaceStyle;
-		sysDark = (st == UIUserInterfaceStyleDark);
-	} @catch (NSException *e) { }
+		return st == UIUserInterfaceStyleDark;
+	} @catch (NSException *e) { return NO; }
+}
+
+static NSString *SPEHDarkModeJS(void)
+{
+	BOOL sysDark = SPEHSystemIsDark();
 
 	return [NSString stringWithFormat:
 		@"(function(){try{"
@@ -830,25 +839,36 @@ static NSString *SPEHDarkModeJS(void)
 		"function on(){return mq?!!mq.matches:!!DARK;}"
 		"function alreadyDark(){try{"
 		"var el=document.body||document.documentElement;"
+		"if(!el)return false;"
 		"var bg=window.getComputedStyle?getComputedStyle(el).backgroundColor:'';"
-		"if(!bg||bg==='transparent')return false;"
+		"if(!bg||bg==='transparent'||bg.indexOf('rgba(0, 0, 0, 0)')===0)return false;"
 		"if(bg.indexOf('rgba')===0){var ps=bg.replace(/rgba?\\(|\\)/g,'').split(',');"
 		"var a=parseFloat(ps[3]);if(!isNaN(a)&&a<0.1)return false;}"
 		"var c=bg.match(/(\\d+)\\D+(\\d+)\\D+(\\d+)/);"
 		"if(c){var l=(parseInt(c[1])*299+parseInt(c[2])*587+parseInt(c[3])*114)/1000;"
 		"return l<70;}}catch(e){}return false;}"
 		"var css=\"html[data-speh-dark='1']{filter:invert(1) hue-rotate(180deg) brightness(0.92) contrast(1.05)!important;background-color:#fff!important;}\""
-		"+\"html[data-speh-dark='1'] img,html[data-speh-dark='1'] video,html[data-speh-dark='1'] canvas,html[data-speh-dark='1'] svg,html[data-speh-dark='1'] iframe{filter:invert(1) hue-rotate(180deg)!important;}\";"
+		"+\"html[data-speh-dark='1'] img,html[data-speh-dark='1'] video,html[data-speh-dark='1'] canvas,html[data-speh-dark='1'] svg,html[data-speh-dark='1'] iframe{filter:invert(1) hue-rotate(180deg)!important;}\""
+		// 0.11.0：搜索结果标题不再被 invert 染黄。整页滤镜会把元素颜色反相，
+		// 想让链接「显示白」源色要给近黑、想「显示灰」源色要给中灰；hue-rotate 对灰阶无效。
+		// 已访问链接用更深一档灰，反相后可明显区分点没点过。
+		"+\"html[data-speh-dark='1'] a,html[data-speh-dark='1'] a:link,html[data-speh-dark='1'] a span,html[data-speh-dark='1'] a div,html[data-speh-dark='1'] a h1,html[data-speh-dark='1'] a h2,html[data-speh-dark='1'] a h3,html[data-speh-dark='1'] a h4{color:#171717!important;}\""
+		"+\"html[data-speh-dark='1'] a:visited,html[data-speh-dark='1'] a:visited span,html[data-speh-dark='1'] a:visited div,html[data-speh-dark='1'] a:visited h1,html[data-speh-dark='1'] a:visited h2,html[data-speh-dark='1'] a:visited h3,html[data-speh-dark='1'] a:visited h4{color:#616161!important;}\";"
 		"function ensure(){if(document.getElementById(ID))return;"
 		"var s=document.createElement('style');s.id=ID;s.textContent=css;"
 		"(document.head||document.documentElement).appendChild(s);}"
 		"function clear(){document.documentElement.removeAttribute('data-speh-dark');"
 		"var s=document.getElementById(ID);if(s&&s.parentNode)s.parentNode.removeChild(s);}"
+		// 可重入：documentStart 阶段 body 还没建立，会先按浅色套上；DOMContentLoaded
+		// 之后 body 有了再复查一次，若网页本身深色则撤销，避免把深色页反转成白。
 		"function apply(){if(!on()){clear();return;}"
-		"if(document.documentElement.getAttribute('data-speh-dark')==='1')return;"
-		"if(alreadyDark())return;ensure();"
+		"var dark=alreadyDark();"
+		"var has=document.documentElement.getAttribute('data-speh-dark')==='1';"
+		"if(dark){if(has)clear();return;}"
+		"if(has)return;ensure();"
 		"document.documentElement.setAttribute('data-speh-dark','1');}"
 		"apply();"
+		"if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',apply,{once:true});}"
 		"if(mq&&!window.__spehDarkWatch){window.__spehDarkWatch=1;"
 		"var h=function(){clear();apply();};"
 		"if(mq.addEventListener)mq.addEventListener('change',h);"
@@ -867,14 +887,228 @@ static void SPEHApplyDarkModeJS(id webView)
 	} @catch (NSException *e) { }
 }
 
-// 0.8.0 踩坑（老板实测）：原来这里用 WKUserScript 往 configuration.userContentController
-// 里 addUserScript，做「文档开始就删 meta」。后果是第三方 Safari 扩展集体异常：
-//   · Userscripts 的「自动加载下一页」不再执行；
-//   · Dark Night 每个页面都重新请求网站权限。
-// 根因：WKWebView 的 configuration 在初始化时已被内部 copy，之后再改（addUserScript /
-// 换 processPool）是非法的，会打乱 Safari 自己的注入管线（扩展 content script 走同一套）。
-// 结论：绝不碰 configuration / userContentController / processPool。
-// 删 meta 改用 evaluateJavaScript 在各时间点执行；横幅本身已由原生 hook 拦住。
+// ─── 0.11.0 消除「先白后黑」闪白：documentStart 注入 ────────────────────
+//
+// 老做法（0.10.0）：页面加载完再 evaluateJavaScript 加 style → 首帧必是白，必闪。
+// 新做法：hook WKWebView 初始化，在 orig 之前（configuration 尚未被 WebKit 内部
+// copy）把深色脚本作为 WKUserScript(atDocumentStart) 加进 userContentController，
+// 脚本在页面任何 DOM/CSS 渲染前就执行 → 第一帧就是深色，零闪白。
+//
+// ⚠️ 与 0.8.0 血泪教训的本质区别：
+//   0.8.0 = webView 已存在后，改 webView.configuration / processPool（非法，打乱扩展注入管线）
+//   0.11.0 = 只在 init 方法进入时改「即将被 copy 的那份 configuration」，是 WKWebView
+//            官方唯一正确的配置时机，不动任何已创建的 webView，扩展链路完全不受影响。
+// 白天：脚本内部 matchMedia 判断为浅色时只 clear 不加样式，零副作用。
+static char kSPEHDarkScriptStampKey;
+
+static void SPEHInjectDarkStartScriptToConfig(id configuration)
+{
+	if (!configuration || !SPEHDarkModeEnabled()) return;
+	@try {
+		WKWebViewConfiguration *cfg = (WKWebViewConfiguration *)configuration;
+		WKUserContentController *ucc = cfg.userContentController;
+		if (!ucc) return;
+		// 同一 configuration 可能初始化多个 webView，打标避免重复 addUserScript
+		if (objc_getAssociatedObject(ucc, &kSPEHDarkScriptStampKey)) return;
+		WKUserScript *script = [[WKUserScript alloc]
+			initWithSource:SPEHDarkModeJS()
+			injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+			forMainFrameOnly:YES];
+		[ucc addUserScript:script];
+		objc_setAssociatedObject(ucc, &kSPEHDarkScriptStampKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+		SPEHLog(@"[dark] documentStart 脚本已注入 configuration");
+	} @catch (NSException *e) {
+		SPEHLog(@"[dark] documentStart 注入失败 %@", e.reason);
+	}
+}
+
+// WKWebView 的两次常见初始化入口。测试用类精确匹配，避免 patch 到别的类。
+static IMP gOrigWVInitWithFrameConfig = NULL;
+static IMP gOrigWVInitWithConfig = NULL;
+
+static id SPEHWVInitWithFrameConfigHook(id self, SEL _cmd, CGRect frame, id configuration)
+{
+	SPEHInjectDarkStartScriptToConfig(configuration);
+	if (gOrigWVInitWithFrameConfig)
+		return ((id (*)(id, SEL, CGRect, id))gOrigWVInitWithFrameConfig)(self, _cmd, frame, configuration);
+	return nil;
+}
+
+static id SPEHWVInitWithConfigHook(id self, SEL _cmd, id configuration)
+{
+	SPEHInjectDarkStartScriptToConfig(configuration);
+	if (gOrigWVInitWithConfig)
+		return ((id (*)(id, SEL, id))gOrigWVInitWithConfig)(self, _cmd, configuration);
+	return nil;
+}
+
+static void SPEHInstallDarkStartHooks(void)
+{
+	if (!SPEHDarkModeEnabled()) return;
+	Class wkCls = NSClassFromString(@"WKWebView");
+	if (!wkCls) return;
+
+	SEL sel1 = @selector(initWithFrame:configuration:);
+	if (class_getInstanceMethod(wkCls, sel1))
+		SPEHPatchInstanceMethod(wkCls, sel1, (IMP)SPEHWVInitWithFrameConfigHook, &gOrigWVInitWithFrameConfig);
+	SEL sel2 = @selector(initWithConfiguration:);
+	if (class_getInstanceMethod(wkCls, sel2))
+		SPEHPatchInstanceMethod(wkCls, sel2, (IMP)SPEHWVInitWithConfigHook, &gOrigWVInitWithConfig);
+
+	SPEHLog(@"[dark] init hooks: frameConfig=%s config=%s",
+			gOrigWVInitWithFrameConfig ? "ok" : "none",
+			gOrigWVInitWithConfig ? "ok" : "none");
+}
+
+// ─── 0.11.0 原生栏深色：状态栏 / 收缩态地址栏 ───────────────────────────
+//
+// 网页深色靠 CSS filter，但 Safari 自己的原生栏不在网页 DOM 里，滤镜管不到：
+//   · 顶部状态栏区域：浅色网页时 Safari 用白底 + 深色图标；
+//   · 底部地址栏：展开时透明（正常），滚动后收缩成白底实色条。
+// 不猜私有类名（dyld cache 里取不到），改用「颜色是白 + 形状是贴边横条 + 深色模式」
+// 三条件拦截，两条栏一次覆盖，白天完全不碰。
+//   · hook setBackgroundColor: → 处理滚动收缩时「动态变白」；
+//   · 定时/事件后扫描视图树 → 处理初始化时就已是白色的栏（兜底）；
+//   · hook preferredStatusBarStyle → 图标/时间变白，避免黑底黑字。
+static IMP gOrigUIViewSetBg = NULL;
+static BOOL gSPEHDarkBarEnabled = NO;
+static BOOL gSPEHDarkBarInHook = NO;   // 重入哨兵：convertRect 可能间接触发 setBg，嵌套调用直接放行
+
+static BOOL SPEHColorIsWhiteish(UIColor *c)
+{
+	if (!c) return NO;
+	CGFloat r = 0, g = 0, b = 0, a = 0;
+	if (![c getRed:&r green:&g blue:&b alpha:&a]) return NO;
+	return a > 0.5 && r > 0.88 && g > 0.88 && b > 0.88;
+}
+
+// 视图在 window 坐标下是否是贴顶或贴底的整宽横条
+static BOOL SPEHViewIsEdgeBar(UIView *v)
+{
+	UIWindow *win = v.window;
+	if (!win) return NO;
+	CGRect r = [v convertRect:v.bounds toView:win];
+	CGFloat sw = win.bounds.size.width, sh = win.bounds.size.height;
+	if (sw <= 0 || sh <= 0) return NO;
+	if (r.size.width < sw * 0.75) return NO;
+	if (r.size.height < 18 || r.size.height > 130) return NO;
+	BOOL top = (r.origin.y <= 2);
+	BOOL bottom = (r.origin.y + r.size.height >= sh - 44);
+	return top || bottom;
+}
+
+// 把横条里的深色文字改成白色（黑底黑字看不见）
+static void SPEHWhitenLabelsInView(UIView *v, int depth)
+{
+	if (depth > 6) return;
+	for (UIView *sub in v.subviews) {
+		if ([sub isKindOfClass:[UILabel class]]) {
+			UILabel *lb = (UILabel *)sub;
+			UIColor *tc = lb.textColor;
+			CGFloat r = 0, g = 0, b = 0, a = 0;
+			if (tc && [tc getRed:&r green:&g blue:&b alpha:&a] &&
+				a > 0.3 && r < 0.6 && g < 0.6 && b < 0.6) {
+				lb.textColor = [UIColor whiteColor];
+			}
+		}
+		SPEHWhitenLabelsInView(sub, depth + 1);
+	}
+}
+
+static void SPEHDarkenBarView(UIView *v)
+{
+	if (!gSPEHDarkBarEnabled) return;
+	@try {
+		if (!SPEHViewIsEdgeBar(v)) return;
+		if (!SPEHColorIsWhiteish(v.backgroundColor)) return;
+		v.backgroundColor = [UIColor blackColor];
+		SPEHWhitenLabelsInView(v, 0);
+		SPEHLog(@"[darkbar] 命中 %@ → 黑", NSStringFromClass([v class]));
+	} @catch (NSException *e) { }
+}
+
+static void SPEHUIViewSetBgHook(UIView *self, SEL _cmd, UIColor *color)
+{
+	if (gSPEHDarkBarEnabled && !gSPEHDarkBarInHook) {
+		gSPEHDarkBarInHook = YES;
+		@try {
+			if (SPEHColorIsWhiteish(color) && SPEHViewIsEdgeBar(self)) {
+				color = [UIColor blackColor];
+				// label 变白放到下一个 runloop，避免布局中途改 textColor 触发递归
+				__weak UIView *wv = self;
+				dispatch_async(dispatch_get_main_queue(), ^{
+					if (wv) SPEHWhitenLabelsInView(wv, 0);
+				});
+				SPEHLog(@"[darkbar] setBg 拦截 %@", NSStringFromClass([self class]));
+			}
+		} @catch (NSException *e) { }
+		gSPEHDarkBarInHook = NO;
+	}
+	if (gOrigUIViewSetBg)
+		((void (*)(id, SEL, id))gOrigUIViewSetBg)(self, _cmd, color);
+}
+
+// 兜底扫描：初始化时就已经是白底的栏，setBg 拦截不到，这里补一次
+static void SPEHScanAndDarkenBars(UIView *root, int depth)
+{
+	if (depth > 14) return;
+	for (UIView *v in root.subviews) {
+		SPEHDarkenBarView(v);
+		SPEHScanAndDarkenBars(v, depth + 1);
+	}
+}
+
+void SPEHScanAndDarkenBarsFromWindow(void)
+{
+	if (!gSPEHDarkBarEnabled) return;
+	@try {
+		UIWindow *win = SPEHKeyWindow();
+		if (win) SPEHScanAndDarkenBars(win, 0);
+	} @catch (NSException *e) { }
+}
+
+// 状态栏图标/时间：深色时强制浅色内容（白字），否则黑底黑字看不见
+static IMP gOrigPreferredStatusBarStyle = NULL;
+static NSInteger SPEHPreferredStatusBarStyleHook(id self, SEL _cmd)
+{
+	NSInteger orig = UIStatusBarStyleDefault;
+	if (gOrigPreferredStatusBarStyle)
+		orig = ((NSInteger (*)(id, SEL))gOrigPreferredStatusBarStyle)(self, _cmd);
+	if (gSPEHDarkBarEnabled) return UIStatusBarStyleLightContent;
+	return orig;
+}
+
+static void SPEHInstallNativeDarkBarHooks(void)
+{
+	gSPEHDarkBarEnabled = SPEHDarkModeEnabled() && SPEHSystemIsDark();
+	if (!gSPEHDarkBarEnabled) return;
+
+	@try {
+		Class uvCls = [UIView class];
+		SEL bgSel = @selector(setBackgroundColor:);
+		Method bgm = class_getInstanceMethod(uvCls, bgSel);
+		if (bgm) SPEHPatchInstanceMethod(uvCls, bgSel, (IMP)SPEHUIViewSetBgHook, &gOrigUIViewSetBg);
+
+		// UIViewController 层改状态栏样式（顶层 VC 的 preferred 会被系统采纳）
+		Class vcCls = [UIViewController class];
+		SEL pssSel = @selector(preferredStatusBarStyle);
+		Method psm = class_getInstanceMethod(vcCls, pssSel);
+		if (psm) SPEHPatchInstanceMethod(vcCls, pssSel, (IMP)SPEHPreferredStatusBarStyleHook, &gOrigPreferredStatusBarStyle);
+
+		SPEHLog(@"[darkbar] installed: setBg=%s statusStyle=%s",
+				gOrigUIViewSetBg ? "ok" : "FAILED",
+				gOrigPreferredStatusBarStyle ? "ok" : "FAILED");
+	} @catch (NSException *e) {
+		SPEHLog(@"[darkbar] install 异常 %@", e.reason);
+	}
+}
+
+// 历史踩坑（0.8.0，保留警示）：webView 已存在后改 webView.configuration /
+// processPool / 事后 addUserScript 是非法的，会打乱 Safari 扩展注入管线
+//   （Userscripts 自动翻页失效、Dark Night 反复要权限）。
+// 0.11.0 的 documentStart 注入不在此列：它只在 WKWebView init 进入时、configuration
+// 被内部 copy 之前修改传入的那份配置，是官方正确时机，不碰任何已创建的 webView。
+// 删 meta 仍由 evaluateJavaScript 在各时间点执行；横幅本身已由原生 hook 拦住。
 
 // ─── Smart App Banner：精准命中（0.9.2 恢复）─────────────────────────────
 //
@@ -1066,6 +1300,7 @@ static void SPEHWVDidMoveToWindowHook(UIView *self, SEL _cmd)
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 			SPEHApplyOpenInAppJS(weakSelf);
 			SPEHApplyDarkModeJS(weakSelf);
+			SPEHScanAndDarkenBarsFromWindow();   // 0.11.0 原生栏兜底
 		});
 	}
 }
@@ -1088,6 +1323,7 @@ static void SPEHTabDidFinishNavigationHook(id self, SEL _cmd, id webView, id nav
 			dispatch_get_main_queue(), ^{
 				SPEHApplyOpenInAppJS(weakWV);
 				SPEHApplyDarkModeJS(weakWV);
+				SPEHScanAndDarkenBarsFromWindow();   // 0.11.0 原生栏兜底
 			});
 	}
 }
@@ -1612,7 +1848,9 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 		SPEHInstallAppOpenDialogHooks();
 		SPEHInstallReaderHooks();
 		SPEHInstallOpenInAppHooks();
+		SPEHInstallDarkStartHooks();   // 0.11.0：documentStart 注入，消除闪白
 		SPEHInstallAppLinkHooks();
+		SPEHInstallNativeDarkBarHooks();  // 0.11.0：状态栏/收缩地址栏变黑
 		SPEHInstallURLBarSwipeHooks();
 	}
 }
