@@ -1,4 +1,4 @@
-// Safari16Enhance 0.13.0 - iOS 16 Safari 增强
+// Safari16Enhance 0.13.1 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.13.0"
+#define SPEH_VERSION "0.13.1"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -659,7 +659,7 @@ static NSString *SPEHOpenInAppJS(void)
 			 "while(t&&t.tagName!=='A'){t=t.parentNode;}if(!t)return;"
 			 "var h=t.getAttribute&&t.getAttribute('href');if(!ok(h)){"
 			 "e.preventDefault();e.stopPropagation();window.__speh.s=(window.__speh.s||0)+1;}}catch(x){}},true);}"
-			 // ④B 0.13.0：Bing 搜索结果页的「继续搜索 / 微软必应APP / 浏览器 继续」卡片
+			 // ④B 0.13.1：Bing 搜索结果页的「继续搜索 / 微软必应APP / 浏览器 继续」卡片
 			 //   Bing 的 OpalUpsell:ContinueSearch 脚本给 #b_results li a 挂冒泡 click，
 			 //   先 preventDefault 再 CSPopupView.show()，点「继续」才 location.href 跳转。
 			 //   对策：在 document 捕获阶段只 stopPropagation、**不** preventDefault ——
@@ -670,10 +670,16 @@ static NSString *SPEHOpenInAppJS(void)
 			 "if(!inRes)return;var a=e.target;dep=0;"
 			 "while(a&&a.nodeType===1&&a.tagName!=='A'&&dep<12){a=a.parentNode;dep++;}"
 			 "if(!a||!a.getAttribute)return;var h=a.getAttribute('href')||'';"
-			 "if(/^https?:/i.test(h)){e.stopPropagation();window.__speh.cs=(window.__speh.cs||0)+1;}}catch(x){}},true);}"
+			 "if(/^https?:/i.test(h)){e.stopPropagation();window.__speh.cs=(window.__speh.cs||0)+1;"
+			 // 鲁棒兜底：万一个别 WKWebView 版本把「事件被中断」当成未激活、默认导航没发生，
+			 // 700ms 后校验①期间没有第二次点击②location 未变，才手工跳转，避免串页。
+			 "window.__speh.ns=(window.__speh.ns||0)+1;var seq=window.__speh.ns,base=location.href;"
+			 "setTimeout(function(){try{if(seq!==window.__speh.ns)return;if(location.href!==base)return;"
+			 "location.href=h;}catch(q){}},700);}"
+			 "}catch(x){}},true);}"
 			 // ⑤ 清网页自绘的「App 内打开」浮层（中英双关键字 + 只认 fixed/sticky/absolute + 宽度够宽）
 			 // 0.9.8：DOM 无变动时跳过全树扫描；卡片延迟插入会由 MutationObserver 重新置脏，不漏（JS 内不用 // 注释以免吃掉拼接行）
-			 // 0.13.0：加入 Bing 卡片特征词（继续搜索 / 搜你所想 / 微软必应APP 等），
+			 // 0.13.1：加入 Bing 卡片特征词（继续搜索 / 搜你所想 / 微软必应APP 等），
 			 //   并把「找到文本节点后向上爬到全宽定位容器再删」补上 —— 原来只删文本节点本身，
 			 //   Bing 的标题在内层小元素、宽度判定永远不过。同时排除 SCRIPT/STYLE，避免误删脚本。
 			 "if(window.__speh.dirty){"
@@ -819,7 +825,7 @@ static void SPEHApplyOpenInAppJSAttempt(id webView, int attempt)
 			if (meta > 0 || elems > 0 || blocked > 0) {
 				SPEHLog(@"[openinapp] 清理 meta=%d el=%d 已拦点击=%d", meta, elems, blocked);
 			}
-			// 0.13.0：Bing 结果页「继续搜索」卡片的压制计数（捕获阶段 stopPropagation 命中）
+			// 0.13.1：Bing 结果页「继续搜索」卡片的压制计数（捕获阶段 stopPropagation 命中）
 			if (bingCs > 0) {
 				SPEHLog(@"[openinapp] Bing 结果页点击压制 累计=%d", bingCs);
 			}
