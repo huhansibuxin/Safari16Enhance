@@ -1,4 +1,4 @@
-// Safari16Enhance 0.11.5 - iOS 16 Safari 增强
+// Safari16Enhance 0.11.6 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -27,7 +27,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.11.5"
+#define SPEH_VERSION "0.11.6"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -867,14 +867,54 @@ static NSString *SPEHDarkModeJS(BOOL dark)
 		// DARK 由 OC 每次调用时实时读取系统状态传入 ⇒ 权威值，每次覆盖写成同一个全局，
 		// 不存在「上一次的旧状态粘住」的问题，语义反转从机制上被排除。
 		"window.__spehDarkForce=%@;"
-		"var css=\"html[data-speh-dark='1']{filter:invert(1) hue-rotate(180deg) brightness(0.92) contrast(1.05)!important;background-color:#fff!important;}\""
-		// 图片/视频/canvas/SVG/iframe 二次反转，保持原色（开源同款配方）
-		"+\"html[data-speh-dark='1'] img,html[data-speh-dark='1'] video,html[data-speh-dark='1'] canvas,html[data-speh-dark='1'] svg,html[data-speh-dark='1'] iframe{filter:invert(1) hue-rotate(180deg)!important;}\""
+		// 外层与媒体元素**严格互逆**：都只用 invert(1) hue-rotate(180deg)。
+		// 0.11.5 外层多叠了 brightness(0.92) contrast(1.05)、内层没有 ⇒ 两次变换不互逆，
+		// 图片被拉暗、拉对比，这就是「有些图片颜色不对」的来源。
+		// 选择器前缀刻意把 [data-speh-dark] 重复一次（特异性 0,2,1），压过站点自带的
+		// `#app img{filter:xxx!important}`（1,0,1）—— 否则图片只吃到外层那次反转 ⇒ 整张反色。
+		"var css=\""
+		"html[data-speh-dark='1'][data-speh-dark]{filter:invert(1) hue-rotate(180deg)!important;background-color:#fff!important;}"
+		// 媒体元素二次反转还原原色。只选「叶子级」元素：picture 与 svg 内的 image 是容器，
+		// 一并选中会与子元素叠加成三次反转，反而更花，故排除。
+		"html[data-speh-dark='1'][data-speh-dark] img,"
+		"html[data-speh-dark='1'][data-speh-dark] video,"
+		"html[data-speh-dark='1'][data-speh-dark] canvas,"
+		"html[data-speh-dark='1'][data-speh-dark] svg,"
+		"html[data-speh-dark='1'][data-speh-dark] iframe,"
+		"html[data-speh-dark='1'][data-speh-dark] object,"
+		"html[data-speh-dark='1'][data-speh-dark] embed,"
+		"html[data-speh-dark='1'][data-speh-dark] input[type='image'],"
+		"html[data-speh-dark='1'][data-speh-dark] [style*='background-image']:empty"
+		"{filter:invert(1) hue-rotate(180deg)!important;}"
+		// 嵌套 svg（图标套图标）只反转最外层，内层还原，避免叠加反色
+		"html[data-speh-dark='1'][data-speh-dark] svg svg{filter:none!important;}"
 		// 定制①：未访问链接源色 #000→显示纯白；已访问 #808080→显示中灰，点没点过分得清
-		"+\"html[data-speh-dark='1'] a,html[data-speh-dark='1'] a:link,html[data-speh-dark='1'] a span,html[data-speh-dark='1'] a div,html[data-speh-dark='1'] a h1,html[data-speh-dark='1'] a h2,html[data-speh-dark='1'] a h3,html[data-speh-dark='1'] a h4{color:#000!important;}\""
-		"+\"html[data-speh-dark='1'] a:visited,html[data-speh-dark='1'] a:visited span,html[data-speh-dark='1'] a:visited div,html[data-speh-dark='1'] a:visited h1,html[data-speh-dark='1'] a:visited h2,html[data-speh-dark='1'] a:visited h3,html[data-speh-dark='1'] a:visited h4{color:#808080!important;}\""
+		"html[data-speh-dark='1'][data-speh-dark] a,"
+		"html[data-speh-dark='1'][data-speh-dark] a:link,"
+		"html[data-speh-dark='1'][data-speh-dark] a span,"
+		"html[data-speh-dark='1'][data-speh-dark] a div,"
+		"html[data-speh-dark='1'][data-speh-dark] a h1,"
+		"html[data-speh-dark='1'][data-speh-dark] a h2,"
+		"html[data-speh-dark='1'][data-speh-dark] a h3,"
+		"html[data-speh-dark='1'][data-speh-dark] a h4{color:#000!important;}"
+		"html[data-speh-dark='1'][data-speh-dark] a:visited,"
+		"html[data-speh-dark='1'][data-speh-dark] a:visited span,"
+		"html[data-speh-dark='1'][data-speh-dark] a:visited div,"
+		"html[data-speh-dark='1'][data-speh-dark] a:visited h1,"
+		"html[data-speh-dark='1'][data-speh-dark] a:visited h2,"
+		"html[data-speh-dark='1'][data-speh-dark] a:visited h3,"
+		"html[data-speh-dark='1'][data-speh-dark] a:visited h4{color:#808080!important;}"
 		// 定制②：搜索关键词高亮原本的屎黄→源色暗红 #8b0000，反相后显示亮红
-		"+\"html[data-speh-dark='1'] em,html[data-speh-dark='1'] strong,html[data-speh-dark='1'] b,html[data-speh-dark='1'] mark,html[data-speh-dark='1'] a em,html[data-speh-dark='1'] a strong,html[data-speh-dark='1'] a b,html[data-speh-dark='1'] a mark{color:#8b0000!important;background-color:transparent!important;}\";"
+		"html[data-speh-dark='1'][data-speh-dark] em,"
+		"html[data-speh-dark='1'][data-speh-dark] strong,"
+		"html[data-speh-dark='1'][data-speh-dark] b,"
+		"html[data-speh-dark='1'][data-speh-dark] mark,"
+		"html[data-speh-dark='1'][data-speh-dark] a em,"
+		"html[data-speh-dark='1'][data-speh-dark] a strong,"
+		"html[data-speh-dark='1'][data-speh-dark] a b,"
+		"html[data-speh-dark='1'][data-speh-dark] a mark"
+		"{color:#8b0000!important;background-color:transparent!important;}"
+		"\";"
 		"function lum(el){try{"
 		"if(!el)return null;"
 		"var bg=window.getComputedStyle?getComputedStyle(el).backgroundColor:'';"
