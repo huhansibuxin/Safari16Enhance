@@ -1,4 +1,4 @@
-// Safari16Enhance 0.12.3 - iOS 16 Safari 增强
+// Safari16Enhance 0.12.4 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.12.3"
+#define SPEH_VERSION "0.12.4"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -771,7 +771,7 @@ static void SPEHInstallAppOpenDialogHooks(void)
 	}
 }
 
-// MARK: - 0.12.3 畸形 URL 导航拦截（根治扩展权限弹窗）
+// MARK: - 0.12.4 畸形 URL 导航拦截（根治扩展权限弹窗）
 //
 // 真机日志铁证：每一次「“Dark Night”想要访问 <畸形 host>」前面几十毫秒，必然紧跟一次
 // 「Safari 浏览器打不开该网页，因为网址无效」；两者成对出现、页面却各不相同

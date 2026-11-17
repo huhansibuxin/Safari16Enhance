@@ -46,6 +46,40 @@ jobs:
           grep -q 'DISPATCH_QUEUE_SERIAL' Tweak.xm
           echo "OK: source discipline present"
 
+      - name: Verify control file
+        run: |
+          python3 - <<'PY'
+          import re, sys
+          raw = open('control', 'rb').read().decode('utf-8').replace('\r\n', '\n')
+          lines = [l for l in raw.split('\n') if l.strip()]
+          fields, order = {}, []
+          for l in lines:
+              if ': ' in l or l.endswith(':'):
+                  k = l.split(':', 1)[0]
+                  if not re.fullmatch(r'[A-Za-z][A-Za-z0-9-]*', k):
+                      print(f"::error::control 行不是合法字段: {l[:80]}")
+                      sys.exit(1)
+                  fields[k] = l.split(':', 1)[1].strip()
+                  order.append(k)
+              else:
+                  print(f"::error::control 出现孤立续行（多半是说明文字粘到了上一行字段）: {l[:80]}")
+                  sys.exit(1)
+          for req in ['Package','Name','Version','Architecture','Description','Maintainer','Author','Section','Depends']:
+              if req not in fields or not fields[req]:
+                  print(f"::error::control 缺少字段或为空: {req}")
+                  sys.exit(1)
+          # Depends 只能是 ASCII 包名表达式 —— 中文说明混进来会让 dpkg 直接拒装整个包
+          dep = fields['Depends']
+          if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9+._\-]*(, ?[A-Za-z0-9][A-Za-z0-9+._\-]*)*', dep):
+              print(f"::error::Depends 字段含非法字符（dpkg 会拒绝安装）: {dep[:120]}")
+              sys.exit(1)
+          # Description 必须是单行（本包一直用单行长描述）
+          if 'Description' not in order:
+              print("::error::Description 字段缺失")
+              sys.exit(1)
+          print(f"OK: control 字段齐全，Depends = {dep}")
+          PY
+
       - name: Build (with diagnostics)
         run: make package
 
@@ -101,14 +135,14 @@ jobs:
       - name: Save and upload diagnostic deb
         run: |
           mkdir -p artifacts
-          cp packages/*.deb artifacts/Safari16Enhance-0.12.3-withlog.deb
+          cp packages/*.deb artifacts/Safari16Enhance-0.12.4-withlog.deb
           ls -l artifacts/
 
       - name: Upload diagnostic deb
         uses: actions/upload-artifact@v4
         with:
           name: Safari16Enhance-roothide-withlog
-          path: artifacts/Safari16Enhance-0.12.3-withlog.deb
+          path: artifacts/Safari16Enhance-0.12.4-withlog.deb
           if-no-files-found: error
 
       - name: Build no-log variant
@@ -116,10 +150,10 @@ jobs:
           rm -f packages/*.deb
           make clean
           cp control control.bak
-          sed -i '' 's/^Version: 0.12.3$/Version: 0.12.3-nolog/' control
+          sed -i '' 's/^Version: 0.12.4$/Version: 0.12.4-nolog/' control
           SPEH_NO_LOG=1 make package
           cp control.bak control
-          cp packages/*.deb artifacts/Safari16Enhance-0.12.3-nolog.deb
+          cp packages/*.deb artifacts/Safari16Enhance-0.12.4-nolog.deb
           ls -l artifacts/
 
       - name: Verify no-log variant
@@ -149,5 +183,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Safari16Enhance-roothide-nolog
-          path: artifacts/Safari16Enhance-0.12.3-nolog.deb
+          path: artifacts/Safari16Enhance-0.12.4-nolog.deb
           if-no-files-found: error
