@@ -1,4 +1,4 @@
-// Safari16Enhance 0.11.2 - iOS 16 Safari 增强
+// Safari16Enhance 0.11.3 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -27,7 +27,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.11.2"
+#define SPEH_VERSION "0.11.3"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -841,7 +841,13 @@ static NSString *SPEHDarkModeJS(void)
 		@"(function(){try{"
 		"var ID='__speh_dark_style',DARK=%@;"
 		"var mq=window.matchMedia?window.matchMedia('(prefers-color-scheme: dark)'):null;"
-		"function on(){return mq?!!mq.matches:!!DARK;}"
+		// 0.11.3：首帧根因——documentStart 阶段少数站点(库库/少数派)的 matchMedia 还没同步到
+		// 系统深色，读到 matches=false 导致不变深，手动切一次深色触发 change 才生效。
+		// 修法：初始状态取 OC 层系统深色(DARK)与 mq.matches 之或——前者兜住"mq 首帧未同步"，
+		// 后者兜住"DARK 过时(WKWebView 复用/期间切过主题)"；全局单例让所有注入实例共享，
+		// 之后仅在系统主题真正切换(mq change)时才更新，保持跟随系统、白天两者皆 false 零副作用。
+		"if(window.__spehDarkOn===undefined)window.__spehDarkOn=!!DARK||!!(mq&&mq.matches);"
+		"function on(){return !!window.__spehDarkOn;}"
 		"function lum(el){try{"
 		"if(!el)return null;"
 		"var bg=window.getComputedStyle?getComputedStyle(el).backgroundColor:'';"
@@ -883,12 +889,12 @@ static NSString *SPEHDarkModeJS(void)
 		"he.style.filter='none';void he.offsetWidth;he.style.filter='';}"
 		"apply();"
 		"if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',apply,{once:true});}"
-		// 少数派等异步设主题的站点：DOMContentLoaded 后 350ms 再复查一次
-		"setTimeout(apply,350);"
+		// 少数派等异步设主题的站点：DOMContentLoaded 后 350ms 再复查一次（同页补注入会重复执行脚本，加 once 标记）
+		"if(!window.__spehDarkRecheck){window.__spehDarkRecheck=1;setTimeout(apply,350);}"
 		"window.addEventListener('pageshow',function(){refresh();apply();},true);"
 		"window.addEventListener('popstate',function(){refresh();},true);"
 		"if(mq&&!window.__spehDarkWatch){window.__spehDarkWatch=1;"
-		"var h=function(){clear();apply();};"
+		"var h=function(){window.__spehDarkOn=!!mq.matches;clear();apply();};"
 		"if(mq.addEventListener)mq.addEventListener('change',h);"
 		"else if(mq.addListener)mq.addListener(h);}"
 		"}catch(e){}})();",
