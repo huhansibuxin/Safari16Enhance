@@ -1,4 +1,4 @@
-// Safari16Enhance 0.11.6 - iOS 16 Safari 增强
+// Safari16Enhance 0.12.0 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -20,14 +20,13 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <substrate.h>
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.11.6"
+#define SPEH_VERSION "0.12.0"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -169,7 +168,6 @@ static BOOL SPEHDialogKillEnabled(void)    { return SPEHBoolPref(@"suppressError
 static BOOL SPEHReaderKillEnabled(void)    { return SPEHBoolPref(@"killReader", YES); }
 static BOOL SPEHOpenInAppKillEnabled(void) { return SPEHBoolPref(@"killOpenInApp", YES); }
 static BOOL SPEHSmartBannerKillEnabled(void) { return SPEHBoolPref(@"killSmartBanner", YES); }
-static BOOL SPEHDarkModeEnabled(void)      { return SPEHBoolPref(@"forceDarkMode", YES); }
 static BOOL SPEHProbeEnabled(void)         { return SPEHBoolPref(@"probeEnabled", NO); }
 
 // MARK: - 通用工具
@@ -802,280 +800,6 @@ static void SPEHApplyOpenInAppJSAttempt(id webView, int attempt)
 	} @catch (NSException *e) { }
 }
 
-// ─── 强制深色模式（0.10.0）────────────────────────────────────────────
-//
-// 参考开源成熟配方（rkshrksh/dark-mode-userscript 等）：
-//   html 套 filter:invert(1) hue-rotate(180deg) → 白网页变深；
-//   img/video/canvas/svg/iframe 再套一次同样滤镜 → 二次反转 = 还原图片原色。
-// 系统深浅色检测：
-//   初始用原生 UITraitCollection（准确），运行时用 JS matchMedia 的 change 事件跟随切换。
-// 白天模式：完全不注入样式、移除所有标记 → 网页保持原样，零副作用。
-// 智能跳过：网页自身已是深色（computed 背景亮度低）时不套滤镜，避免"深色被反转成白"。
-// 只走 evaluateJavaScript，绝不碰 configuration / userContentController / processPool
-// （0.8.0 血泪教训：碰了会搞坏 Userscripts / Dark Night 等第三方扩展）。
-
-// ─── 强制深色（0.11.5：OC 实时系统状态驱动，媒体查询不再参与判定）────────
-//
-// 0.11.4 完全照搬开源「纯 CSS @media (prefers-color-scheme: dark)」，真机实测：
-// 大部分网页根本不黑。日志证明脚本是注入成功了的（[dark] documentStart 脚本已注入
-// configuration），所以问题不在注入链路，而在 WKWebView 里这条媒体查询的求值不可靠 ——
-// 系统明明是深色，页面上下文里 prefers-color-scheme 仍可能被判成 light，于是包在
-// @media 里的整块规则一条都不生效 ⇒ 全站不黑。
-//
-// 0.11.5 改成「权威状态在 OC，CSS 不再包 @media」：
-//   · OC 每次调用都**实时**读 webView 自己的 traitCollection.userInterfaceStyle
-//     （读不到再退 UIScreen），把结果直接拼进 JS 参数 —— 不缓存、不靠 change 事件回写，
-//     所以既不会粘滞，也不会出现「点浅色反变黑 / 点深色反变白」的语义反转。
-//   · CSS 选择器统一 html[data-speh-dark="1"]（属性选择器 + !important），不覆盖页面
-//     自身的 html id，避免打断依赖 documentElement.id 的站点（Angular 等）。
-//   · hook WKWebView -traitCollectionDidChange:（公开类的方法，不是 UIView 基类那种
-//     全局核心方法，无递归风险），系统切深/浅时把新状态推给页面，不用刷新即时生效。
-//   · 首帧：documentStart 注入时用 UIScreen 当前状态做初值，绝大多数情况首帧即黑、不闪白；
-//     若该值与 webView trait 不一致，didMoveToWindow 后 0.1s 的推送会立刻纠正。
-//   · 网页自身已是深色（根背景亮度 < 25）时不加标记，避免被反成白。
-//   · 颜色定制保留：未访问链接 #000→显示白 / 已访问 #808080→显示灰 /
-//     关键词高亮 #8b0000→显示红。
-
-static BOOL SPEHSystemIsDarkNow(void)
-{
-	@try {
-		UIUserInterfaceStyle st = [[UIScreen mainScreen] traitCollection].userInterfaceStyle;
-		if (st != UIUserInterfaceStyleUnspecified)
-			return st == UIUserInterfaceStyleDark;
-	} @catch (NSException *e) { }
-	return NO;
-}
-
-// 优先用 webView 自身的 trait（与 WebKit 内部判定同源，最准），退化到系统级
-static BOOL SPEHWebViewIsSystemDark(id webView)
-{
-	@try {
-		if ([webView isKindOfClass:[UIView class]]) {
-			UIUserInterfaceStyle st = [(UIView *)webView traitCollection].userInterfaceStyle;
-			if (st != UIUserInterfaceStyleUnspecified)
-				return st == UIUserInterfaceStyleDark;
-		}
-	} @catch (NSException *e) { }
-	return SPEHSystemIsDarkNow();
-}
-
-static NSString *SPEHDarkModeJS(BOOL dark)
-{
-	return [NSString stringWithFormat:
-		@"(function(){try{"
-		"var ID='__speh_dark_style';"
-		// DARK 由 OC 每次调用时实时读取系统状态传入 ⇒ 权威值，每次覆盖写成同一个全局，
-		// 不存在「上一次的旧状态粘住」的问题，语义反转从机制上被排除。
-		"window.__spehDarkForce=%@;"
-		// 外层与媒体元素**严格互逆**：都只用 invert(1) hue-rotate(180deg)。
-		// 0.11.5 外层多叠了 brightness(0.92) contrast(1.05)、内层没有 ⇒ 两次变换不互逆，
-		// 图片被拉暗、拉对比，这就是「有些图片颜色不对」的来源。
-		// 选择器前缀刻意把 [data-speh-dark] 重复一次（特异性 0,2,1），压过站点自带的
-		// `#app img{filter:xxx!important}`（1,0,1）—— 否则图片只吃到外层那次反转 ⇒ 整张反色。
-		"var css=\""
-		"html[data-speh-dark='1'][data-speh-dark]{filter:invert(1) hue-rotate(180deg)!important;background-color:#fff!important;}"
-		// 媒体元素二次反转还原原色。只选「叶子级」元素：picture 与 svg 内的 image 是容器，
-		// 一并选中会与子元素叠加成三次反转，反而更花，故排除。
-		"html[data-speh-dark='1'][data-speh-dark] img,"
-		"html[data-speh-dark='1'][data-speh-dark] video,"
-		"html[data-speh-dark='1'][data-speh-dark] canvas,"
-		"html[data-speh-dark='1'][data-speh-dark] svg,"
-		"html[data-speh-dark='1'][data-speh-dark] iframe,"
-		"html[data-speh-dark='1'][data-speh-dark] object,"
-		"html[data-speh-dark='1'][data-speh-dark] embed,"
-		"html[data-speh-dark='1'][data-speh-dark] input[type='image'],"
-		"html[data-speh-dark='1'][data-speh-dark] [style*='background-image']:empty"
-		"{filter:invert(1) hue-rotate(180deg)!important;}"
-		// 嵌套 svg（图标套图标）只反转最外层，内层还原，避免叠加反色
-		"html[data-speh-dark='1'][data-speh-dark] svg svg{filter:none!important;}"
-		// 定制①：未访问链接源色 #000→显示纯白；已访问 #808080→显示中灰，点没点过分得清
-		"html[data-speh-dark='1'][data-speh-dark] a,"
-		"html[data-speh-dark='1'][data-speh-dark] a:link,"
-		"html[data-speh-dark='1'][data-speh-dark] a span,"
-		"html[data-speh-dark='1'][data-speh-dark] a div,"
-		"html[data-speh-dark='1'][data-speh-dark] a h1,"
-		"html[data-speh-dark='1'][data-speh-dark] a h2,"
-		"html[data-speh-dark='1'][data-speh-dark] a h3,"
-		"html[data-speh-dark='1'][data-speh-dark] a h4{color:#000!important;}"
-		"html[data-speh-dark='1'][data-speh-dark] a:visited,"
-		"html[data-speh-dark='1'][data-speh-dark] a:visited span,"
-		"html[data-speh-dark='1'][data-speh-dark] a:visited div,"
-		"html[data-speh-dark='1'][data-speh-dark] a:visited h1,"
-		"html[data-speh-dark='1'][data-speh-dark] a:visited h2,"
-		"html[data-speh-dark='1'][data-speh-dark] a:visited h3,"
-		"html[data-speh-dark='1'][data-speh-dark] a:visited h4{color:#808080!important;}"
-		// 定制②：搜索关键词高亮原本的屎黄→源色暗红 #8b0000，反相后显示亮红
-		"html[data-speh-dark='1'][data-speh-dark] em,"
-		"html[data-speh-dark='1'][data-speh-dark] strong,"
-		"html[data-speh-dark='1'][data-speh-dark] b,"
-		"html[data-speh-dark='1'][data-speh-dark] mark,"
-		"html[data-speh-dark='1'][data-speh-dark] a em,"
-		"html[data-speh-dark='1'][data-speh-dark] a strong,"
-		"html[data-speh-dark='1'][data-speh-dark] a b,"
-		"html[data-speh-dark='1'][data-speh-dark] a mark"
-		"{color:#8b0000!important;background-color:transparent!important;}"
-		"\";"
-		"function lum(el){try{"
-		"if(!el)return null;"
-		"var bg=window.getComputedStyle?getComputedStyle(el).backgroundColor:'';"
-		"if(!bg||bg==='transparent'||bg.indexOf('rgba(0, 0, 0, 0)')===0)return null;"
-		"if(bg.indexOf('rgba')===0){var ps=bg.replace(/rgba?\\(|\\)/g,'').split(',');"
-		"var a=parseFloat(ps[3]);if(!isNaN(a)&&a<0.1)return null;}"
-		"var c=bg.match(/(\\d+)\\D+(\\d+)\\D+(\\d+)/);"
-		"if(c)return (parseInt(c[1])*299+parseInt(c[2])*587+parseInt(c[3])*114)/1000;"
-		"}catch(e){}return null;}"
-		// 网页自身已深色判断：只看根背景亮度，与系统深浅色无关 ⇒ 不会随系统切换反转
-		"function nativeDark(){var l=lum(document.documentElement);return (l!==null&&l<25);}"
-		"function ensureStyle(){"
-		"if(document.getElementById(ID))return;"
-		"var s=document.createElement('style');s.id=ID;s.textContent=css;"
-		"(document.head||document.documentElement).appendChild(s);}"
-		"function marked(){var he=document.documentElement;return !!(he&&he.getAttribute('data-speh-dark')==='1');}"
-		"function apply(){var he=document.documentElement;if(!he)return;"
-		"ensureStyle();"
-		"if(nativeDark()||!window.__spehDarkForce){if(marked())he.removeAttribute('data-speh-dark');return;}"
-		"if(marked())return;"
-		"he.setAttribute('data-speh-dark','1');}"
-		// 返回(bfcache)/popstate 时同帧内摘除→强制 reflow→恢复，让滤镜重算，无中间白帧
-		"function refresh(){var he=document.documentElement;if(!he||!marked())return;"
-		"he.removeAttribute('data-speh-dark');void he.offsetWidth;he.setAttribute('data-speh-dark','1');}"
-		// 供 OC 在 traitCollectionDidChange / 页面加载后推送权威状态
-		"window.__spehDarkSet=function(v){try{window.__spehDarkForce=!!v;apply();}catch(e){}};"
-		"apply();"
-		"if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',apply,{once:true});}"
-		"if(!window.__spehDarkRecheck){window.__spehDarkRecheck=1;setTimeout(apply,350);}"
-		"window.addEventListener('pageshow',function(){try{refresh();apply();}catch(e){}},true);"
-		"window.addEventListener('popstate',function(){try{refresh();}catch(e){}},true);"
-		"}catch(e){}})();",
-		dark ? @"true" : @"false"];
-}
-
-// 把「当前实时系统深浅色」推给页面（轻量：只动状态 + apply，不重建样式表）
-static void SPEHPushDarkStateToWebView(id webView)
-{
-	if (!webView || !SPEHDarkModeEnabled()) return;
-	BOOL dark = SPEHWebViewIsSystemDark(webView);
-	@try {
-		NSString *js = [NSString stringWithFormat:
-			@"try{if(window.__spehDarkSet)window.__spehDarkSet(%@);}catch(e){}",
-			dark ? @"true" : @"false"];
-		[(id<SPEHWebViewJS>)webView evaluateJavaScript:js completionHandler:nil];
-	} @catch (NSException *e) { }
-}
-
-// 整段脚本重跑一次（幂等），同时把当前实时系统状态作为参数带进去
-static void SPEHApplyDarkModeJS(id webView)
-{
-	if (!webView || !SPEHDarkModeEnabled()) return;
-	@try {
-		[(id<SPEHWebViewJS>)webView evaluateJavaScript:SPEHDarkModeJS(SPEHWebViewIsSystemDark(webView))
-			completionHandler:^(id result, NSError *error) {
-				if (error && SPEHProbeEnabled()) SPEHLog(@"[dark] JS 失败 %@", error.localizedDescription);
-			}];
-	} @catch (NSException *e) { }
-}
-
-// ─── 消除「先白后黑」闪白：documentStart 注入 ────────────────────────────
-//
-// 老做法（0.10.0）：页面加载完再 evaluateJavaScript 加样式 → 首帧必是白，必闪。
-// 新做法：hook WKWebView 初始化，在 orig 之前（configuration 尚未被 WebKit 内部
-// copy）把深色脚本作为 WKUserScript(atDocumentStart) 加进 userContentController，
-// 脚本在页面任何 DOM/CSS 渲染前就执行 → 第一帧就是深色，零闪白。
-//
-// ⚠️ 与 0.8.0 血泪教训的本质区别：
-//   0.8.0 = webView 已存在后，改 webView.configuration / processPool（非法，打乱扩展注入管线）
-//   0.11.0 = 只在 init 方法进入时改「即将被 copy 的那份 configuration」，是 WKWebView
-//            官方唯一正确的配置时机，不动任何已创建的 webView，扩展链路完全不受影响。
-static char kSPEHDarkScriptStampKey;
-
-static void SPEHInjectDarkStartScriptToConfig(id configuration)
-{
-	if (!configuration || !SPEHDarkModeEnabled()) return;
-	@try {
-		WKWebViewConfiguration *cfg = (WKWebViewConfiguration *)configuration;
-		WKUserContentController *ucc = cfg.userContentController;
-		if (!ucc) return;
-		// 同一 configuration 可能初始化多个 webView，打标避免重复 addUserScript
-		if (objc_getAssociatedObject(ucc, &kSPEHDarkScriptStampKey)) return;
-		WKUserScript *script = [[WKUserScript alloc]
-			initWithSource:SPEHDarkModeJS(SPEHSystemIsDarkNow())
-			injectionTime:WKUserScriptInjectionTimeAtDocumentStart
-			forMainFrameOnly:YES];
-		[ucc addUserScript:script];
-		objc_setAssociatedObject(ucc, &kSPEHDarkScriptStampKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-		SPEHLog(@"[dark] documentStart 脚本已注入 configuration (初值 dark=%d)", (int)SPEHSystemIsDarkNow());
-	} @catch (NSException *e) {
-		SPEHLog(@"[dark] documentStart 注入失败 %@", e.reason);
-	}
-}
-
-// WKWebView 的两次常见初始化入口。测试用类精确匹配，避免 patch 到别的类。
-static IMP gOrigWVInitWithFrameConfig = NULL;
-static IMP gOrigWVInitWithConfig = NULL;
-static IMP gOrigWVTraitChanged = NULL;
-
-static id SPEHWVInitWithFrameConfigHook(id self, SEL _cmd, CGRect frame, id configuration)
-{
-	SPEHInjectDarkStartScriptToConfig(configuration);
-	if (gOrigWVInitWithFrameConfig)
-		return ((id (*)(id, SEL, CGRect, id))gOrigWVInitWithFrameConfig)(self, _cmd, frame, configuration);
-	return nil;
-}
-
-static id SPEHWVInitWithConfigHook(id self, SEL _cmd, id configuration)
-{
-	SPEHInjectDarkStartScriptToConfig(configuration);
-	if (gOrigWVInitWithConfig)
-		return ((id (*)(id, SEL, id))gOrigWVInitWithConfig)(self, _cmd, configuration);
-	return nil;
-}
-
-// 系统切深/浅：WKWebView 的 trait 变化 ⇒ 直接把新状态推给页面，不用刷新。
-// 只做一次 evaluateJavaScript（异步、幂等），不碰布局、不碰任何 UIView 基类方法。
-static void SPEHWVTraitChangedHook(id self, SEL _cmd, UITraitCollection *prev)
-{
-	if (gOrigWVTraitChanged)
-		((void (*)(id, SEL, id))gOrigWVTraitChanged)(self, _cmd, prev);
-	if (!SPEHDarkModeEnabled()) return;
-	@try {
-		if (@available(iOS 13.0, *)) {
-			// self 是 id（runtime patch 的 IMP 签名），取 trait 需显式转 UIView
-			UITraitCollection *cur = [(UIView *)self traitCollection];
-			if (![cur hasDifferentColorAppearanceComparedToTraitCollection:prev]) return;
-		}
-		SPEHPushDarkStateToWebView(self);
-	} @catch (NSException *e) { }
-}
-
-static void SPEHInstallDarkStartHooks(void)
-{
-	if (!SPEHDarkModeEnabled()) return;
-	Class wkCls = NSClassFromString(@"WKWebView");
-	if (!wkCls) return;
-
-	SEL sel1 = @selector(initWithFrame:configuration:);
-	if (class_getInstanceMethod(wkCls, sel1))
-		SPEHPatchInstanceMethod(wkCls, sel1, (IMP)SPEHWVInitWithFrameConfigHook, &gOrigWVInitWithFrameConfig);
-	SEL sel2 = @selector(initWithConfiguration:);
-	if (class_getInstanceMethod(wkCls, sel2))
-		SPEHPatchInstanceMethod(wkCls, sel2, (IMP)SPEHWVInitWithConfigHook, &gOrigWVInitWithConfig);
-	SEL sel3 = @selector(traitCollectionDidChange:);
-	if (class_getInstanceMethod(wkCls, sel3))
-		SPEHPatchInstanceMethod(wkCls, sel3, (IMP)SPEHWVTraitChangedHook, &gOrigWVTraitChanged);
-
-	SPEHLog(@"[dark] init hooks: frameConfig=%s config=%s traitChange=%s",
-			gOrigWVInitWithFrameConfig ? "ok" : "none",
-			gOrigWVInitWithConfig ? "ok" : "none",
-			gOrigWVTraitChanged ? "ok" : "none");
-}
-
-// 历史踩坑（0.8.0，保留警示）：webView 已存在后改 webView.configuration /
-// processPool / 事后 addUserScript 是非法的，会打乱 Safari 扩展注入管线
-//   （Userscripts 自动翻页失效、Dark Night 反复要权限）。
-// 0.11.0 的 documentStart 注入不在此列：它只在 WKWebView init 进入时、configuration
-// 被内部 copy 之前修改传入的那份配置，是官方正确时机，不碰任何已创建的 webView。
-// 删 meta 仍由 evaluateJavaScript 在各时间点执行；横幅本身已由原生 hook 拦住。
-
 // ─── Smart App Banner：精准命中（0.9.2 恢复）─────────────────────────────
 //
 // 0.9.1 曾把这段整体删除，怀疑它与「扩展权限反复弹窗」有关。现已证实那次弹窗来自
@@ -1260,14 +984,10 @@ static void SPEHWVDidMoveToWindowHook(UIView *self, SEL _cmd)
 	}
 
 	// 清「App 内打开」浮层与 apple-itunes-app meta（纯 JS，不碰原生）
-	// 0.10.0：同时注入强制深色（同一时间点、同一 evaluateJavaScript 通道）
-	// 0.11.5：首个时机提前到 0.1s —— media query 在 WKWebView 里不可靠的站点，
-	// 靠这一次推送补上深色（越早越不容易看到白→黑）。后续时机兜异步建 DOM 的站点。
-	NSArray *delays = @[ @0.1, @0.8, @2.5, @5.0 ];
+	NSArray *delays = @[ @0.8, @2.5, @5.0 ];
 	for (NSNumber *d in delays) {
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 			SPEHApplyOpenInAppJS(weakSelf);
-			SPEHApplyDarkModeJS(weakSelf);
 		});
 	}
 }
@@ -1289,17 +1009,14 @@ static void SPEHTabDidFinishNavigationHook(id self, SEL _cmd, id webView, id nav
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
 			dispatch_get_main_queue(), ^{
 				SPEHApplyOpenInAppJS(weakWV);
-				SPEHApplyDarkModeJS(weakWV);
 			});
 	}
 }
 
 static void SPEHInstallOpenInAppHooks(void)
 {
-	// 0.10.0：注入 hook 由 openinapp + 深色模块共用，任一开启就必须安装。
-	// 各模块开关已在自己的 Apply 函数内部判断。
-	if (!SPEHOpenInAppKillEnabled() && !SPEHDarkModeEnabled()) {
-		SPEHLog(@"[inject] openinapp 与 darkmode 均关闭，不装注入 hook");
+	if (!SPEHOpenInAppKillEnabled()) {
+		SPEHLog(@"[inject] openinapp 关闭，不装注入 hook");
 		return;
 	}
 
@@ -1805,16 +1522,15 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 #ifndef SPEH_NO_LOG
 		SPEHLog(@"log file = %@", SPEHLogPath());
 #endif
-		SPEHLog(@"dialog=%d reader=%d openinapp=%d smartbanner=%d applink=%d darkmode=%d probe=%d",
+		SPEHLog(@"dialog=%d reader=%d openinapp=%d smartbanner=%d applink=%d probe=%d",
 				SPEHDialogKillEnabled(), SPEHReaderKillEnabled(),
 				SPEHOpenInAppKillEnabled(), SPEHSmartBannerKillEnabled(),
-				SPEHAppLinkKillEnabled(), SPEHDarkModeEnabled(), SPEHProbeEnabled());
+				SPEHAppLinkKillEnabled(), SPEHProbeEnabled());
 
 		SPEHInstallSFDialogHooks();
 		SPEHInstallAppOpenDialogHooks();
 		SPEHInstallReaderHooks();
 		SPEHInstallOpenInAppHooks();
-		SPEHInstallDarkStartHooks();   // 0.11.0：documentStart 注入，消除闪白
 		SPEHInstallAppLinkHooks();
 		SPEHInstallURLBarSwipeHooks();
 	}

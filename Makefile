@@ -13,7 +13,7 @@ Safari16Enhance_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-var
 ifneq ($(SPEH_NO_LOG),)
 Safari16Enhance_CFLAGS += -DSPEH_NO_LOG
 endif
-Safari16Enhance_FRAMEWORKS = UIKit Foundation WebKit
+Safari16Enhance_FRAMEWORKS = UIKit Foundation
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
