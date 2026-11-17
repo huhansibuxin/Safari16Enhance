@@ -1,4 +1,4 @@
-// Safari16Enhance 0.9.8 - iOS 16 Safari 增强
+// Safari16Enhance 0.9.9 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.9.8"
+#define SPEH_VERSION "0.9.9"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -1099,6 +1099,9 @@ static BOOL SPEHURLIsBing(id url)
 // （first=19 连查 6 次），每次都要把 200+ 字符的长 URL 格式化成 NSString，这才是这块的主要开销。
 // 改成按「接口 + URL 去掉 query」去重：同 key 只写首条，之后每累计 10 次写一行汇总。
 // 证据力不变 —— 「这个域名查过、并且返回 nil」这条事实仍然完整保留。
+// 0.9.9 编译修复：这三个符号只服务于写日志的去重；no-log 变体整体不编译，
+// 否则 -Wunused-function/-Wunused-variable 在 -Werror 下会失败（0.9.8 GitHub 端提交即栽在这里）。
+#ifndef SPEH_NO_LOG
 static NSMutableSet *gAppLinkSeen = nil;
 static int gAppLinkSuppress = 0;
 
@@ -1115,6 +1118,7 @@ static NSString *SPEHAppLinkKey(NSString *kind, id url)
 	if (s.length > 120) s = [s substringToIndex:120];
 	return [(kind ?: @"") stringByAppendingString:s];
 }
+#endif
 
 // 返回 YES 表示「这一条是新页面，值得写日志」；NO 表示同一页的重复查询，已合并计数。
 static BOOL SPEHAppLinkLogOnce(NSString *kind, id url)
