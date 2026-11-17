@@ -456,18 +456,20 @@ static BOOL SPEHActionWantsOpenApp(id dialog)
 
 static IMP gOrigPresentDialog = NULL;
 
-// 0.12.1：畸形 origin 的扩展权限请求兜底。
+// 0.12.1：畸形 origin 的扩展权限请求 —— 只做诊断记录，不做拦截（老板要求先查清来源）。
 //
 // 真机日志实证：Dark Night / Aurora 这类深色扩展会反复弹
 //   「“X”想要访问 huayuarc.xn--cn -928dokq99f6ub31h。」
-// 注意那个 host 里**带空格**，是非法 punycode / 非法域名。Safari 拿它去匹配
-// GrantedPermissionOrigins 永远匹配不上（连 `*://*/*` 都套不住非法 host），
-// 于是每加载一次该页面就重新询问一次；用户点「始终允许」写回去的还是同一条非法
-// origin，于是下一次照样弹 —— 这就是「全部允许 / 全部拒绝都没用」的死循环。
+// 把这个 host 做 punycode 解码，得到的是 **「cn 怎么打不开」** —— 也就是说这个
+// 「域名」其实是一句中文被当成 URL 解析了（原串形如 huayuarc.cn 怎么打不开）。
+// 空格让 origin 非法 ⇒ Safari 拿它匹配授权表永远失败（连全站通配都套不住非法 host），
+// 于是每加载一次就重新询问；用户点「始终允许」写回去的还是同一条非法 origin，
+// 下一次照样弹 —— 这就是「全部允许 / 全部拒绝都没用」的死循环。
 //
-// 处理：识别「扩展权限请求 + host 含空白」，直接不呈现对话框（这套框背后没有
-// WebKit 导航 decision，不呈现不会卡导航）。该页面本身是「网址无效」的坏链，
-// 扩展在该页不注入没有任何损失。判断条件极窄：正常域名不可能含空白字符。
+// 当前只在命中时把「当时页面真实 URL」打进日志，用于定位是谁在加载这个坏串。
+// ⚠️ 注释里绝对不要写 `星号斜杠星号` 那种通配写法：Logos 预处理器会把其中的
+// `斜杠星号` 当成块注释开头，直接把后面整段（包括 %ctor）吃掉，编译表现为
+// 一堆 unused function。这个坑已经踩过一次。
 static BOOL SPEHIsBadHostExtensionPermission(NSString *desc)
 {
 	if (!desc.length) return NO;
@@ -504,29 +506,48 @@ static BOOL SPEHIsBadHostExtensionPermission(NSString *desc)
 	return [tail rangeOfCharacterFromSet:[NSCharacterSet whitespaceCharacterSet]].location != NSNotFound;
 }
 
+// 诊断用：取当前窗口里第一个 WKWebView 的 URL（不 import WebKit，纯运行时类型判断）
+static NSString *SPEHFindWebViewURL(UIView *v, int depth)
+{
+	if (!v || depth > 24) return nil;
+	static Class wkCls = Nil;
+	static dispatch_once_t onceWK;
+	dispatch_once(&onceWK, ^{ wkCls = NSClassFromString(@"WKWebView"); });
+	if (wkCls && [v isKindOfClass:wkCls]) {
+		@try {
+			id u = ((id (*)(id, SEL))objc_msgSend)(v, @selector(URL));
+			if ([u isKindOfClass:[NSURL class]]) {
+				NSString *s = [(NSURL *)u absoluteString];
+				if (s.length) return s;
+			}
+		} @catch (NSException *e) { }
+	}
+	for (UIView *sub in v.subviews) {
+		NSString *r = SPEHFindWebViewURL(sub, depth + 1);
+		if (r.length) return r;
+	}
+	return nil;
+}
+
+static NSString *SPEHCurrentPageURL(void)
+{
+	@try {
+		for (UIWindow *w in [UIApplication sharedApplication].windows) {
+			NSString *r = SPEHFindWebViewURL(w, 0);
+			if (r.length) return r;
+		}
+	} @catch (NSException *e) { }
+	return @"(unknown)";
+}
+
 static void SPEHPresentDialogHook(id self, SEL _cmd, id dialog)
 {
 	NSString *desc = SPEHDialogDescribe(dialog);
 
+	// 只记录，不拦截：畸形 host 的扩展权限请求，把「页面真实 URL」一并打出来，
+	// 用于定位到底是谁在加载这个坏串（是恢复的标签、书签，还是地址栏输入）。
 	if (SPEHIsBadHostExtensionPermission(desc)) {
-		SPEHLog(@"[extperm] 拦截非法 host 权限请求（不呈现） %@", desc);
-		// 兜底：万一 Safari 已把它挂进状态机，0.1s 后取消（确认仍是同一个才动）
-		__weak id weakCtl = self;
-		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
-					   dispatch_get_main_queue(), ^{
-			id s = weakCtl;
-			if (!s) return;
-			@try {
-				if ([s respondsToSelector:@selector(presentedDialog)]) {
-					id cur = ((id (*)(id, SEL))objc_msgSend)(s, @selector(presentedDialog));
-					if (cur == dialog && [s respondsToSelector:@selector(cancelPresentedDialogIfNeeded)]) {
-						((void (*)(id, SEL))objc_msgSend)(s, @selector(cancelPresentedDialogIfNeeded));
-						SPEHLog(@"[extperm] 0.1s 兜底取消生效");
-					}
-				}
-			} @catch (NSException *e) { }
-		});
-		return;
+		SPEHLog(@"[extperm] 畸形 host 权限请求 page=%@", SPEHCurrentPageURL());
 	}
 
 	BOOL wantsOpen = SPEHTextWantsOpenApp(desc) || SPEHActionWantsOpenApp(dialog);
