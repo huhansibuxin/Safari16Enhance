@@ -1,4 +1,4 @@
-// Safari16Enhance 0.11.3 - iOS 16 Safari 增强
+// Safari16Enhance 0.11.4 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -27,7 +27,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.11.3"
+#define SPEH_VERSION "0.11.4"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -814,40 +814,36 @@ static void SPEHApplyOpenInAppJSAttempt(id webView, int attempt)
 // 只走 evaluateJavaScript，绝不碰 configuration / userContentController / processPool
 // （0.8.0 血泪教训：碰了会搞坏 Userscripts / Dark Night 等第三方扩展）。
 
-// 系统深浅色（原生侧）：documentStart 脚本的 DARK 兜底值
-static BOOL SPEHSystemIsDark(void)
-{
-	@try {
-		UIUserInterfaceStyle st = [[UITraitCollection currentTraitCollection] userInterfaceStyle];
-		if (st == UIUserInterfaceStyleUnspecified)
-			st = [[UIScreen mainScreen] traitCollection].userInterfaceStyle;
-		return st == UIUserInterfaceStyleDark;
-	} @catch (NSException *e) { return NO; }
-}
-
+// ─── 强制深色（0.11.4：按开源方案重写主体）──────────────────────────────
+//
+// 0.11.0~0.11.3 自研"深浅色状态机"(JS 缓存 __spehDarkOn + DARK||mq.matches + mq change 写回)
+// 在 Safari 复用 WKWebView / 多次 documentStart 注入 / 多时机补注入时状态粘滞、语义反转
+// （点浅色反而变黑、点深色反而变白）。0.11.4 彻底废弃这套自研判断，改用开源通行方案：
+//
+//   · 滤镜配方：invert(1) hue-rotate(180deg)（hkitago/InvertDark、StackOverflow 高票一致）
+//   · 深浅色判断：纯 CSS @media (prefers-color-scheme: dark)，由 WebKit 内部实时求值，
+//     系统切深/浅自动生效，JS 不再缓存任何"当前是否深色"布尔值 ⇒ 语义永不反转。
+//     白天 media query 不匹配 ⇒ 整块规则不生效 ⇒ 零副作用。
+//   · JS 只保留"网页自身是否已深色"的亮度判断（与系统无关），用于给 <html> 打高特异性 id；
+//     这样网页原生深色时跳过，避免被反成白。
+//   · 保留我们的定制：已访问链接灰阶区分、搜索关键词高亮改红（见下方 CSS 注释）。
 static NSString *SPEHDarkModeJS(void)
 {
-	BOOL sysDark = SPEHSystemIsDark();
-
-	// 0.11.2 修复四件事：
-	//  1) 链接已访问/未访问色差太小且被站点 CSS 覆盖 → 用 html#speh-dark-root 提高特异性，
-	//     未访问源色 #000(显示纯白)、已访问源色 #808080(显示中灰)，差距拉到最大。
-	//  2) 搜索关键词高亮(em/strong/mark/b)经 invert 后呈屎黄 → 源色给暗红 #8b0000，
-	//     invert+hue-rotate 保持色相 → 显示亮红。
-	//  3) 返回上一页(bfcache)闪白 → pageshow/popstate 时同帧强制重算 filter(关-开无中间帧)。
-	//  4) 少数派等站点误判 → alreadyDark 只看 documentElement(根)亮度、阈值收紧到 l<25，
-	//     只有根背景确为极深才跳过；不再看 body（body 深但根浅的站点一律照常套深色）。
 	return [NSString stringWithFormat:
 		@"(function(){try{"
-		"var ID='__speh_dark_style',DARK=%@;"
-		"var mq=window.matchMedia?window.matchMedia('(prefers-color-scheme: dark)'):null;"
-		// 0.11.3：首帧根因——documentStart 阶段少数站点(库库/少数派)的 matchMedia 还没同步到
-		// 系统深色，读到 matches=false 导致不变深，手动切一次深色触发 change 才生效。
-		// 修法：初始状态取 OC 层系统深色(DARK)与 mq.matches 之或——前者兜住"mq 首帧未同步"，
-		// 后者兜住"DARK 过时(WKWebView 复用/期间切过主题)"；全局单例让所有注入实例共享，
-		// 之后仅在系统主题真正切换(mq change)时才更新，保持跟随系统、白天两者皆 false 零副作用。
-		"if(window.__spehDarkOn===undefined)window.__spehDarkOn=!!DARK||!!(mq&&mq.matches);"
-		"function on(){return !!window.__spehDarkOn;}"
+		"var ID='__speh_dark_style',ROOT='speh-dark-root';"
+		// css 主体包在 @media (prefers-color-scheme: dark) 内：深浅色判断完全交给 WebKit，
+		// 不再由 JS 读状态决定套不套。白天零副作用，切换实时跟随，语义不可能反转。
+		"var css=\"@media (prefers-color-scheme:dark){\""
+		"+\"html#speh-dark-root{filter:invert(1) hue-rotate(180deg) brightness(0.92) contrast(1.05)!important;background-color:#fff!important;}\""
+		// 图片/视频/canvas/SVG/iframe 二次反转，保持原色（开源同款配方）
+		"+\"html#speh-dark-root img,html#speh-dark-root video,html#speh-dark-root canvas,html#speh-dark-root svg,html#speh-dark-root iframe{filter:invert(1) hue-rotate(180deg)!important;}\""
+		// 定制①：未访问链接源色 #000→显示纯白；已访问 #808080→显示中灰，点没点过分得清
+		"+\"html#speh-dark-root a,html#speh-dark-root a:link,html#speh-dark-root a span,html#speh-dark-root a div,html#speh-dark-root a h1,html#speh-dark-root a h2,html#speh-dark-root a h3,html#speh-dark-root a h4{color:#000!important;}\""
+		"+\"html#speh-dark-root a:visited,html#speh-dark-root a:visited span,html#speh-dark-root a:visited div,html#speh-dark-root a:visited h1,html#speh-dark-root a:visited h2,html#speh-dark-root a:visited h3,html#speh-dark-root a:visited h4{color:#808080!important;}\""
+		// 定制②：搜索关键词高亮原本的屎黄→源色暗红 #8b0000，反相后显示亮红
+		"+\"html#speh-dark-root em,html#speh-dark-root strong,html#speh-dark-root b,html#speh-dark-root mark,html#speh-dark-root a em,html#speh-dark-root a strong,html#speh-dark-root a b,html#speh-dark-root a mark{color:#8b0000!important;background-color:transparent!important;}\""
+		"+\"}\";"
 		"function lum(el){try{"
 		"if(!el)return null;"
 		"var bg=window.getComputedStyle?getComputedStyle(el).backgroundColor:'';"
@@ -857,48 +853,31 @@ static NSString *SPEHDarkModeJS(void)
 		"var c=bg.match(/(\\d+)\\D+(\\d+)\\D+(\\d+)/);"
 		"if(c)return (parseInt(c[1])*299+parseInt(c[2])*587+parseInt(c[3])*114)/1000;"
 		"}catch(e){}return null;}"
-		"function alreadyDark(){var l=lum(document.documentElement);return (l!==null&&l<25);}"
-		// 用 id 选择器把特异性拉满，压过站点自带的 a/visited 规则
-		"var css=\"html#speh-dark-root{filter:invert(1) hue-rotate(180deg) brightness(0.92) contrast(1.05)!important;background-color:#fff!important;}\""
-		"+\"html#speh-dark-root img,html#speh-dark-root video,html#speh-dark-root canvas,html#speh-dark-root svg,html#speh-dark-root iframe{filter:invert(1) hue-rotate(180deg)!important;}\""
-		// 未访问=纯白(#000 源)，已访问=中灰(#808080 源)，两档差距拉到最大
-		"+\"html#speh-dark-root a,html#speh-dark-root a:link,html#speh-dark-root a span,html#speh-dark-root a div,html#speh-dark-root a h1,html#speh-dark-root a h2,html#speh-dark-root a h3,html#speh-dark-root a h4{color:#000!important;}\""
-		"+\"html#speh-dark-root a:visited,html#speh-dark-root a:visited span,html#speh-dark-root a:visited div,html#speh-dark-root a:visited h1,html#speh-dark-root a:visited h2,html#speh-dark-root a:visited h3,html#speh-dark-root a:visited h4{color:#808080!important;}\""
-		// 关键词高亮屎黄→红：源色暗红 #8b0000，反相后显示亮红
-		"+\"html#speh-dark-root em,html#speh-dark-root strong,html#speh-dark-root b,html#speh-dark-root mark,html#speh-dark-root a em,html#speh-dark-root a strong,html#speh-dark-root a b,html#speh-dark-root a mark{color:#8b0000!important;background-color:transparent!important;}\";"
+		// 网页自身已深色判断：只看根背景亮度，与系统深浅色无关 ⇒ 不会随系统切换反转
+		"function nativeDark(){var l=lum(document.documentElement);return (l!==null&&l<25);}"
 		"var _oldId=null;"
-		"function ensure(){var he=document.documentElement;"
+		"function ensureStyle(){"
 		"if(document.getElementById(ID))return;"
-		"_oldId=he.getAttribute('id');"
-		"he.setAttribute('id','speh-dark-root');"
 		"var s=document.createElement('style');s.id=ID;s.textContent=css;"
 		"(document.head||document.documentElement).appendChild(s);}"
-		"function clear(){var he=document.documentElement;"
-		"he.removeAttribute('data-speh-dark');"
-		"if(_oldId!==null){if(_oldId)he.setAttribute('id',_oldId);else he.removeAttribute('id');_oldId=null;}"
-		"var s=document.getElementById(ID);if(s&&s.parentNode)s.parentNode.removeChild(s);}"
-		"function apply(){if(!on()){clear();return;}"
-		"var dark=alreadyDark();"
-		"var has=document.documentElement.getAttribute('data-speh-dark')==='1';"
-		"if(dark){if(has)clear();return;}"
-		"if(has)return;ensure();"
-		"document.documentElement.setAttribute('data-speh-dark','1');}"
-		// 返回闪白：bfcache 恢复时同帧内 filter 关→强制 reflow→开，无中间白帧
+		"function apply(){var he=document.documentElement;"
+		"ensureStyle();"
+		"if(nativeDark()){if(he.id===ROOT){if(_oldId!==null){if(_oldId)he.setAttribute('id',_oldId);else he.removeAttribute('id');_oldId=null;}}return;}"
+		"if(he.id===ROOT)return;"
+		"_oldId=he.getAttribute('id');"
+		"he.setAttribute('id',ROOT);}"
+		// 返回(bfcache)闪白：同帧内 id 摘除→强制 reflow→恢复，让 media query+滤镜重算，无中间白帧
 		"function refresh(){var he=document.documentElement;"
-		"if(he.getAttribute('data-speh-dark')!=='1'){apply();return;}"
-		"he.style.filter='none';void he.offsetWidth;he.style.filter='';}"
+		"if(he.id!==ROOT)return;"
+		"var o=he.getAttribute('id');he.removeAttribute('id');void he.offsetWidth;"
+		"if(o)he.setAttribute('id',o);}"
 		"apply();"
 		"if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',apply,{once:true});}"
-		// 少数派等异步设主题的站点：DOMContentLoaded 后 350ms 再复查一次（同页补注入会重复执行脚本，加 once 标记）
 		"if(!window.__spehDarkRecheck){window.__spehDarkRecheck=1;setTimeout(apply,350);}"
 		"window.addEventListener('pageshow',function(){refresh();apply();},true);"
 		"window.addEventListener('popstate',function(){refresh();},true);"
-		"if(mq&&!window.__spehDarkWatch){window.__spehDarkWatch=1;"
-		"var h=function(){window.__spehDarkOn=!!mq.matches;clear();apply();};"
-		"if(mq.addEventListener)mq.addEventListener('change',h);"
-		"else if(mq.addListener)mq.addListener(h);}"
-		"}catch(e){}})();",
-		sysDark ? @"1" : @"0"];
+		"}catch(e){}})();"
+		];
 }
 
 static void SPEHApplyDarkModeJS(id webView)
