@@ -1,4 +1,4 @@
-// Safari16Enhance 0.12.7 - iOS 16 Safari 增强
+// Safari16Enhance 0.12.8 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -27,7 +27,7 @@
 #import <math.h>
 #import <dlfcn.h>
 
-#define SPEH_VERSION "0.12.7"
+#define SPEH_VERSION "0.12.8"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -768,7 +768,11 @@ typedef struct {
 	int (*close)(void *);
 } SPEHSqliteApi;
 
-static int SPEHPurgeBadTabsInDB(void)
+static int SPEHPurgeBadInSqlitePath(NSString *path, BOOL mergeWal);
+
+// 0.12.8：参数化 —— 任意 sqlite 库都能洗；mergeWal=YES 时 checkpoint + VACUUM，
+// 把 -wal 里的旧页合并回主库并清零空闲页，避免遗留字节被下次 grep 误判成「还在」。
+static int SPEHPurgeBadInSqlitePath(NSString *path, BOOL mergeWal)
 {
 	static SPEHSqliteApi api;
 	static BOOL apiReady = NO;
@@ -788,7 +792,7 @@ static int SPEHPurgeBadTabsInDB(void)
 		if (!api.open_v2 || !api.prepare_v2 || !api.step || !api.exec || !api.close || !api.finalize) return -2;
 	}
 
-	NSString *path = @"/var/mobile/Library/Safari/SafariTabs.db";
+	if (!path.length) return -3;
 	if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return -3;
 
 	void *db = NULL;
@@ -797,6 +801,8 @@ static int SPEHPurgeBadTabsInDB(void)
 		if (db) api.close(db);
 		return -4;
 	}
+	// 覆盖删除：UPDATE 之后旧值所在页会被清零，不然字节残留会一直被 grep 到。
+	api.exec(db, "PRAGMA secure_delete=ON", NULL, NULL, NULL);
 
 	NSMutableArray *tables = [NSMutableArray array];
 	void *st = NULL;
@@ -858,8 +864,190 @@ static int SPEHPurgeBadTabsInDB(void)
 		}
 	}
 
+	if (fixed > 0 && mergeWal) {
+		// 把 -wal 合并回主库再截断：否则旧版本页还躺在 wal 里，Safari 下次重开可能回滚回去。
+		api.exec(db, "PRAGMA wal_checkpoint(TRUNCATE)", NULL, NULL, NULL);
+		// 重建库，把 secure_delete 清掉的残留页彻底交付给文件系统（字节层面也搜不到）。
+		api.exec(db, "VACUUM", NULL, NULL, NULL);
+		// VACUUM 之后本身会产生新 wal，再截断一次。
+		api.exec(db, "PRAGMA wal_checkpoint(TRUNCATE)", NULL, NULL, NULL);
+	}
+
 	api.close(db);
 	return fixed;
+}
+
+// MARK: - 0.12.8 全盘定位与净化
+//
+// 0.12.7 已经把 SafariTabs.db 的 bookmarks rowid=278 改成 about:blank，复清也是 fixed=0，
+// 但弹窗标题依然是「想要访问 huayuarc.xn--cn -928dokq99f6ub31h」⇒ 这个 origin 另有副本。
+// 关键认知：Safari 的「待授权 origin」是一份持久化队列，不只在
+//   <容器>/Library/Safari/WebExtensions/Extensions.plist
+// 里，WebKit 侧另有站点数据与 AppGroup 副本。所以这次不再猜目录，直接把
+//   /var/mobile/Library/Safari、/var/mobile/Library/WebKit、/var/mobile/Library/Preferences、
+//   Containers/Shared/AppGroup、以及 Safari 自己的容器
+// 全部递归扫一遍，凡含 928dokq 的文件：
+//   - SQLite（文件头 "SQLite format 3"）→ 逐表逐 TEXT 列 UPDATE 成 about:blank + checkpoint + VACUUM
+//   - plist → 递归删掉含该串的 key/value，再序列化写回
+//   - 其他（会话二进制等）→ 只记录，不动（避免写坏 Safari 私有格式）
+
+// 进程内读文件找坏串；命中返回 YES。
+static BOOL SPEHFileContainsBadToken(NSString *path, unsigned long long *outSize)
+{
+	NSFileManager *fm = [NSFileManager defaultManager];
+	NSDictionary *attr = [fm attributesOfItemAtPath:path error:nil];
+	unsigned long long sz = [attr fileSize];
+	if (outSize) *outSize = sz;
+	if (sz == 0 || sz > (32ULL * 1024 * 1024)) return NO;
+	NSData *d = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
+	if (!d.length) return NO;
+	static NSData *needle = nil;
+	if (!needle) needle = [@"928dokq" dataUsingEncoding:NSUTF8StringEncoding];
+	return [d rangeOfData:needle options:0 range:NSMakeRange(0, d.length)].location != NSNotFound;
+}
+
+static void SPEHScanBadTokenDir(NSString *dir, int depth, NSMutableArray *out)
+{
+	if (depth > 3 || out.count >= 40 || !dir.length) return;
+	NSFileManager *fm = [NSFileManager defaultManager];
+	NSArray *names = [fm contentsOfDirectoryAtPath:dir error:nil];
+	if (![names isKindOfClass:[NSArray class]]) return;
+
+	for (NSString *n in names) {
+		if (out.count >= 40) return;
+		NSString *p = [dir stringByAppendingPathComponent:n];
+		BOOL isDir = NO;
+		if (![fm fileExistsAtPath:p isDirectory:&isDir]) continue;
+		if (isDir) {
+			// 跳过明显无关的大目录，控制耗时
+			if ([n isEqualToString:@"Media"] || [n isEqualToString:@"Caches"]
+				|| [n isEqualToString:@"tmp"] || [n isEqualToString:@"Downloads"]) continue;
+			SPEHScanBadTokenDir(p, depth + 1, out);
+			continue;
+		}
+		unsigned long long sz = 0;
+		if (SPEHFileContainsBadToken(p, &sz)) {
+			[out addObject:[NSString stringWithFormat:@"%@(%lluK)", p, sz / 1024]];
+		}
+	}
+}
+
+// plist 递归删：key 或 string value 含坏串就删/置空
+static BOOL SPEHPurgeBadTokenInObject(id *obj)
+{
+	if (!obj || !*obj) return NO;
+	BOOL changed = NO;
+	if ([*obj isKindOfClass:[NSMutableDictionary class]]) {
+		NSMutableDictionary *d = (NSMutableDictionary *)*obj;
+		for (id k in [d allKeys]) {
+			NSString *ks = [k isKindOfClass:[NSString class]] ? k : nil;
+			if (ks && ks.length && [ks rangeOfString:@"928dokq"].location != NSNotFound) {
+				[d removeObjectForKey:k];
+				changed = YES;
+				continue;
+			}
+			id v = d[k];
+			if ([v isKindOfClass:[NSString class]] && [v rangeOfString:@"928dokq"].location != NSNotFound) {
+				d[k] = @"about:blank";
+				changed = YES;
+				continue;
+			}
+			NSMutableArray *holder = [NSMutableArray arrayWithObject:v ?: [NSNull null]];
+			if (SPEHPurgeBadTokenInObject(&holder[0])) {
+				d[k] = holder[0];
+				changed = YES;
+			}
+		}
+		return changed;
+	}
+	if ([*obj isKindOfClass:[NSMutableArray class]]) {
+		NSMutableArray *a = (NSMutableArray *)*obj;
+		for (NSUInteger i = 0; i < a.count; i++) {
+			id v = a[i];
+			if ([v isKindOfClass:[NSString class]] && [v rangeOfString:@"928dokq"].location != NSNotFound) {
+				a[i] = @"about:blank";
+				changed = YES;
+				continue;
+			}
+			NSMutableArray *holder = [NSMutableArray arrayWithObject:v ?: [NSNull null]];
+			if (SPEHPurgeBadTokenInObject(&holder[0])) {
+				a[i] = holder[0];
+				changed = YES;
+			}
+		}
+		return changed;
+	}
+	return NO;
+}
+
+static int SPEHPurgeBadTokenInPlist(NSString *path)
+{
+	NSData *raw = [NSData dataWithContentsOfFile:path options:0 error:nil];
+	if (!raw.length) return -1;
+	id pl = nil;
+	@try {
+		pl = [NSPropertyListSerialization propertyListWithData:raw options:NSPropertyListMutableContainersAndLeaves
+													   format:NULL error:nil];
+	} @catch (NSException *e) { pl = nil; }
+	if (!pl || ![pl isKindOfClass:[NSMutableDictionary class]]) return -2;
+
+	BOOL changed = SPEHPurgeBadTokenInObject(&pl);
+	if (!changed) return 0;
+
+	NSData *out = [NSPropertyListSerialization dataWithPropertyList:pl format:NSPropertyListBinaryFormat_v1_0
+															 options:0 error:nil];
+	if (!out.length) return -3;
+	if (![out writeToFile:path atomically:YES]) return -4;
+	return 1;
+}
+
+static NSString *SPEHScanAndPurgeBadTokenInRoots(NSArray *roots, int *outFixed)
+{
+	NSMutableArray *hits = [NSMutableArray array];
+	for (NSString *r in roots) SPEHScanBadTokenDir(r, 0, hits);
+
+	int fixedFiles = 0;
+	NSMutableArray *report = [NSMutableArray array];
+	for (NSString *one in hits) {
+		// one 形如 "/path/file(123K)"，拆出路径
+		NSRange pr = [one rangeOfString:@"(" options:NSBackwardsSearch];
+		NSString *path = pr.location == NSNotFound ? one : [one substringToIndex:pr.location];
+
+		NSData *head = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
+		BOOL isSqlite = NO;
+		if (head.length >= 16) {
+			NSString *magic = [[NSString alloc] initWithData:[head subdataWithRange:NSMakeRange(0, 15)]
+													encoding:NSUTF8StringEncoding];
+			isSqlite = [magic isEqualToString:@"SQLite format 3"];
+		}
+		[report addObject:[NSString stringWithFormat:@"%@[%@]", path, isSqlite ? @"sqlite" : @"bin"]];
+
+		int rc = 0;
+		if (isSqlite) {
+			rc = SPEHPurgeBadInSqlitePath(path, YES);
+		} else if ([path.pathExtension.lowercaseString isEqualToString:@"plist"]) {
+			rc = SPEHPurgeBadTokenInPlist(path);
+		}
+		if (rc != 0) {
+			// 只在真的改了东西时计数；sqlite 返回命中行数，plist 返回 1
+			fixedFiles++;
+		}
+	}
+
+	if (outFixed) *outFixed = fixedFiles;
+	return report.count ? [report componentsJoinedByString:@", "] : @"(无命中)";
+}
+
+// 全盘扫 + 修。返回可读报告（日志用），实际修复数通过 outFixed 带回。
+static NSString *SPEHScanAndPurgeBadToken(int *outFixed)
+{
+	NSArray *roots = @[
+		@"/var/mobile/Library/Safari",
+		@"/var/mobile/Library/WebKit",
+		@"/var/mobile/Library/Preferences",
+		@"/var/mobile/Library/Caches/com.apple.mobilesafari",
+	];
+	return SPEHScanAndPurgeBadTokenInRoots(roots, outFixed);
 }
 
 #ifndef SPEH_NO_LOG
@@ -2308,11 +2496,23 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 		SPEHLog(@"[extperm] 权限表净化 removed=%d（0=无脏数据 -1..-6=异常码）", sanitized);
 		(void)sanitized;   // no-log 变体里 SPEHLog 是空宏，避免 -Wunused 被 -Werror 拦下
 
-		// 0.12.7：真正根治 —— 标签页库里那条坏 URL 直接改写为 about:blank。
-		// 必须早于会话恢复，否则 Safari 已经把这条 URL 读进内存，清库就没意义了。
-		int purged = SPEHPurgeBadTabsInDB();
-		SPEHLog(@"[tabdb] 标签页库净化 fixed=%d（0=无脏数据 -1..-4=异常码）", purged);
-		(void)purged;
+		// 0.12.8：全盘扫 + 修。SafariTabs.db 里那条 bookmarks 已改掉，弹窗却还在，
+		// 说明这个 origin 在 WebKit / AppGroup 侧另有副本 —— 这次不猜目录，直接全扫。
+		// 第一批（Safari / WebKit / Preferences / 容器）体积小，同步跑，确保早于会话恢复。
+		int wideFixed = -1;
+		NSString *wideReport = SPEHScanAndPurgeBadToken(&wideFixed);
+		SPEHLog(@"[badscan] 命中: %@", wideReport);
+		SPEHLog(@"[badscan] 已净化文件数=%d", wideFixed);
+		(void)wideFixed;
+
+		// 第二批：AppGroup 有上百个组、体量大，扔后台线程，免得拖慢启动。
+		dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+			NSArray *slowRoots = @[ @"/var/mobile/Containers/Shared/AppGroup" ];
+			int f = -1;
+			NSString *rep = SPEHScanAndPurgeBadTokenInRoots(slowRoots, &f);
+			SPEHLog(@"[badscan][AppGroup] 命中: %@ / 净化=%d", rep, f);
+			(void)f;
+		});
 
 		// 0.12.5：启动后扫两遍，把 URL 就是那串畸形内容的标签页关掉（源头在会话恢复里）。
 		for (NSNumber *delay in @[ @3.0, @10.0 ]) {
@@ -2321,10 +2521,11 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 				int closed = SPEHCloseBadTabs();
 				SPEHLog(@"[extperm] 清扫畸形标签页 closed=%d（-1..-4=枚举失败码）", closed);
 				(void)closed;
-				// 库有可能被 Safari 重新写入过，再清一遍（幂等）
-				int again = SPEHPurgeBadTabsInDB();
-				SPEHLog(@"[tabdb] 复清 fixed=%d", again);
-				(void)again;
+				// 库有可能被 Safari 重新写入过，再全盘清一遍（幂等）
+				int againFixed = -1;
+				NSString *againReport = SPEHScanAndPurgeBadToken(&againFixed);
+				SPEHLog(@"[badscan] 复清命中: %@ / 净化=%d", againReport, againFixed);
+				(void)againFixed;
 			});
 		}
 
