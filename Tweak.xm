@@ -1,4 +1,4 @@
-// Safari16Enhance 0.12.6 - iOS 16 Safari 增强
+// Safari16Enhance 0.12.7 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -25,8 +25,9 @@
 #import <substrate.h>
 #import <unistd.h>
 #import <math.h>
+#import <dlfcn.h>
 
-#define SPEH_VERSION "0.12.6"
+#define SPEH_VERSION "0.12.7"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -743,6 +744,122 @@ static int SPEHCloseBadTabs(void)
 		}
 	}
 	return closed;
+}
+
+// MARK: - 标签页库净化（0.12.7 真正根治）
+//
+// 0.12.6 在进程内扫到了落点：/var/mobile/Library/Safari 下只有
+//   SafariTabs.db / SafariTabs.db-wal 含畸形串（bad=1），
+//   History.db / BrowserState.db / CloudTabs.db 里只有正常的 huayuarc 域名（yourepo）。
+// 也就是说浏览器里确实存着一个 URL 就是「huayuarc.cn 怎么打不开」的标签页。
+// 它每次被恢复/重载都会：先报「网址无效」→ 扩展再拿这个 origin 去请求授权 →
+// 权限弹窗反复出现；而这条 origin 天生无法解析成合法 match pattern，永远匹配不上。
+// 该目录受 datavault 保护（SSH 连 ls 都 Operation not permitted），只能在 Safari 进程内改。
+// 做法：sqlite3 打开 SafariTabs.db，把含 928dokq 的文本列改写为 about:blank。
+// 行本身保留不删 —— 避免破坏 tab group / 会话的外键关系，只是让那页不再是坏 URL。
+typedef struct {
+	int (*open_v2)(const char *, void **, int, const char *);
+	int (*prepare_v2)(void *, const char *, int, void **, const char *);
+	int (*step)(void *);
+	const unsigned char *(*column_text)(void *, int);
+	int (*column_int)(void *, int);
+	int (*finalize)(void *);
+	int (*exec)(void *, const char *, void *, void *, char **);
+	int (*close)(void *);
+} SPEHSqliteApi;
+
+static int SPEHPurgeBadTabsInDB(void)
+{
+	static SPEHSqliteApi api;
+	static BOOL apiReady = NO;
+	if (!apiReady) {
+		void *h = dlopen("/usr/lib/libsqlite3.dylib", RTLD_LAZY);
+		if (!h) h = dlopen("/usr/lib/libsqlite3.0.dylib", RTLD_LAZY);
+		if (!h) return -1;
+		api.open_v2    = (int (*)(const char *, void **, int, const char *))dlsym(h, "sqlite3_open_v2");
+		api.prepare_v2 = (int (*)(void *, const char *, int, void **, const char *))dlsym(h, "sqlite3_prepare_v2");
+		api.step       = (int (*)(void *))dlsym(h, "sqlite3_step");
+		api.column_text = (const unsigned char *(*)(void *, int))dlsym(h, "sqlite3_column_text");
+		api.column_int = (int (*)(void *, int))dlsym(h, "sqlite3_column_int");
+		api.finalize   = (int (*)(void *))dlsym(h, "sqlite3_finalize");
+		api.exec       = (int (*)(void *, const char *, void *, void *, char **))dlsym(h, "sqlite3_exec");
+		api.close      = (int (*)(void *))dlsym(h, "sqlite3_close");
+		apiReady = YES;
+		if (!api.open_v2 || !api.prepare_v2 || !api.step || !api.exec || !api.close || !api.finalize) return -2;
+	}
+
+	NSString *path = @"/var/mobile/Library/Safari/SafariTabs.db";
+	if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return -3;
+
+	void *db = NULL;
+	// 2 = SQLITE_OPEN_READWRITE, 0x10000 = SQLITE_OPEN_FULLMUTEX
+	if (api.open_v2([path UTF8String], &db, 2 | 0x10000, NULL) != 0) {
+		if (db) api.close(db);
+		return -4;
+	}
+
+	NSMutableArray *tables = [NSMutableArray array];
+	void *st = NULL;
+	if (api.prepare_v2(db, "SELECT name FROM sqlite_master WHERE type='table'", -1, &st, NULL) == 0 && st) {
+		while (api.step(st) == 100) {
+			const unsigned char *n = api.column_text(st, 0);
+			if (n) [tables addObject:[NSString stringWithUTF8String:(const char *)n]];
+		}
+	}
+	if (st) api.finalize(st);
+
+	int fixed = 0;
+	for (NSString *t in tables) {
+		NSMutableArray *textCols = [NSMutableArray array];
+		NSString *colsSql = [NSString stringWithFormat:@"PRAGMA table_info(\"%@\")", t];
+		void *cs = NULL;
+		if (api.prepare_v2(db, [colsSql UTF8String], -1, &cs, NULL) == 0 && cs) {
+			while (api.step(cs) == 100) {
+				const unsigned char *cn = api.column_text(cs, 1);
+				const unsigned char *ct = api.column_text(cs, 2);
+				if (!cn) continue;
+				NSString *colName = [NSString stringWithUTF8String:(const char *)cn];
+				NSString *colType = ct ? [[NSString stringWithUTF8String:(const char *)ct] uppercaseString] : @"";
+				BOOL isText = (colType.length == 0)
+					|| [colType rangeOfString:@"TEXT"].location != NSNotFound
+					|| [colType rangeOfString:@"CHAR"].location != NSNotFound
+					|| [colType rangeOfString:@"CLOB"].location != NSNotFound;
+				if (isText) [textCols addObject:colName];
+			}
+		}
+		if (cs) api.finalize(cs);
+
+		for (NSString *col in textCols) {
+			NSMutableArray *ids = [NSMutableArray array];
+			NSString *sel = [NSString stringWithFormat:
+							 @"SELECT rowid, \"%@\" FROM \"%@\" WHERE \"%@\" LIKE '%%928dokq%%'", col, t, col];
+			void *ss = NULL;
+			if (api.prepare_v2(db, [sel UTF8String], -1, &ss, NULL) == 0 && ss) {
+				while (api.step(ss) == 100) {
+					int rid = api.column_int(ss, 0);
+					const unsigned char *v = api.column_text(ss, 1);
+					[ids addObject:[NSString stringWithFormat:@"%d", rid]];
+					SPEHLog(@"[tabdb] 命中 %@.%@ rowid=%d 原值=%@", t, col, rid,
+							v ? [NSString stringWithUTF8String:(const char *)v] : @"(null)");
+				}
+			}
+			if (ss) api.finalize(ss);
+
+			if (ids.count) {
+				NSString *upd = [NSString stringWithFormat:
+								 @"UPDATE \"%@\" SET \"%@\"='about:blank' WHERE rowid IN (%@)",
+								 t, col, [ids componentsJoinedByString:@","]];
+				if (api.exec(db, [upd UTF8String], NULL, NULL, NULL) == 0) {
+					fixed += (int)ids.count;
+				} else {
+					SPEHLog(@"[tabdb] 改写失败 %@.%@（可能被占用）", t, col);
+				}
+			}
+		}
+	}
+
+	api.close(db);
+	return fixed;
 }
 
 #ifndef SPEH_NO_LOG
@@ -2191,6 +2308,12 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 		SPEHLog(@"[extperm] 权限表净化 removed=%d（0=无脏数据 -1..-6=异常码）", sanitized);
 		(void)sanitized;   // no-log 变体里 SPEHLog 是空宏，避免 -Wunused 被 -Werror 拦下
 
+		// 0.12.7：真正根治 —— 标签页库里那条坏 URL 直接改写为 about:blank。
+		// 必须早于会话恢复，否则 Safari 已经把这条 URL 读进内存，清库就没意义了。
+		int purged = SPEHPurgeBadTabsInDB();
+		SPEHLog(@"[tabdb] 标签页库净化 fixed=%d（0=无脏数据 -1..-4=异常码）", purged);
+		(void)purged;
+
 		// 0.12.5：启动后扫两遍，把 URL 就是那串畸形内容的标签页关掉（源头在会话恢复里）。
 		for (NSNumber *delay in @[ @3.0, @10.0 ]) {
 			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
@@ -2198,6 +2321,10 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 				int closed = SPEHCloseBadTabs();
 				SPEHLog(@"[extperm] 清扫畸形标签页 closed=%d（-1..-4=枚举失败码）", closed);
 				(void)closed;
+				// 库有可能被 Safari 重新写入过，再清一遍（幂等）
+				int again = SPEHPurgeBadTabsInDB();
+				SPEHLog(@"[tabdb] 复清 fixed=%d", again);
+				(void)again;
 			});
 		}
 
