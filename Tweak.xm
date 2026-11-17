@@ -999,7 +999,9 @@ static void SPEHWVTraitChangedHook(id self, SEL _cmd, UITraitCollection *prev)
 	if (!SPEHDarkModeEnabled()) return;
 	@try {
 		if (@available(iOS 13.0, *)) {
-			if (![self.traitCollection hasDifferentColorAppearanceComparedToTraitCollection:prev]) return;
+			// self 是 id（runtime patch 的 IMP 签名），取 trait 需显式转 UIView
+			UITraitCollection *cur = [(UIView *)self traitCollection];
+			if (![cur hasDifferentColorAppearanceComparedToTraitCollection:prev]) return;
 		}
 		SPEHPushDarkStateToWebView(self);
 	} @catch (NSException *e) { }
