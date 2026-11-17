@@ -470,6 +470,8 @@ static IMP gOrigPresentDialog = NULL;
 // ⚠️ 注释里绝对不要写 `星号斜杠星号` 那种通配写法：Logos 预处理器会把其中的
 // `斜杠星号` 当成块注释开头，直接把后面整段（包括 %ctor）吃掉，编译表现为
 // 一堆 unused function。这个坑已经踩过一次。
+// 这一整套只在 withlog 变体里编译：no-log 下 SPEHLog 是空宏，函数会变成未引用。
+#ifndef SPEH_NO_LOG
 static BOOL SPEHIsBadHostExtensionPermission(NSString *desc)
 {
 	if (!desc.length) return NO;
@@ -539,6 +541,7 @@ static NSString *SPEHCurrentPageURL(void)
 	} @catch (NSException *e) { }
 	return @"(unknown)";
 }
+#endif
 
 static void SPEHPresentDialogHook(id self, SEL _cmd, id dialog)
 {
@@ -546,9 +549,11 @@ static void SPEHPresentDialogHook(id self, SEL _cmd, id dialog)
 
 	// 只记录，不拦截：畸形 host 的扩展权限请求，把「页面真实 URL」一并打出来，
 	// 用于定位到底是谁在加载这个坏串（是恢复的标签、书签，还是地址栏输入）。
+#ifndef SPEH_NO_LOG
 	if (SPEHIsBadHostExtensionPermission(desc)) {
 		SPEHLog(@"[extperm] 畸形 host 权限请求 page=%@", SPEHCurrentPageURL());
 	}
+#endif
 
 	BOOL wantsOpen = SPEHTextWantsOpenApp(desc) || SPEHActionWantsOpenApp(dialog);
 	if (wantsOpen) {
