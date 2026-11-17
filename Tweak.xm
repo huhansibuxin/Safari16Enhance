@@ -952,9 +952,9 @@ static BOOL SPEHPurgeBadTokenInObject(id *obj)
 				changed = YES;
 				continue;
 			}
-			NSMutableArray *holder = [NSMutableArray arrayWithObject:v ?: [NSNull null]];
-			if (SPEHPurgeBadTokenInObject(&holder[0])) {
-				d[k] = holder[0];
+			id child = v;
+			if (SPEHPurgeBadTokenInObject(&child)) {
+				d[k] = child;
 				changed = YES;
 			}
 		}
@@ -969,9 +969,9 @@ static BOOL SPEHPurgeBadTokenInObject(id *obj)
 				changed = YES;
 				continue;
 			}
-			NSMutableArray *holder = [NSMutableArray arrayWithObject:v ?: [NSNull null]];
-			if (SPEHPurgeBadTokenInObject(&holder[0])) {
-				a[i] = holder[0];
+			id child = v;
+			if (SPEHPurgeBadTokenInObject(&child)) {
+				a[i] = child;
 				changed = YES;
 			}
 		}
