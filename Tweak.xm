@@ -1,4 +1,4 @@
-// Safari16Enhance 0.12.1 - iOS 16 Safari 增强
+// Safari16Enhance 0.12.2 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.12.1"
+#define SPEH_VERSION "0.12.2"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -470,8 +470,7 @@ static IMP gOrigPresentDialog = NULL;
 // ⚠️ 注释里绝对不要写 `星号斜杠星号` 那种通配写法：Logos 预处理器会把其中的
 // `斜杠星号` 当成块注释开头，直接把后面整段（包括 %ctor）吃掉，编译表现为
 // 一堆 unused function。这个坑已经踩过一次。
-// 这一整套只在 withlog 变体里编译：no-log 下 SPEHLog 是空宏，函数会变成未引用。
-#ifndef SPEH_NO_LOG
+// 这个判定两个变体都要用（no-log 下也要吞弹窗），所以放在条件编译外面。
 static BOOL SPEHIsBadHostExtensionPermission(NSString *desc)
 {
 	if (!desc.length) return NO;
@@ -508,6 +507,8 @@ static BOOL SPEHIsBadHostExtensionPermission(NSString *desc)
 	return [tail rangeOfCharacterFromSet:[NSCharacterSet whitespaceCharacterSet]].location != NSNotFound;
 }
 
+// 以下诊断只在 withlog 变体里编译：no-log 下 SPEHLog 是空宏，这些函数会变成未引用（-Werror）。
+#ifndef SPEH_NO_LOG
 // 诊断用：取当前窗口里第一个 WKWebView 的 URL（不 import WebKit，纯运行时类型判断）
 static NSString *SPEHFindWebViewURL(UIView *v, int depth)
 {
@@ -541,7 +542,100 @@ static NSString *SPEHCurrentPageURL(void)
 	} @catch (NSException *e) { }
 	return @"(unknown)";
 }
+
+// 0.12.2 诊断：把所有「名字里同时带 Permission + Extension/WebExt」的类扫出来，
+// 用于下一版精准 hook 权限判定入口（iOS 16 上没有公开头文件，只能运行时枚举）。
+static NSString *SPEHScanPermissionClasses(void)
+{
+	NSMutableArray *hits = [NSMutableArray array];
+	int count = objc_getClassList(NULL, 0);
+	if (count <= 0) return @"(none)";
+	Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
+	if (!classes) return @"(alloc fail)";
+	count = objc_getClassList(classes, count);
+	for (int i = 0; i < count; i++) {
+		const char *n = class_getName(classes[i]);
+		if (!n) continue;
+		NSString *name = [NSString stringWithUTF8String:n];
+		if (!name.length) continue;
+		BOOL hasPerm = [name rangeOfString:@"Permission" options:NSCaseInsensitiveSearch].location != NSNotFound;
+		BOOL hasExt = ([name rangeOfString:@"Extension" options:NSCaseInsensitiveSearch].location != NSNotFound)
+				   || ([name rangeOfString:@"WebExt" options:NSCaseInsensitiveSearch].location != NSNotFound);
+		if (hasPerm && hasExt) [hits addObject:name];
+	}
+	free(classes);
+	if (!hits.count) return @"(none)";
+	[hits sortUsingSelector:@selector(compare:)];
+	return [hits componentsJoinedByString:@", "];
+}
+
+// 0.12.2 诊断：优先用私有 _ivarDescription 全量 dump，退化为只列 ivar 名字。
+static NSString *SPEHObjectDump(id obj)
+{
+	if (!obj) return @"(nil)";
+	NSMutableString *s = [NSMutableString string];
+	SEL sel = NSSelectorFromString(@"_ivarDescription");
+	if ([obj respondsToSelector:sel]) {
+		@try {
+			id r = ((id (*)(id, SEL))objc_msgSend)(obj, sel);
+			if ([r isKindOfClass:[NSString class]]) [s appendString:(NSString *)r];
+		} @catch (NSException *e) { }
+	}
+	if (!s.length) {
+		unsigned int c = 0;
+		Ivar *ivars = class_copyIvarList([obj class], &c);
+		for (unsigned int i = 0; i < c; i++) {
+			const char *nm = ivar_getName(ivars[i]);
+			if (nm) [s appendFormat:@"%s; ", nm];
+		}
+		if (ivars) free(ivars);
+	}
+	if (!s.length) return @"(empty)";
+	if (s.length > 900) return [[s substringToIndex:900] stringByAppendingString:@"...(truncated)"];
+	return s;
+}
 #endif
+
+// 0.12.2：把「已挂进状态机但又不该显示」的 dialog 走完取消流程。
+// 必须走 orig 再取消，不能直接 return —— 否则背后的 completionHandler 不回调，
+// 扩展侧/导航侧会一直 pending（0.9.7 踩过：弹窗没了但返回按钮失灵）。
+static void SPEHSuppressDialogNow(id self, SEL _cmd, id dialog)
+{
+	if (gOrigPresentDialog) ((void (*)(id, SEL, id))gOrigPresentDialog)(self, _cmd, dialog);
+
+	BOOL canceled = NO;
+	@try {
+		if ([self respondsToSelector:@selector(cancelPresentedDialogIfNeeded)]) {
+			((void (*)(id, SEL))objc_msgSend)(self, @selector(cancelPresentedDialogIfNeeded));
+			canceled = YES;
+		}
+	} @catch (NSException *e) { canceled = NO; }
+
+	if (!canceled) {
+		@try {
+			if ([self respondsToSelector:@selector(_dismissCurrentDialogWithResponse:)]) {
+				((void (*)(id, SEL, id))objc_msgSend)(self, @selector(_dismissCurrentDialogWithResponse:),
+						@{@"password": @"", @"selectedActionIndex": @1, @"text": @""});
+				canceled = YES;
+			}
+		} @catch (NSException *e) { canceled = NO; }
+	}
+
+	__weak id weakSelf = self;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+				   dispatch_get_main_queue(), ^{
+		id s = weakSelf;
+		if (!s) return;
+		@try {
+			if ([s respondsToSelector:@selector(presentedDialog)]) {
+				id cur = ((id (*)(id, SEL))objc_msgSend)(s, @selector(presentedDialog));
+				if (cur == dialog && [s respondsToSelector:@selector(cancelPresentedDialogIfNeeded)]) {
+					((void (*)(id, SEL))objc_msgSend)(s, @selector(cancelPresentedDialogIfNeeded));
+				}
+			}
+		} @catch (NSException *e) { }
+	});
+}
 
 static void SPEHPresentDialogHook(id self, SEL _cmd, id dialog)
 {
@@ -549,11 +643,23 @@ static void SPEHPresentDialogHook(id self, SEL _cmd, id dialog)
 
 	// 只记录，不拦截：畸形 host 的扩展权限请求，把「页面真实 URL」一并打出来，
 	// 用于定位到底是谁在加载这个坏串（是恢复的标签、书签，还是地址栏输入）。
-#ifndef SPEH_NO_LOG
 	if (SPEHIsBadHostExtensionPermission(desc)) {
-		SPEHLog(@"[extperm] 畸形 host 权限请求 page=%@", SPEHCurrentPageURL());
-	}
+#ifndef SPEH_NO_LOG
+		static int badCount = 0;
+		badCount++;
+		if (badCount <= 15) {
+			SPEHLog(@"[extperm] #%d page=%@", badCount, SPEHCurrentPageURL());
+			SPEHLog(@"[extperm] #%d dialog=%@", badCount, SPEHObjectDump(dialog));
+		} else if (badCount == 16) {
+			SPEHLog(@"[extperm] 后续同类弹窗不再记录（累计已超 15 次）");
+		}
 #endif
+		// 0.12.2：这条 origin 天生非法（host 带空格/中文），Safari 拿它匹配授权表永远失败，
+		// 无论用户点「允许1天 / 始终允许 / 不允许」都只会在 plist 里反复写回同一条坏 key，
+		// 下一次照样弹 —— 实测知乎/wap.zol 每次翻页都弹。这里直接吞掉，不再打扰用户。
+		SPEHSuppressDialogNow(self, _cmd, dialog);
+		return;
+	}
 
 	BOOL wantsOpen = SPEHTextWantsOpenApp(desc) || SPEHActionWantsOpenApp(dialog);
 	if (wantsOpen) {
@@ -1626,6 +1732,10 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 
 		SPEHInstallSFDialogHooks();
 		SPEHInstallAppOpenDialogHooks();
+#ifndef SPEH_NO_LOG
+		// 0.12.2 诊断：枚举权限相关类名，下一版据此精准 hook 权限判定入口
+		SPEHLog(@"[extperm] 权限相关类: %@", SPEHScanPermissionClasses());
+#endif
 		SPEHInstallReaderHooks();
 		SPEHInstallOpenInAppHooks();
 		SPEHInstallAppLinkHooks();
