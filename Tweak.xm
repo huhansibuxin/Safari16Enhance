@@ -1,4 +1,4 @@
-// Safari16Enhance 0.9.9 - iOS 16 Safari 增强
+// Safari16Enhance 0.10.0 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.9.9"
+#define SPEH_VERSION "0.10.0"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -168,6 +168,7 @@ static BOOL SPEHDialogKillEnabled(void)    { return SPEHBoolPref(@"suppressError
 static BOOL SPEHReaderKillEnabled(void)    { return SPEHBoolPref(@"killReader", YES); }
 static BOOL SPEHOpenInAppKillEnabled(void) { return SPEHBoolPref(@"killOpenInApp", YES); }
 static BOOL SPEHSmartBannerKillEnabled(void) { return SPEHBoolPref(@"killSmartBanner", YES); }
+static BOOL SPEHDarkModeEnabled(void)      { return SPEHBoolPref(@"forceDarkMode", YES); }
 static BOOL SPEHProbeEnabled(void)         { return SPEHBoolPref(@"probeEnabled", NO); }
 
 // MARK: - 通用工具
@@ -734,6 +735,8 @@ static void SPEHApplyOpenInAppJSAttempt(id webView, int attempt);
 
 static void SPEHApplyOpenInAppJS(id webView)
 {
+	// 0.10.0：开关下沉到函数内部，使注入 hook 可被深色模块共用（不再被外层 return 挡住）
+	if (!SPEHOpenInAppKillEnabled()) return;
 	SPEHApplyOpenInAppJSAttempt(webView, 0);
 }
 
@@ -794,6 +797,72 @@ static void SPEHApplyOpenInAppJSAttempt(id webView, int attempt)
 			if (meta > 0 || elems > 0 || blocked > 0) {
 				SPEHLog(@"[openinapp] 清理 meta=%d el=%d 已拦点击=%d", meta, elems, blocked);
 			}
+		}];
+	} @catch (NSException *e) { }
+}
+
+// ─── 强制深色模式（0.10.0）────────────────────────────────────────────
+//
+// 参考开源成熟配方（rkshrksh/dark-mode-userscript 等）：
+//   html 套 filter:invert(1) hue-rotate(180deg) → 白网页变深；
+//   img/video/canvas/svg/iframe 再套一次同样滤镜 → 二次反转 = 还原图片原色。
+// 系统深浅色检测：
+//   初始用原生 UITraitCollection（准确），运行时用 JS matchMedia 的 change 事件跟随切换。
+// 白天模式：完全不注入样式、移除所有标记 → 网页保持原样，零副作用。
+// 智能跳过：网页自身已是深色（computed 背景亮度低）时不套滤镜，避免"深色被反转成白"。
+// 只走 evaluateJavaScript，绝不碰 configuration / userContentController / processPool
+// （0.8.0 血泪教训：碰了会搞坏 Userscripts / Dark Night 等第三方扩展）。
+
+static NSString *SPEHDarkModeJS(void)
+{
+	BOOL sysDark = NO;
+	@try {
+		UIUserInterfaceStyle st = [[UITraitCollection currentTraitCollection] userInterfaceStyle];
+		if (st == UIUserInterfaceStyleUnspecified)
+			st = [[UIScreen mainScreen] traitCollection].userInterfaceStyle;
+		sysDark = (st == UIUserInterfaceStyleDark);
+	} @catch (NSException *e) { }
+
+	return [NSString stringWithFormat:
+		@"(function(){try{"
+		"var ID='__speh_dark_style',DARK=%@;"
+		"var mq=window.matchMedia?window.matchMedia('(prefers-color-scheme: dark)'):null;"
+		"function on(){return mq?!!mq.matches:!!DARK;}"
+		"function alreadyDark(){try{"
+		"var el=document.body||document.documentElement;"
+		"var bg=window.getComputedStyle?getComputedStyle(el).backgroundColor:'';"
+		"if(!bg||bg==='transparent')return false;"
+		"if(bg.indexOf('rgba')===0){var ps=bg.replace(/rgba?\\(|\\)/g,'').split(',');"
+		"var a=parseFloat(ps[3]);if(!isNaN(a)&&a<0.1)return false;}"
+		"var c=bg.match(/(\\d+)\\D+(\\d+)\\D+(\\d+)/);"
+		"if(c){var l=(parseInt(c[1])*299+parseInt(c[2])*587+parseInt(c[3])*114)/1000;"
+		"return l<70;}}catch(e){}return false;}"
+		"var css=\"html[data-speh-dark='1']{filter:invert(1) hue-rotate(180deg) brightness(0.92) contrast(1.05)!important;background-color:#fff!important;}\""
+		"+\"html[data-speh-dark='1'] img,html[data-speh-dark='1'] video,html[data-speh-dark='1'] canvas,html[data-speh-dark='1'] svg,html[data-speh-dark='1'] iframe{filter:invert(1) hue-rotate(180deg)!important;}\";"
+		"function ensure(){if(document.getElementById(ID))return;"
+		"var s=document.createElement('style');s.id=ID;s.textContent=css;"
+		"(document.head||document.documentElement).appendChild(s);}"
+		"function clear(){document.documentElement.removeAttribute('data-speh-dark');"
+		"var s=document.getElementById(ID);if(s&&s.parentNode)s.parentNode.removeChild(s);}"
+		"function apply(){if(!on()){clear();return;}"
+		"if(document.documentElement.getAttribute('data-speh-dark')==='1')return;"
+		"if(alreadyDark())return;ensure();"
+		"document.documentElement.setAttribute('data-speh-dark','1');}"
+		"apply();"
+		"if(mq&&!window.__spehDarkWatch){window.__spehDarkWatch=1;"
+		"var h=function(){clear();apply();};"
+		"if(mq.addEventListener)mq.addEventListener('change',h);"
+		"else if(mq.addListener)mq.addListener(h);}"
+		"}catch(e){}})();",
+		sysDark ? @"1" : @"0"];
+}
+
+static void SPEHApplyDarkModeJS(id webView)
+{
+	if (!webView || !SPEHDarkModeEnabled()) return;
+	@try {
+		[(id<SPEHWebViewJS>)webView evaluateJavaScript:SPEHDarkModeJS() completionHandler:^(id result, NSError *error) {
+			if (error && SPEHProbeEnabled()) SPEHLog(@"[dark] JS 失败 %@", error.localizedDescription);
 		}];
 	} @catch (NSException *e) { }
 }
@@ -991,10 +1060,12 @@ static void SPEHWVDidMoveToWindowHook(UIView *self, SEL _cmd)
 	}
 
 	// 清「App 内打开」浮层与 apple-itunes-app meta（纯 JS，不碰原生）
+	// 0.10.0：同时注入强制深色（同一时间点、同一 evaluateJavaScript 通道）
 	NSArray *delays = @[ @0.8, @2.5, @5.0 ];
 	for (NSNumber *d in delays) {
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 			SPEHApplyOpenInAppJS(weakSelf);
+			SPEHApplyDarkModeJS(weakSelf);
 		});
 	}
 }
@@ -1016,13 +1087,19 @@ static void SPEHTabDidFinishNavigationHook(id self, SEL _cmd, id webView, id nav
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
 			dispatch_get_main_queue(), ^{
 				SPEHApplyOpenInAppJS(weakWV);
+				SPEHApplyDarkModeJS(weakWV);
 			});
 	}
 }
 
 static void SPEHInstallOpenInAppHooks(void)
 {
-	if (!SPEHOpenInAppKillEnabled()) { SPEHLog(@"[openinapp] disabled by prefs"); return; }
+	// 0.10.0：注入 hook 由 openinapp + 深色模块共用，任一开启就必须安装。
+	// 各模块开关已在自己的 Apply 函数内部判断。
+	if (!SPEHOpenInAppKillEnabled() && !SPEHDarkModeEnabled()) {
+		SPEHLog(@"[inject] openinapp 与 darkmode 均关闭，不装注入 hook");
+		return;
+	}
 
 	Class wkCls = NSClassFromString(@"WKWebView");
 	if (!wkCls) { SPEHLog(@"[openinapp] WKWebView 未加载"); return; }
@@ -1526,10 +1603,10 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 #ifndef SPEH_NO_LOG
 		SPEHLog(@"log file = %@", SPEHLogPath());
 #endif
-		SPEHLog(@"dialog=%d reader=%d openinapp=%d smartbanner=%d applink=%d probe=%d",
+		SPEHLog(@"dialog=%d reader=%d openinapp=%d smartbanner=%d applink=%d darkmode=%d probe=%d",
 				SPEHDialogKillEnabled(), SPEHReaderKillEnabled(),
 				SPEHOpenInAppKillEnabled(), SPEHSmartBannerKillEnabled(),
-				SPEHAppLinkKillEnabled(), SPEHProbeEnabled());
+				SPEHAppLinkKillEnabled(), SPEHDarkModeEnabled(), SPEHProbeEnabled());
 
 		SPEHInstallSFDialogHooks();
 		SPEHInstallAppOpenDialogHooks();
