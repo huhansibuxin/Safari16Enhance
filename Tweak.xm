@@ -1,4 +1,4 @@
-// Safari16Enhance 0.12.9 - iOS 16 Safari 增强
+// Safari16Enhance 0.13.0 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.12.9"
+#define SPEH_VERSION "0.13.0"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -659,21 +659,43 @@ static NSString *SPEHOpenInAppJS(void)
 			 "while(t&&t.tagName!=='A'){t=t.parentNode;}if(!t)return;"
 			 "var h=t.getAttribute&&t.getAttribute('href');if(!ok(h)){"
 			 "e.preventDefault();e.stopPropagation();window.__speh.s=(window.__speh.s||0)+1;}}catch(x){}},true);}"
+			 // ④B 0.13.0：Bing 搜索结果页的「继续搜索 / 微软必应APP / 浏览器 继续」卡片
+			 //   Bing 的 OpalUpsell:ContinueSearch 脚本给 #b_results li a 挂冒泡 click，
+			 //   先 preventDefault 再 CSPopupView.show()，点「继续」才 location.href 跳转。
+			 //   对策：在 document 捕获阶段只 stopPropagation、**不** preventDefault ——
+			 //   Bing 的处理器收不到事件，而 <a> 的默认导航不受影响，链接照常打开。
+			 "if(!window.__speh.bing&&/bing\\./i.test(location.hostname||'')){window.__speh.bing=1;"
+			 "document.addEventListener('click',function(e){try{var n=e.target;var inRes=false,dep=0;"
+			 "while(n&&n.nodeType===1&&dep<40){if(n.id==='b_results'){inRes=true;break;}n=n.parentNode;dep++;}"
+			 "if(!inRes)return;var a=e.target;dep=0;"
+			 "while(a&&a.nodeType===1&&a.tagName!=='A'&&dep<12){a=a.parentNode;dep++;}"
+			 "if(!a||!a.getAttribute)return;var h=a.getAttribute('href')||'';"
+			 "if(/^https?:/i.test(h)){e.stopPropagation();window.__speh.cs=(window.__speh.cs||0)+1;}}catch(x){}},true);}"
 			 // ⑤ 清网页自绘的「App 内打开」浮层（中英双关键字 + 只认 fixed/sticky/absolute + 宽度够宽）
 			 // 0.9.8：DOM 无变动时跳过全树扫描；卡片延迟插入会由 MutationObserver 重新置脏，不漏（JS 内不用 // 注释以免吃掉拼接行）
+			 // 0.13.0：加入 Bing 卡片特征词（继续搜索 / 搜你所想 / 微软必应APP 等），
+			 //   并把「找到文本节点后向上爬到全宽定位容器再删」补上 —— 原来只删文本节点本身，
+			 //   Bing 的标题在内层小元素、宽度判定永远不过。同时排除 SCRIPT/STYLE，避免误删脚本。
 			 "if(window.__speh.dirty){"
-			 "var kws=['App 内打开','App内打开','在App内打开','在 App 内打开','打开App','打开 App','open in app','Open in App','OPEN IN APP'];"
+			 "var kws=['App 内打开','App内打开','在App内打开','在 App 内打开','打开App','打开 App','open in app','Open in App','OPEN IN APP',"
+			 "'继续搜索','搜你所想','搜你所想，有求必应','搜你所想,有求必应','微软必应APP','使用必应应用搜索','在必应应用中打开'];"
 			 "var els=document.querySelectorAll('body *');var wlim=Math.max(240,window.innerWidth*0.6);"
 			 "for(var j=0;j<els.length;j++){var el=els[j];if(!el.parentNode)continue;"
-			 "var t=(el.textContent||'').replace(/^\\s+|\\s+$/g,'');if(!t||t.length>60)continue;"
+			 "var tg=el.tagName;if(tg==='SCRIPT'||tg==='STYLE'||tg==='NOSCRIPT'||tg==='TEMPLATE')continue;"
+			 "var t=(el.textContent||'').replace(/^\\s+|\\s+$/g,'');if(!t||t.length>120)continue;"
 			 "var hit=false;for(var k=0;k<kws.length;k++){if(t.indexOf(kws[k])>=0){hit=true;break;}}"
 			 "if(!hit)continue;"
-			 "var cs=getComputedStyle(el);"
-			 "if((cs.position==='fixed'||cs.position==='sticky')&&el.getBoundingClientRect().width>=wlim){"
-			 "el.parentNode.removeChild(el);r.e++;}}"
+			 "var box=el,dep2=0,root=null;"
+			 "while(box&&box.nodeType===1&&dep2<10){var bcs=getComputedStyle(box);"
+			 "if(bcs.position==='fixed'||bcs.position==='sticky'||bcs.position==='absolute'){root=box;break;}"
+			 "if(box.getBoundingClientRect().width>=wlim){root=box;break;}"
+			 "box=box.parentNode;dep2++;}"
+			 "if(!root)root=el;if(root===document.body||root===document.documentElement)root=el;"
+			 "if(root.parentNode){root.parentNode.removeChild(root);r.e++;}}"
 			 "window.__speh.dirty=0;r.scan=1;}"
 			 "return 'first='+(first?1:0)+' meta='+r.m+' el='+r.e+' link='+r.link"
-			 "+' scan='+r.scan+' click='+window.__speh.click+' s='+(window.__speh.s||0);"
+			 "+' scan='+r.scan+' click='+window.__speh.click+' s='+(window.__speh.s||0)"
+			 "+' cs='+(window.__speh.cs||0);"
 			 "}catch(err){return 'ERR:'+err;}})()";
 	});
 	return js;
@@ -783,6 +805,7 @@ static void SPEHApplyOpenInAppJSAttempt(id webView, int attempt)
 			int click = SPEHJSInt(r, @"click");
 			int blocked = SPEHJSInt(r, @"s");
 			int scanned = SPEHJSInt(r, @"scan");
+			int bingCs  = SPEHJSInt(r, @"cs=");
 
 			// 0.9.3：探针默认关闭。「就绪」是诊断用的每页一条，只在 probe 打开时打；
 			// 「清理」只在真的动过手（删了 meta / 拆了浮层 / 拦了点击）时打，属于真事件，保留。
@@ -795,6 +818,10 @@ static void SPEHApplyOpenInAppJSAttempt(id webView, int attempt)
 			}
 			if (meta > 0 || elems > 0 || blocked > 0) {
 				SPEHLog(@"[openinapp] 清理 meta=%d el=%d 已拦点击=%d", meta, elems, blocked);
+			}
+			// 0.13.0：Bing 结果页「继续搜索」卡片的压制计数（捕获阶段 stopPropagation 命中）
+			if (bingCs > 0) {
+				SPEHLog(@"[openinapp] Bing 结果页点击压制 累计=%d", bingCs);
 			}
 		}];
 	} @catch (NSException *e) { }
