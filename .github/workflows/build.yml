@@ -101,14 +101,14 @@ jobs:
       - name: Save and upload diagnostic deb
         run: |
           mkdir -p artifacts
-          cp packages/*.deb artifacts/Safari16Enhance-0.12.2-withlog.deb
+          cp packages/*.deb artifacts/Safari16Enhance-0.12.3-withlog.deb
           ls -l artifacts/
 
       - name: Upload diagnostic deb
         uses: actions/upload-artifact@v4
         with:
           name: Safari16Enhance-roothide-withlog
-          path: artifacts/Safari16Enhance-0.12.2-withlog.deb
+          path: artifacts/Safari16Enhance-0.12.3-withlog.deb
           if-no-files-found: error
 
       - name: Build no-log variant
@@ -116,10 +116,10 @@ jobs:
           rm -f packages/*.deb
           make clean
           cp control control.bak
-          sed -i '' 's/^Version: 0.12.2$/Version: 0.12.2-nolog/' control
+          sed -i '' 's/^Version: 0.12.3$/Version: 0.12.3-nolog/' control
           SPEH_NO_LOG=1 make package
           cp control.bak control
-          cp packages/*.deb artifacts/Safari16Enhance-0.12.2-nolog.deb
+          cp packages/*.deb artifacts/Safari16Enhance-0.12.3-nolog.deb
           ls -l artifacts/
 
       - name: Verify no-log variant
@@ -149,5 +149,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Safari16Enhance-roothide-nolog
-          path: artifacts/Safari16Enhance-0.12.2-nolog.deb
+          path: artifacts/Safari16Enhance-0.12.3-nolog.deb
           if-no-files-found: error

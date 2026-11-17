@@ -1,4 +1,4 @@
-// Safari16Enhance 0.12.2 - iOS 16 Safari 增强
+// Safari16Enhance 0.12.3 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.12.2"
+#define SPEH_VERSION "0.12.3"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -769,6 +769,130 @@ static void SPEHInstallAppOpenDialogHooks(void)
 								(IMP)SPEHWillPresentDialogHook, &gOrigWillPresentDialog);
 		SPEHLog(@"[appdlg] hook willPresentDialog: %s", gOrigWillPresentDialog ? "ok" : "FAILED");
 	}
+}
+
+// MARK: - 0.12.3 畸形 URL 导航拦截（根治扩展权限弹窗）
+//
+// 真机日志铁证：每一次「“Dark Night”想要访问 <畸形 host>」前面几十毫秒，必然紧跟一次
+// 「Safari 浏览器打不开该网页，因为网址无效」；两者成对出现、页面却各不相同
+// （知乎 / 知乎专栏 / wap.zol / 百度经验 / bing 结果页）。
+// 结论：有条导航在反复加载那个坏串 —— 浏览器报网址无效，扩展权限又拿同一个 host 去请求，
+// 用户点「始终允许」写回的还是坏 key，于是两框一起循环。
+// 处理：在导航入口把这个 host 非法的请求直接掐掉，不启动导航，两个弹窗同时消失。
+// 正常 URL（含 percent-encoded 后的纯 ASCII）一律原样放行，不加任何额外判断。
+
+static BOOL SPEHURLStringIsMalformed(NSString *s)
+{
+	if (!s.length) return NO;
+	NSUInteger n = (s.length > 4096) ? 4096 : s.length;
+	for (NSUInteger i = 0; i < n; i++) {
+		unichar c = [s characterAtIndex:i];
+		if (c == ' ' || c == '\t' || c == '\n' || c > 0x7E) return YES;
+	}
+	return NO;
+}
+
+static NSString *SPEHRequestURLString(id req)
+{
+	if (!req) return nil;
+	if ([req isKindOfClass:[NSString class]]) return (NSString *)req;
+	@try {
+		if ([req isKindOfClass:[NSURL class]]) return [(NSURL *)req absoluteString];
+		if ([req respondsToSelector:@selector(URL)]) {
+			id u = ((id (*)(id, SEL))objc_msgSend)(req, @selector(URL));
+			if ([u isKindOfClass:[NSURL class]]) return [(NSURL *)u absoluteString];
+			if ([u isKindOfClass:[NSString class]]) return (NSString *)u;
+		}
+		if ([req respondsToSelector:@selector(absoluteString)]) {
+			id u = ((id (*)(id, SEL))objc_msgSend)(req, @selector(absoluteString));
+			if ([u isKindOfClass:[NSString class]]) return (NSString *)u;
+		}
+	} @catch (NSException *e) { }
+	return nil;
+}
+
+#ifndef SPEH_NO_LOG
+static int gBadNavLogCount = 0;
+static void SPEHLogBadNav(const char *tag, SEL cmd, NSString *url)
+{
+	if (gBadNavLogCount >= 12) return;
+	gBadNavLogCount++;
+	SPEHLog(@"[badurl] #%d %s -[%s] url=%@ page=%@", gBadNavLogCount, tag,
+			sel_getName(cmd), url ?: @"(nil)", SPEHCurrentPageURL());
+	if (gBadNavLogCount <= 4) {
+		@try {
+			SPEHLog(@"[badurl] #%d stack=%@", gBadNavLogCount,
+					[[NSThread callStackSymbols] componentsJoinedByString:@" <- "]);
+		} @catch (NSException *e) { }
+	}
+}
+#endif
+
+// — WKWebView -loadRequest:（返回 WKNavigation，拦下时回 nil 表示未启动导航）
+static IMP gOrigWKLoadRequest = NULL;
+static id SPEHWKLoadRequestHook(id self, SEL _cmd, id req)
+{
+	NSString *u = SPEHRequestURLString(req);
+	if (SPEHURLStringIsMalformed(u)) {
+#ifndef SPEH_NO_LOG
+		SPEHLogBadNav("拦截", _cmd, u);
+#endif
+		return nil;
+	}
+	if (gOrigWKLoadRequest) return ((id (*)(id, SEL, id))gOrigWKLoadRequest)(self, _cmd, req);
+	return nil;
+}
+
+// — TabDocument -loadRequest: / -_loadRequest:（返回类型不定，统一按 id 转发：
+//   arm64 上 objc_msgSend 的返回值走同一个 x0，void 方法多读一个 x0 是安全的，反之不行）
+static IMP gOrigTabLoadRequest = NULL;
+static id SPEHTabLoadRequestHook(id self, SEL _cmd, id req)
+{
+	NSString *u = SPEHRequestURLString(req);
+	if (SPEHURLStringIsMalformed(u)) {
+#ifndef SPEH_NO_LOG
+		SPEHLogBadNav("拦截", _cmd, u);
+#endif
+		return nil;
+	}
+	if (gOrigTabLoadRequest) return ((id (*)(id, SEL, id))gOrigTabLoadRequest)(self, _cmd, req);
+	return nil;
+}
+
+static IMP gOrigTabLoadRequestUnderscore = NULL;
+static id SPEHTabLoadRequestUnderscoreHook(id self, SEL _cmd, id req)
+{
+	NSString *u = SPEHRequestURLString(req);
+	if (SPEHURLStringIsMalformed(u)) {
+#ifndef SPEH_NO_LOG
+		SPEHLogBadNav("拦截", _cmd, u);
+#endif
+		return nil;
+	}
+	if (gOrigTabLoadRequestUnderscore) return ((id (*)(id, SEL, id))gOrigTabLoadRequestUnderscore)(self, _cmd, req);
+	return nil;
+}
+
+static void SPEHInstallBadURLNavigationHooks(void)
+{
+	Class wk = NSClassFromString(@"WKWebView");
+	Class tab = NSClassFromString(@"TabDocument");
+
+	BOOL wkOK = NO, tabOK = NO, tabUOK = NO;
+	if (wk && class_getInstanceMethod(wk, @selector(loadRequest:))) {
+		SPEHPatchInstanceMethod(wk, @selector(loadRequest:), (IMP)SPEHWKLoadRequestHook, &gOrigWKLoadRequest);
+		wkOK = (gOrigWKLoadRequest != NULL);
+	}
+	if (tab && class_getInstanceMethod(tab, @selector(loadRequest:))) {
+		SPEHPatchInstanceMethod(tab, @selector(loadRequest:), (IMP)SPEHTabLoadRequestHook, &gOrigTabLoadRequest);
+		tabOK = (gOrigTabLoadRequest != NULL);
+	}
+	if (tab && class_getInstanceMethod(tab, @selector(_loadRequest:))) {
+		SPEHPatchInstanceMethod(tab, @selector(_loadRequest:), (IMP)SPEHTabLoadRequestUnderscoreHook, &gOrigTabLoadRequestUnderscore);
+		tabUOK = (gOrigTabLoadRequestUnderscore != NULL);
+	}
+	SPEHLog(@"[badurl] hook WKWebView loadRequest:=%d | TabDocument loadRequest:=%d _loadRequest:=%d",
+			wkOK, tabOK, tabUOK);
 }
 
 // MARK: - 阅读器击杀（白名单精准命中）
@@ -1732,6 +1856,7 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 
 		SPEHInstallSFDialogHooks();
 		SPEHInstallAppOpenDialogHooks();
+		SPEHInstallBadURLNavigationHooks();
 #ifndef SPEH_NO_LOG
 		// 0.12.2 诊断：枚举权限相关类名，下一版据此精准 hook 权限判定入口
 		SPEHLog(@"[extperm] 权限相关类: %@", SPEHScanPermissionClasses());
