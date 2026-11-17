@@ -1,4 +1,4 @@
-// Safari16Enhance 0.12.5 - iOS 16 Safari 增强
+// Safari16Enhance 0.12.6 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.12.5"
+#define SPEH_VERSION "0.12.6"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -454,8 +454,53 @@ static BOOL SPEHActionWantsOpenApp(id dialog)
 	return NO;
 }
 
-static IMP gOrigPresentDialog = NULL;
+// 0.12.6：BrowserController 没有公开的 shared 入口（实测 sharedController / mainBrowserController
+// 都不存在，扫描时拿到的是 -2），只能 hook 它的 init 把实例存下来，之后才能枚举标签页。
+static __weak id gBrowserController = nil;
+static IMP gOrigBrowserControllerInit = NULL;
 
+static id SPEHBrowserControllerInitHook(id self, SEL _cmd)
+{
+	id r = nil;
+	if (gOrigBrowserControllerInit) r = ((id (*)(id, SEL))gOrigBrowserControllerInit)(self, _cmd);
+	gBrowserController = self;
+	return r;
+}
+
+// 兜底：hook init 可能来不及（Safari 可能先建好控制器再加载 dylib），
+// 再从当前窗口的视图控制器树里把 BrowserController 捞出来。
+static id SPEHFindBrowserController(void)
+{
+	if (gBrowserController) return gBrowserController;
+
+	Class target = NSClassFromString(@"BrowserController");
+	UIWindow *win = nil;
+	@try { win = [UIApplication sharedApplication].keyWindow; } @catch (NSException *e) { win = nil; }
+	id rootVC = nil;
+	@try { rootVC = win.rootViewController; } @catch (NSException *e) { rootVC = nil; }
+	if (!rootVC) return nil;
+
+	NSMutableArray *stack = [NSMutableArray arrayWithObject:rootVC];
+	int guard = 0;
+	while (stack.count && guard++ < 500) {
+		id vc = stack.firstObject;
+		[stack removeObjectAtIndex:0];
+		if (target && [vc isKindOfClass:target]) return vc;
+		@try {
+			if ([vc respondsToSelector:@selector(childViewControllers)]) {
+				NSArray *kids = ((id (*)(id, SEL))objc_msgSend)(vc, @selector(childViewControllers));
+				if ([kids isKindOfClass:[NSArray class]]) [stack addObjectsFromArray:kids];
+			}
+			if ([vc respondsToSelector:@selector(presentedViewController)]) {
+				id p = ((id (*)(id, SEL))objc_msgSend)(vc, @selector(presentedViewController));
+				if (p) [stack addObject:p];
+			}
+		} @catch (NSException *e) { }
+	}
+	return nil;
+}
+
+static IMP gOrigPresentDialog = NULL;
 // 0.12.1：畸形 origin 的扩展权限请求 —— 只做诊断记录，不做拦截（老板要求先查清来源）。
 //
 // 真机日志实证：Dark Night / Aurora 这类深色扩展会反复弹
@@ -605,31 +650,71 @@ static BOOL SPEHStringIsMalformedHost(NSString *s)
 // 会话状态存在 datavault 保护区（SSH 读不到），只能在进程内把这页关掉。
 static int SPEHCloseBadTabs(void)
 {
-	Class bcCls = NSClassFromString(@"BrowserController");
-	if (!bcCls) return -1;
-
-	id bc = nil;
-	for (NSString *selName in @[@"sharedController", @"mainBrowserController"]) {
-		SEL s = NSSelectorFromString(selName);
-		if (![bcCls respondsToSelector:s]) continue;
-		@try { bc = ((id (*)(id, SEL))objc_msgSend)(bcCls, s); } @catch (NSException *e) { bc = nil; }
-		if (bc) break;
+	id bc = SPEHFindBrowserController();
+	if (!bc) {
+		Class bcCls = NSClassFromString(@"BrowserController");
+		if (!bcCls) return -1;
+		for (NSString *selName in @[@"sharedController", @"mainBrowserController", @"sharedInstance"]) {
+			SEL s = NSSelectorFromString(selName);
+			if (![bcCls respondsToSelector:s]) continue;
+			@try { bc = ((id (*)(id, SEL))objc_msgSend)(bcCls, s); } @catch (NSException *e) { bc = nil; }
+			if (bc) break;
+		}
 	}
 	if (!bc) return -2;
 
 	id tabs = nil;
-	if ([bc respondsToSelector:@selector(tabDocuments)]) {
-		@try { tabs = ((id (*)(id, SEL))objc_msgSend)(bc, @selector(tabDocuments)); } @catch (NSException *e) { tabs = nil; }
+	for (NSString *selName in @[@"tabDocuments", @"tabs"]) {
+		SEL s = NSSelectorFromString(selName);
+		if (![bc respondsToSelector:s]) continue;
+		@try { tabs = ((id (*)(id, SEL))objc_msgSend)(bc, s); } @catch (NSException *e) { tabs = nil; }
+		if (tabs) break;
 	}
 	if (!tabs) {
-		for (NSString *ivName in @[@"_tabDocuments", @"_tabs"]) {
+		for (NSString *ivName in @[@"_tabDocuments", @"_tabs", @"_tabDocumentsOrderedSet"]) {
 			Ivar iv = class_getInstanceVariable(object_getClass(bc), ivName.UTF8String);
 			if (!iv) continue;
 			@try { tabs = object_getIvar(bc, iv); } @catch (NSException *e) { tabs = nil; }
 			if (tabs) break;
 		}
 	}
-	if (!tabs) return -3;
+	if (!tabs) {
+		// 再退一层：BrowserController 通常把标签页托管给 TabController
+		id tc = nil;
+		for (NSString *selName in @[@"tabController"]) {
+			SEL s = NSSelectorFromString(selName);
+			if (![bc respondsToSelector:s]) continue;
+			@try { tc = ((id (*)(id, SEL))objc_msgSend)(bc, s); } @catch (NSException *e) { tc = nil; }
+		}
+		if (!tc) {
+			Ivar iv = class_getInstanceVariable(object_getClass(bc), "_tabController");
+			if (iv) { @try { tc = object_getIvar(bc, iv); } @catch (NSException *e) { tc = nil; } }
+		}
+		if (tc) {
+			SEL s = NSSelectorFromString(@"tabDocuments");
+			if ([tc respondsToSelector:s]) {
+				@try { tabs = ((id (*)(id, SEL))objc_msgSend)(tc, s); } @catch (NSException *e) { tabs = nil; }
+			}
+		}
+	}
+	if (!tabs) {
+#ifndef SPEH_NO_LOG
+		static BOOL dumpedIvars = NO;
+		if (!dumpedIvars) {
+			dumpedIvars = YES;
+			NSMutableArray *names = [NSMutableArray array];
+			unsigned int c = 0;
+			Ivar *ivs = class_copyIvarList(object_getClass(bc), &c);
+			for (unsigned int i = 0; i < c; i++) {
+				const char *n = ivar_getName(ivs[i]);
+				if (n) [names addObject:[NSString stringWithUTF8String:n]];
+			}
+			if (ivs) free(ivs);
+			SPEHLog(@"[extperm] BrowserController 无 tabDocuments，ivar=%@", [names componentsJoinedByString:@","]);
+		}
+#endif
+		return -3;
+	}
 
 	NSArray *list = nil;
 	@try {
@@ -661,6 +746,40 @@ static int SPEHCloseBadTabs(void)
 }
 
 #ifndef SPEH_NO_LOG
+// 0.12.6 诊断：Safari 进程自己有权读 /var/mobile/Library/Safari（datavault 保护，SSH 读不到），
+// 所以在进程内扫一遍，找出那个坏串到底还存在哪个文件里 —— 会话恢复 / 书签 / 最近关闭 / 自动填充。
+static NSString *SPEHScanSafariSharedDir(void)
+{
+	NSString *dir = @"/var/mobile/Library/Safari";
+	NSFileManager *fm = [NSFileManager defaultManager];
+	NSArray *names = [fm contentsOfDirectoryAtPath:dir error:nil];
+	if (![names isKindOfClass:[NSArray class]]) return @"(无法列出目录)";
+
+	NSData *needle = [@"928dokq" dataUsingEncoding:NSUTF8StringEncoding];
+	NSData *needle2 = [@"huayuarc" dataUsingEncoding:NSUTF8StringEncoding];
+	NSMutableArray *hits = [NSMutableArray array];
+
+	for (NSString *n in names) {
+		if (hits.count >= 20) break;
+		NSString *p = [dir stringByAppendingPathComponent:n];
+		BOOL isDir = NO;
+		if (![fm fileExistsAtPath:p isDirectory:&isDir] || isDir) continue;
+		NSDictionary *attr = [fm attributesOfItemAtPath:p error:nil];
+		unsigned long long sz = [attr fileSize];
+		if (sz == 0 || sz > (20ULL * 1024 * 1024)) continue;
+		NSData *d = [NSData dataWithContentsOfFile:p];
+		if (!d.length) continue;
+		NSRange full = NSMakeRange(0, d.length);
+		BOOL h1 = (needle.length && [d rangeOfData:needle options:0 range:full].location != NSNotFound);
+		BOOL h2 = (needle2.length && [d rangeOfData:needle2 options:0 range:full].location != NSNotFound);
+		if (h1 || h2) {
+			[hits addObject:[NSString stringWithFormat:@"%@(%lluK,bad=%d,host=%d)",
+							 n, sz / 1024, h1 ? 1 : 0, h2 ? 1 : 0]];
+		}
+	}
+	return hits.count ? [hits componentsJoinedByString:@", "] : @"(共享目录无命中)";
+}
+
 // 0.12.5 诊断：畸形 host 权限请求被触发时打一份调用栈，直接指认是哪个类/方法在请求。
 static NSString *SPEHBacktraceText(NSUInteger limit)
 {
@@ -830,6 +949,19 @@ static void SPEHPresentDialogHook(id self, SEL _cmd, id dialog)
 {
 	NSString *desc = SPEHDialogDescribe(dialog);
 
+#ifndef SPEH_NO_LOG
+	// 0.12.6：这个「网址无效」就是坏 URL 被真正加载时抛出来的，是整条链的源头节点。
+	// 在这里打调用栈，就能直接指认是哪个类/方法在发起加载。
+	if ([desc rangeOfString:@"网址无效"].location != NSNotFound) {
+		static int invalidCount = 0;
+		invalidCount++;
+		if (invalidCount <= 5) {
+			SPEHLog(@"[badurl] 无效URL弹窗 #%d page=%@", invalidCount, SPEHCurrentPageURL());
+			SPEHLog(@"[badurl] #%d 调用栈=%@", invalidCount, SPEHBacktraceText(30));
+		}
+	}
+#endif
+
 	// 只记录，不拦截：畸形 host 的扩展权限请求，把「页面真实 URL」一并打出来，
 	// 用于定位到底是谁在加载这个坏串（是恢复的标签、书签，还是地址栏输入）。
 	if (SPEHIsBadHostExtensionPermission(desc)) {
@@ -962,6 +1094,16 @@ static void SPEHInstallAppOpenDialogHooks(void)
 		SPEHPatchInstanceMethod(wc, @selector(dialogController:willPresentDialog:),
 								(IMP)SPEHWillPresentDialogHook, &gOrigWillPresentDialog);
 		SPEHLog(@"[appdlg] hook willPresentDialog: %s", gOrigWillPresentDialog ? "ok" : "FAILED");
+	}
+
+	// 0.12.6：抓 BrowserController 实例，供启动后的标签页清扫使用
+	Class bcC = NSClassFromString(@"BrowserController");
+	BOOL hasBCInit = (bcC && class_getInstanceMethod(bcC, @selector(init))) ? YES : NO;
+	if (hasBCInit) {
+		SPEHPatchInstanceMethod(bcC, @selector(init), (IMP)SPEHBrowserControllerInitHook, &gOrigBrowserControllerInit);
+		SPEHLog(@"[extperm] hook BrowserController init %s", gOrigBrowserControllerInit ? "ok" : "FAILED");
+	} else {
+		SPEHLog(@"[extperm] BrowserController init 不可 hook（存在=%d）", bcC ? 1 : 0);
 	}
 }
 
@@ -2058,6 +2200,14 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 				(void)closed;
 			});
 		}
+
+#ifndef SPEH_NO_LOG
+		// 0.12.6：进程内扫 Safari 共享目录（SSH 读不到的 datavault 区），定位坏串的持久化落点
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+					   dispatch_get_main_queue(), ^{
+			SPEHLog(@"[extperm] 共享目录命中: %@", SPEHScanSafariSharedDir());
+		});
+#endif
 		SPEHLog(@"dialog=%d reader=%d openinapp=%d smartbanner=%d applink=%d probe=%d",
 				SPEHDialogKillEnabled(), SPEHReaderKillEnabled(),
 				SPEHOpenInAppKillEnabled(), SPEHSmartBannerKillEnabled(),
