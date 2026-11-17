@@ -1,4 +1,4 @@
-// Safari16Enhance 0.12.0 - iOS 16 Safari 增强
+// Safari16Enhance 0.12.1 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.12.0"
+#define SPEH_VERSION "0.12.1"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -455,9 +455,80 @@ static BOOL SPEHActionWantsOpenApp(id dialog)
 }
 
 static IMP gOrigPresentDialog = NULL;
+
+// 0.12.1：畸形 origin 的扩展权限请求兜底。
+//
+// 真机日志实证：Dark Night / Aurora 这类深色扩展会反复弹
+//   「“X”想要访问 huayuarc.xn--cn -928dokq99f6ub31h。」
+// 注意那个 host 里**带空格**，是非法 punycode / 非法域名。Safari 拿它去匹配
+// GrantedPermissionOrigins 永远匹配不上（连 `*://*/*` 都套不住非法 host），
+// 于是每加载一次该页面就重新询问一次；用户点「始终允许」写回去的还是同一条非法
+// origin，于是下一次照样弹 —— 这就是「全部允许 / 全部拒绝都没用」的死循环。
+//
+// 处理：识别「扩展权限请求 + host 含空白」，直接不呈现对话框（这套框背后没有
+// WebKit 导航 decision，不呈现不会卡导航）。该页面本身是「网址无效」的坏链，
+// 扩展在该页不注入没有任何损失。判断条件极窄：正常域名不可能含空白字符。
+static BOOL SPEHIsBadHostExtensionPermission(NSString *desc)
+{
+	if (!desc.length) return NO;
+
+	static NSArray *extKW = nil;
+	static dispatch_once_t onceEP;
+	dispatch_once(&onceEP, ^{
+		extKW = @[@"想要访问", @"wants to access", @"would like to access", @"想要读取"];
+	});
+	BOOL isExtPermission = NO;
+	for (NSString *k in extKW) {
+		if ([desc rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) { isExtPermission = YES; break; }
+	}
+	if (!isExtPermission) return NO;
+
+	// 取「访问 / access」之后的片段，作为疑似 host
+	NSString *tail = nil;
+	NSRange r = [desc rangeOfString:@"想要访问"];
+	if (r.location != NSNotFound) {
+		tail = [desc substringFromIndex:NSMaxRange(r)];
+	} else {
+		NSRange r2 = [desc rangeOfString:@"access" options:NSCaseInsensitiveSearch];
+		if (r2.location == NSNotFound) return NO;
+		tail = [desc substringFromIndex:NSMaxRange(r2)];
+	}
+
+	NSRange stop = [tail rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"。\n"]];
+	if (stop.location != NSNotFound) tail = [tail substringToIndex:stop.location];
+	NSRange msg = [tail rangeOfString:@"message="];
+	if (msg.location != NSNotFound) tail = [tail substringToIndex:msg.location];
+	if (!tail.length) return NO;
+
+	// 域名不可能含空白字符 ⇒ 含空白即畸形 origin，永远匹配不上授权表
+	return [tail rangeOfCharacterFromSet:[NSCharacterSet whitespaceCharacterSet]].location != NSNotFound;
+}
+
 static void SPEHPresentDialogHook(id self, SEL _cmd, id dialog)
 {
 	NSString *desc = SPEHDialogDescribe(dialog);
+
+	if (SPEHIsBadHostExtensionPermission(desc)) {
+		SPEHLog(@"[extperm] 拦截非法 host 权限请求（不呈现） %@", desc);
+		// 兜底：万一 Safari 已把它挂进状态机，0.1s 后取消（确认仍是同一个才动）
+		__weak id weakCtl = self;
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+					   dispatch_get_main_queue(), ^{
+			id s = weakCtl;
+			if (!s) return;
+			@try {
+				if ([s respondsToSelector:@selector(presentedDialog)]) {
+					id cur = ((id (*)(id, SEL))objc_msgSend)(s, @selector(presentedDialog));
+					if (cur == dialog && [s respondsToSelector:@selector(cancelPresentedDialogIfNeeded)]) {
+						((void (*)(id, SEL))objc_msgSend)(s, @selector(cancelPresentedDialogIfNeeded));
+						SPEHLog(@"[extperm] 0.1s 兜底取消生效");
+					}
+				}
+			} @catch (NSException *e) { }
+		});
+		return;
+	}
+
 	BOOL wantsOpen = SPEHTextWantsOpenApp(desc) || SPEHActionWantsOpenApp(dialog);
 	if (wantsOpen) {
 		// 0.9.7 修复：不能直接 return。
