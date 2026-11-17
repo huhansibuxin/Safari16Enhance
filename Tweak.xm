@@ -1,4 +1,4 @@
-// Safari16Enhance 0.11.1 - iOS 16 Safari 增强
+// Safari16Enhance 0.11.2 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -27,7 +27,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.11.1"
+#define SPEH_VERSION "0.11.2"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -829,43 +829,64 @@ static NSString *SPEHDarkModeJS(void)
 {
 	BOOL sysDark = SPEHSystemIsDark();
 
+	// 0.11.2 修复四件事：
+	//  1) 链接已访问/未访问色差太小且被站点 CSS 覆盖 → 用 html#speh-dark-root 提高特异性，
+	//     未访问源色 #000(显示纯白)、已访问源色 #808080(显示中灰)，差距拉到最大。
+	//  2) 搜索关键词高亮(em/strong/mark/b)经 invert 后呈屎黄 → 源色给暗红 #8b0000，
+	//     invert+hue-rotate 保持色相 → 显示亮红。
+	//  3) 返回上一页(bfcache)闪白 → pageshow/popstate 时同帧强制重算 filter(关-开无中间帧)。
+	//  4) 少数派等站点误判 → alreadyDark 只看 documentElement(根)亮度、阈值收紧到 l<25，
+	//     只有根背景确为极深才跳过；不再看 body（body 深但根浅的站点一律照常套深色）。
 	return [NSString stringWithFormat:
 		@"(function(){try{"
 		"var ID='__speh_dark_style',DARK=%@;"
 		"var mq=window.matchMedia?window.matchMedia('(prefers-color-scheme: dark)'):null;"
 		"function on(){return mq?!!mq.matches:!!DARK;}"
-		"function alreadyDark(){try{"
-		"var el=document.body||document.documentElement;"
-		"if(!el)return false;"
+		"function lum(el){try{"
+		"if(!el)return null;"
 		"var bg=window.getComputedStyle?getComputedStyle(el).backgroundColor:'';"
-		"if(!bg||bg==='transparent'||bg.indexOf('rgba(0, 0, 0, 0)')===0)return false;"
+		"if(!bg||bg==='transparent'||bg.indexOf('rgba(0, 0, 0, 0)')===0)return null;"
 		"if(bg.indexOf('rgba')===0){var ps=bg.replace(/rgba?\\(|\\)/g,'').split(',');"
-		"var a=parseFloat(ps[3]);if(!isNaN(a)&&a<0.1)return false;}"
+		"var a=parseFloat(ps[3]);if(!isNaN(a)&&a<0.1)return null;}"
 		"var c=bg.match(/(\\d+)\\D+(\\d+)\\D+(\\d+)/);"
-		"if(c){var l=(parseInt(c[1])*299+parseInt(c[2])*587+parseInt(c[3])*114)/1000;"
-		"return l<70;}}catch(e){}return false;}"
-		"var css=\"html[data-speh-dark='1']{filter:invert(1) hue-rotate(180deg) brightness(0.92) contrast(1.05)!important;background-color:#fff!important;}\""
-		"+\"html[data-speh-dark='1'] img,html[data-speh-dark='1'] video,html[data-speh-dark='1'] canvas,html[data-speh-dark='1'] svg,html[data-speh-dark='1'] iframe{filter:invert(1) hue-rotate(180deg)!important;}\""
-		// 0.11.0：搜索结果标题不再被 invert 染黄。整页滤镜会把元素颜色反相，
-		// 想让链接「显示白」源色要给近黑、想「显示灰」源色要给中灰；hue-rotate 对灰阶无效。
-		// 已访问链接用更深一档灰，反相后可明显区分点没点过。
-		"+\"html[data-speh-dark='1'] a,html[data-speh-dark='1'] a:link,html[data-speh-dark='1'] a span,html[data-speh-dark='1'] a div,html[data-speh-dark='1'] a h1,html[data-speh-dark='1'] a h2,html[data-speh-dark='1'] a h3,html[data-speh-dark='1'] a h4{color:#171717!important;}\""
-		"+\"html[data-speh-dark='1'] a:visited,html[data-speh-dark='1'] a:visited span,html[data-speh-dark='1'] a:visited div,html[data-speh-dark='1'] a:visited h1,html[data-speh-dark='1'] a:visited h2,html[data-speh-dark='1'] a:visited h3,html[data-speh-dark='1'] a:visited h4{color:#616161!important;}\";"
-		"function ensure(){if(document.getElementById(ID))return;"
+		"if(c)return (parseInt(c[1])*299+parseInt(c[2])*587+parseInt(c[3])*114)/1000;"
+		"}catch(e){}return null;}"
+		"function alreadyDark(){var l=lum(document.documentElement);return (l!==null&&l<25);}"
+		// 用 id 选择器把特异性拉满，压过站点自带的 a/visited 规则
+		"var css=\"html#speh-dark-root{filter:invert(1) hue-rotate(180deg) brightness(0.92) contrast(1.05)!important;background-color:#fff!important;}\""
+		"+\"html#speh-dark-root img,html#speh-dark-root video,html#speh-dark-root canvas,html#speh-dark-root svg,html#speh-dark-root iframe{filter:invert(1) hue-rotate(180deg)!important;}\""
+		// 未访问=纯白(#000 源)，已访问=中灰(#808080 源)，两档差距拉到最大
+		"+\"html#speh-dark-root a,html#speh-dark-root a:link,html#speh-dark-root a span,html#speh-dark-root a div,html#speh-dark-root a h1,html#speh-dark-root a h2,html#speh-dark-root a h3,html#speh-dark-root a h4{color:#000!important;}\""
+		"+\"html#speh-dark-root a:visited,html#speh-dark-root a:visited span,html#speh-dark-root a:visited div,html#speh-dark-root a:visited h1,html#speh-dark-root a:visited h2,html#speh-dark-root a:visited h3,html#speh-dark-root a:visited h4{color:#808080!important;}\""
+		// 关键词高亮屎黄→红：源色暗红 #8b0000，反相后显示亮红
+		"+\"html#speh-dark-root em,html#speh-dark-root strong,html#speh-dark-root b,html#speh-dark-root mark,html#speh-dark-root a em,html#speh-dark-root a strong,html#speh-dark-root a b,html#speh-dark-root a mark{color:#8b0000!important;background-color:transparent!important;}\";"
+		"var _oldId=null;"
+		"function ensure(){var he=document.documentElement;"
+		"if(document.getElementById(ID))return;"
+		"_oldId=he.getAttribute('id');"
+		"he.setAttribute('id','speh-dark-root');"
 		"var s=document.createElement('style');s.id=ID;s.textContent=css;"
 		"(document.head||document.documentElement).appendChild(s);}"
-		"function clear(){document.documentElement.removeAttribute('data-speh-dark');"
+		"function clear(){var he=document.documentElement;"
+		"he.removeAttribute('data-speh-dark');"
+		"if(_oldId!==null){if(_oldId)he.setAttribute('id',_oldId);else he.removeAttribute('id');_oldId=null;}"
 		"var s=document.getElementById(ID);if(s&&s.parentNode)s.parentNode.removeChild(s);}"
-		// 可重入：documentStart 阶段 body 还没建立，会先按浅色套上；DOMContentLoaded
-		// 之后 body 有了再复查一次，若网页本身深色则撤销，避免把深色页反转成白。
 		"function apply(){if(!on()){clear();return;}"
 		"var dark=alreadyDark();"
 		"var has=document.documentElement.getAttribute('data-speh-dark')==='1';"
 		"if(dark){if(has)clear();return;}"
 		"if(has)return;ensure();"
 		"document.documentElement.setAttribute('data-speh-dark','1');}"
+		// 返回闪白：bfcache 恢复时同帧内 filter 关→强制 reflow→开，无中间白帧
+		"function refresh(){var he=document.documentElement;"
+		"if(he.getAttribute('data-speh-dark')!=='1'){apply();return;}"
+		"he.style.filter='none';void he.offsetWidth;he.style.filter='';}"
 		"apply();"
 		"if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',apply,{once:true});}"
+		// 少数派等异步设主题的站点：DOMContentLoaded 后 350ms 再复查一次
+		"setTimeout(apply,350);"
+		"window.addEventListener('pageshow',function(){refresh();apply();},true);"
+		"window.addEventListener('popstate',function(){refresh();},true);"
 		"if(mq&&!window.__spehDarkWatch){window.__spehDarkWatch=1;"
 		"var h=function(){clear();apply();};"
 		"if(mq.addEventListener)mq.addEventListener('change',h);"
