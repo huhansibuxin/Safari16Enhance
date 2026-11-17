@@ -1,4 +1,4 @@
-// Safari16Enhance 0.12.4 - iOS 16 Safari 增强
+// Safari16Enhance 0.12.5 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.12.4"
+#define SPEH_VERSION "0.12.5"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -507,6 +507,195 @@ static BOOL SPEHIsBadHostExtensionPermission(NSString *desc)
 	return [tail rangeOfCharacterFromSet:[NSCharacterSet whitespaceCharacterSet]].location != NSNotFound;
 }
 
+// MARK: - 扩展权限表净化（0.12.5 根治）
+//
+// 病灶：Extensions.plist 里各扩展的 xxxPermissionOrigins 字典中有一条 key，
+//   形如 星号 冒号 斜杠 斜杠 星号 点 huayuarc.xn--cn -928dokq99f6ub31h 斜杠 星号
+//   （host 中间带空格，真实含义是「huayuarc.cn 怎么打不开」这整句中文被当成域名）。
+// 这种 key 不是合法的 WebKit match pattern，解析必然失败，后果是双向的：
+//   1) 每次往该 origin 注入都判「未授权」→ 反复弹「想要访问」；
+//   2) 连同一条字典里的全站通配授权也一起失效 → 部分网站扩展压根不注入，
+//      表现就是「这些网站点了 DARK 按钮也不变黑，工具栏还挂个三角感叹号」。
+// 用户在弹窗上点允许/不允许，Safari 都只会把同一串坏 key 写回去（实测 Granted 变 Revoked），
+// 所以这个循环永远出不来。唯一根治点：在 Safari 读取这份 plist 之前把它清掉 —— 因此放在 ctor 最前面。
+static int SPEHSanitizeExtensionPlist(void)
+{
+	NSString *home = NSHomeDirectory();
+	if (!home.length) return -1;
+	NSString *path = [home stringByAppendingPathComponent:@"Library/Safari/WebExtensions/Extensions.plist"];
+
+
+	NSFileManager *fm = [NSFileManager defaultManager];
+	if (![fm fileExistsAtPath:path]) return -2;
+
+	NSData *data = [NSData dataWithContentsOfFile:path];
+	if (!data.length) return -3;
+
+	id root = nil;
+	@try {
+		root = [NSPropertyListSerialization propertyListWithData:data
+														options:NSPropertyListMutableContainersAndLeaves
+														 format:NULL
+														  error:nil];
+	} @catch (NSException *e) { root = nil; }
+	if (![root isKindOfClass:[NSDictionary class]]) return -4;
+
+	NSMutableDictionary *rootDict = (NSMutableDictionary *)root;
+	int removed = 0;
+
+	for (NSString *extKey in [[rootDict allKeys] copy]) {
+		id ext = [rootDict objectForKey:extKey];
+		if (![ext isKindOfClass:[NSDictionary class]]) continue;
+		NSMutableDictionary *extDict = (NSMutableDictionary *)ext;
+
+		for (NSString *field in [[extDict allKeys] copy]) {
+			if (![field hasSuffix:@"Origins"]) continue;   // Granted/Revoked/Accessible PermissionOrigins
+			id val = [extDict objectForKey:field];
+			if (![val isKindOfClass:[NSDictionary class]]) continue;
+
+			NSMutableDictionary *origins = [NSMutableDictionary dictionaryWithDictionary:(NSDictionary *)val];
+			for (id k in [[origins allKeys] copy]) {
+				if (![k isKindOfClass:[NSString class]]) { [origins removeObjectForKey:k]; removed++; continue; }
+				NSString *ks = (NSString *)k;
+				BOOL bad = NO;
+				for (NSUInteger i = 0; i < ks.length; i++) {
+					unichar c = [ks characterAtIndex:i];
+					if (c <= 0x20 || c > 0x7e) { bad = YES; break; }   // 空白 + 非 ASCII 一律判非法
+				}
+				if (bad) { [origins removeObjectForKey:k]; removed++; }
+			}
+			[extDict setObject:origins forKey:field];
+		}
+	}
+
+	if (removed <= 0) return 0;
+
+	NSData *out = [NSPropertyListSerialization dataWithPropertyList:root
+															format:NSPropertyListXMLFormat_v1_0
+														   options:0
+															 error:nil];
+	if (!out.length) return -5;
+	if (![out writeToFile:path atomically:YES]) return -6;
+	return removed;
+}
+
+// 判断一个 URL 字符串的 host 段是否非法（含空白 / 含非 ASCII）。
+static BOOL SPEHStringIsMalformedHost(NSString *s)
+{
+	if (![s isKindOfClass:[NSString class]] || !s.length) return NO;
+	for (NSUInteger i = 0; i < s.length; i++) {
+		if ([s characterAtIndex:i] > 0x7e) return YES;
+	}
+	NSRange r = [s rangeOfString:@"://"];
+	if (r.location == NSNotFound) return NO;
+	NSUInteger start = NSMaxRange(r);
+	if (start >= s.length) return NO;
+	NSRange stop = [s rangeOfString:@"/" options:0 range:NSMakeRange(start, s.length - start)];
+	NSString *host = (stop.location == NSNotFound)
+		? [s substringFromIndex:start]
+		: [s substringWithRange:NSMakeRange(start, stop.location - start)];
+	return [host rangeOfCharacterFromSet:[NSCharacterSet whitespaceCharacterSet]].location != NSNotFound;
+}
+
+// 0.12.5：找出持有畸形 URL 的「幽灵标签页」并关掉。
+// 证据：权限弹窗的对象永远不是当前页面（页面是知乎 / bing / zol，弹窗却固定是那串
+// 「huayuarc.cn 怎么打不开」），而「网址无效」弹窗和它成对出现 —— 说明浏览器里还挂着一个
+// URL 就是这串东西的标签页，它每次被恢复 / 重载，就会走一遍：
+//   报「网址无效」→ 扩展拿它的 origin 请求授权 → 用户点允许/不允许都写回同一条坏 key。
+// 会话状态存在 datavault 保护区（SSH 读不到），只能在进程内把这页关掉。
+static int SPEHCloseBadTabs(void)
+{
+	Class bcCls = NSClassFromString(@"BrowserController");
+	if (!bcCls) return -1;
+
+	id bc = nil;
+	for (NSString *selName in @[@"sharedController", @"mainBrowserController"]) {
+		SEL s = NSSelectorFromString(selName);
+		if (![bcCls respondsToSelector:s]) continue;
+		@try { bc = ((id (*)(id, SEL))objc_msgSend)(bcCls, s); } @catch (NSException *e) { bc = nil; }
+		if (bc) break;
+	}
+	if (!bc) return -2;
+
+	id tabs = nil;
+	if ([bc respondsToSelector:@selector(tabDocuments)]) {
+		@try { tabs = ((id (*)(id, SEL))objc_msgSend)(bc, @selector(tabDocuments)); } @catch (NSException *e) { tabs = nil; }
+	}
+	if (!tabs) {
+		for (NSString *ivName in @[@"_tabDocuments", @"_tabs"]) {
+			Ivar iv = class_getInstanceVariable(object_getClass(bc), ivName.UTF8String);
+			if (!iv) continue;
+			@try { tabs = object_getIvar(bc, iv); } @catch (NSException *e) { tabs = nil; }
+			if (tabs) break;
+		}
+	}
+	if (!tabs) return -3;
+
+	NSArray *list = nil;
+	@try {
+		if ([tabs respondsToSelector:@selector(allObjects)]) list = [tabs allObjects];
+		else if ([tabs isKindOfClass:[NSArray class]]) list = (NSArray *)tabs;
+	} @catch (NSException *e) { list = nil; }
+	if (![list isKindOfClass:[NSArray class]] || !list.count) return -4;
+
+	int closed = 0;
+	for (id tab in list) {
+		NSString *u = nil;
+		for (NSString *selName in @[@"url", @"URL", @"currentURL", @"uncommittedURL"]) {
+			SEL s = NSSelectorFromString(selName);
+			if (![tab respondsToSelector:s]) continue;
+			@try {
+				id v = ((id (*)(id, SEL))objc_msgSend)(tab, s);
+				if ([v isKindOfClass:[NSURL class]]) { u = [(NSURL *)v absoluteString]; break; }
+			} @catch (NSException *e) { }
+		}
+		if (!SPEHStringIsMalformedHost(u)) continue;
+		SPEHLog(@"[extperm] 关闭畸形 URL 标签页: %@", u);
+		SEL closeSel = NSSelectorFromString(@"close");
+		if (![tab respondsToSelector:closeSel]) closeSel = NSSelectorFromString(@"closeTab");
+		if ([tab respondsToSelector:closeSel]) {
+			@try { ((void (*)(id, SEL))objc_msgSend)(tab, closeSel); closed++; } @catch (NSException *e) { }
+		}
+	}
+	return closed;
+}
+
+#ifndef SPEH_NO_LOG
+// 0.12.5 诊断：畸形 host 权限请求被触发时打一份调用栈，直接指认是哪个类/方法在请求。
+static NSString *SPEHBacktraceText(NSUInteger limit)
+{
+	NSArray *sym = [NSThread callStackSymbols];
+	if (!sym.count) return @"(no symbols)";
+	NSUInteger n = sym.count < limit ? sym.count : limit;
+	NSMutableArray *keep = [NSMutableArray arrayWithCapacity:n];
+	for (NSUInteger i = 0; i < n; i++) [keep addObject:sym[i]];
+	return [keep componentsJoinedByString:@" <- "];
+}
+
+// 0.12.5 诊断：把某个类的全部方法名列出来（含继承链），用于找可 hook 的入口。
+static NSString *SPEHMethodNamesOfClass(NSString *clsName)
+{
+	Class cls = NSClassFromString(clsName);
+	if (!cls) return @"(class not found)";
+	NSMutableArray *out = [NSMutableArray array];
+	Class cur = cls;
+	int depth = 0;
+	while (cur && cur != [NSObject class] && depth < 4) {
+		unsigned int mc = 0;
+		Method *ms = class_copyMethodList(cur, &mc);
+		for (unsigned int i = 0; i < mc; i++) {
+			NSString *s = NSStringFromSelector(method_getName(ms[i]));
+			if (s.length) [out addObject:[NSString stringWithFormat:@"%@-%@", depth ? @"^" : @"", s]];
+		}
+		if (ms) free(ms);
+		cur = class_getSuperclass(cur);
+		depth++;
+	}
+	if (!out.count) return @"(no methods)";
+	return [out componentsJoinedByString:@" "];
+}
+#endif
+
 // 以下诊断只在 withlog 变体里编译：no-log 下 SPEHLog 是空宏，这些函数会变成未引用（-Werror）。
 #ifndef SPEH_NO_LOG
 // 诊断用：取当前窗口里第一个 WKWebView 的 URL（不 import WebKit，纯运行时类型判断）
@@ -650,6 +839,11 @@ static void SPEHPresentDialogHook(id self, SEL _cmd, id dialog)
 		if (badCount <= 15) {
 			SPEHLog(@"[extperm] #%d page=%@", badCount, SPEHCurrentPageURL());
 			SPEHLog(@"[extperm] #%d dialog=%@", badCount, SPEHObjectDump(dialog));
+			if (badCount <= 3) {
+				SPEHLog(@"[extperm] #%d 调用栈=%@", badCount, SPEHBacktraceText(28));
+				SPEHLog(@"[extperm] #%d banner方法=%@", badCount, SPEHMethodNamesOfClass(@"SFWebExtensionPermissionBanner"));
+				SPEHLog(@"[extperm] #%d 权限API方法=%@", badCount, SPEHMethodNamesOfClass(@"WBSWebExtensionAPIPermissionsObjC"));
+			}
 		} else if (badCount == 16) {
 			SPEHLog(@"[extperm] 后续同类弹窗不再记录（累计已超 15 次）");
 		}
@@ -1849,6 +2043,21 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 #ifndef SPEH_NO_LOG
 		SPEHLog(@"log file = %@", SPEHLogPath());
 #endif
+		// 0.12.5：必须在任何 hook/WebExtension 控制器初始化之前洗掉非法 origin key，
+		// 否则 Safari 已经把那条坏 pattern 读进内存，清磁盘就没意义了。
+		int sanitized = SPEHSanitizeExtensionPlist();
+		SPEHLog(@"[extperm] 权限表净化 removed=%d（0=无脏数据 -1..-6=异常码）", sanitized);
+		(void)sanitized;   // no-log 变体里 SPEHLog 是空宏，避免 -Wunused 被 -Werror 拦下
+
+		// 0.12.5：启动后扫两遍，把 URL 就是那串畸形内容的标签页关掉（源头在会话恢复里）。
+		for (NSNumber *delay in @[ @3.0, @10.0 ]) {
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+						   dispatch_get_main_queue(), ^{
+				int closed = SPEHCloseBadTabs();
+				SPEHLog(@"[extperm] 清扫畸形标签页 closed=%d（-1..-4=枚举失败码）", closed);
+				(void)closed;
+			});
+		}
 		SPEHLog(@"dialog=%d reader=%d openinapp=%d smartbanner=%d applink=%d probe=%d",
 				SPEHDialogKillEnabled(), SPEHReaderKillEnabled(),
 				SPEHOpenInAppKillEnabled(), SPEHSmartBannerKillEnabled(),
