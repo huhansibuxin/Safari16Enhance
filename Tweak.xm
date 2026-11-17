@@ -1,4 +1,4 @@
-// Safari16Enhance 0.11.0 - iOS 16 Safari 增强
+// Safari16Enhance 0.11.1 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -27,7 +27,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.11.0"
+#define SPEH_VERSION "0.11.1"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -223,9 +223,6 @@ static void SPEHShowToast(NSString *text)
 		}];
 	});
 }
-
-// 0.11.0 原生栏兜底扫描（定义在深色模块，转发声明供注入时机调用）
-void SPEHScanAndDarkenBarsFromWindow(void);
 
 static BOOL SPEHMethodReturnsBool(Method m)
 {
@@ -817,7 +814,7 @@ static void SPEHApplyOpenInAppJSAttempt(id webView, int attempt)
 // 只走 evaluateJavaScript，绝不碰 configuration / userContentController / processPool
 // （0.8.0 血泪教训：碰了会搞坏 Userscripts / Dark Night 等第三方扩展）。
 
-// 系统深浅色（原生侧）：documentStart 脚本与原生栏 hook 共用
+// 系统深浅色（原生侧）：documentStart 脚本的 DARK 兜底值
 static BOOL SPEHSystemIsDark(void)
 {
 	@try {
@@ -958,149 +955,6 @@ static void SPEHInstallDarkStartHooks(void)
 	SPEHLog(@"[dark] init hooks: frameConfig=%s config=%s",
 			gOrigWVInitWithFrameConfig ? "ok" : "none",
 			gOrigWVInitWithConfig ? "ok" : "none");
-}
-
-// ─── 0.11.0 原生栏深色：状态栏 / 收缩态地址栏 ───────────────────────────
-//
-// 网页深色靠 CSS filter，但 Safari 自己的原生栏不在网页 DOM 里，滤镜管不到：
-//   · 顶部状态栏区域：浅色网页时 Safari 用白底 + 深色图标；
-//   · 底部地址栏：展开时透明（正常），滚动后收缩成白底实色条。
-// 不猜私有类名（dyld cache 里取不到），改用「颜色是白 + 形状是贴边横条 + 深色模式」
-// 三条件拦截，两条栏一次覆盖，白天完全不碰。
-//   · hook setBackgroundColor: → 处理滚动收缩时「动态变白」；
-//   · 定时/事件后扫描视图树 → 处理初始化时就已是白色的栏（兜底）；
-//   · hook preferredStatusBarStyle → 图标/时间变白，避免黑底黑字。
-static IMP gOrigUIViewSetBg = NULL;
-static BOOL gSPEHDarkBarEnabled = NO;
-static BOOL gSPEHDarkBarInHook = NO;   // 重入哨兵：convertRect 可能间接触发 setBg，嵌套调用直接放行
-
-static BOOL SPEHColorIsWhiteish(UIColor *c)
-{
-	if (!c) return NO;
-	CGFloat r = 0, g = 0, b = 0, a = 0;
-	if (![c getRed:&r green:&g blue:&b alpha:&a]) return NO;
-	return a > 0.5 && r > 0.88 && g > 0.88 && b > 0.88;
-}
-
-// 视图在 window 坐标下是否是贴顶或贴底的整宽横条
-static BOOL SPEHViewIsEdgeBar(UIView *v)
-{
-	UIWindow *win = v.window;
-	if (!win) return NO;
-	CGRect r = [v convertRect:v.bounds toView:win];
-	CGFloat sw = win.bounds.size.width, sh = win.bounds.size.height;
-	if (sw <= 0 || sh <= 0) return NO;
-	if (r.size.width < sw * 0.75) return NO;
-	if (r.size.height < 18 || r.size.height > 130) return NO;
-	BOOL top = (r.origin.y <= 2);
-	BOOL bottom = (r.origin.y + r.size.height >= sh - 44);
-	return top || bottom;
-}
-
-// 把横条里的深色文字改成白色（黑底黑字看不见）
-static void SPEHWhitenLabelsInView(UIView *v, int depth)
-{
-	if (depth > 6) return;
-	for (UIView *sub in v.subviews) {
-		if ([sub isKindOfClass:[UILabel class]]) {
-			UILabel *lb = (UILabel *)sub;
-			UIColor *tc = lb.textColor;
-			CGFloat r = 0, g = 0, b = 0, a = 0;
-			if (tc && [tc getRed:&r green:&g blue:&b alpha:&a] &&
-				a > 0.3 && r < 0.6 && g < 0.6 && b < 0.6) {
-				lb.textColor = [UIColor whiteColor];
-			}
-		}
-		SPEHWhitenLabelsInView(sub, depth + 1);
-	}
-}
-
-static void SPEHDarkenBarView(UIView *v)
-{
-	if (!gSPEHDarkBarEnabled) return;
-	@try {
-		if (!SPEHViewIsEdgeBar(v)) return;
-		if (!SPEHColorIsWhiteish(v.backgroundColor)) return;
-		v.backgroundColor = [UIColor blackColor];
-		SPEHWhitenLabelsInView(v, 0);
-		SPEHLog(@"[darkbar] 命中 %@ → 黑", NSStringFromClass([v class]));
-	} @catch (NSException *e) { }
-}
-
-static void SPEHUIViewSetBgHook(UIView *self, SEL _cmd, UIColor *color)
-{
-	if (gSPEHDarkBarEnabled && !gSPEHDarkBarInHook) {
-		gSPEHDarkBarInHook = YES;
-		@try {
-			if (SPEHColorIsWhiteish(color) && SPEHViewIsEdgeBar(self)) {
-				color = [UIColor blackColor];
-				// label 变白放到下一个 runloop，避免布局中途改 textColor 触发递归
-				__weak UIView *wv = self;
-				dispatch_async(dispatch_get_main_queue(), ^{
-					if (wv) SPEHWhitenLabelsInView(wv, 0);
-				});
-				SPEHLog(@"[darkbar] setBg 拦截 %@", NSStringFromClass([self class]));
-			}
-		} @catch (NSException *e) { }
-		gSPEHDarkBarInHook = NO;
-	}
-	if (gOrigUIViewSetBg)
-		((void (*)(id, SEL, id))gOrigUIViewSetBg)(self, _cmd, color);
-}
-
-// 兜底扫描：初始化时就已经是白底的栏，setBg 拦截不到，这里补一次
-static void SPEHScanAndDarkenBars(UIView *root, int depth)
-{
-	if (depth > 14) return;
-	for (UIView *v in root.subviews) {
-		SPEHDarkenBarView(v);
-		SPEHScanAndDarkenBars(v, depth + 1);
-	}
-}
-
-void SPEHScanAndDarkenBarsFromWindow(void)
-{
-	if (!gSPEHDarkBarEnabled) return;
-	@try {
-		UIWindow *win = SPEHKeyWindow();
-		if (win) SPEHScanAndDarkenBars(win, 0);
-	} @catch (NSException *e) { }
-}
-
-// 状态栏图标/时间：深色时强制浅色内容（白字），否则黑底黑字看不见
-static IMP gOrigPreferredStatusBarStyle = NULL;
-static NSInteger SPEHPreferredStatusBarStyleHook(id self, SEL _cmd)
-{
-	NSInteger orig = UIStatusBarStyleDefault;
-	if (gOrigPreferredStatusBarStyle)
-		orig = ((NSInteger (*)(id, SEL))gOrigPreferredStatusBarStyle)(self, _cmd);
-	if (gSPEHDarkBarEnabled) return UIStatusBarStyleLightContent;
-	return orig;
-}
-
-static void SPEHInstallNativeDarkBarHooks(void)
-{
-	gSPEHDarkBarEnabled = SPEHDarkModeEnabled() && SPEHSystemIsDark();
-	if (!gSPEHDarkBarEnabled) return;
-
-	@try {
-		Class uvCls = [UIView class];
-		SEL bgSel = @selector(setBackgroundColor:);
-		Method bgm = class_getInstanceMethod(uvCls, bgSel);
-		if (bgm) SPEHPatchInstanceMethod(uvCls, bgSel, (IMP)SPEHUIViewSetBgHook, &gOrigUIViewSetBg);
-
-		// UIViewController 层改状态栏样式（顶层 VC 的 preferred 会被系统采纳）
-		Class vcCls = [UIViewController class];
-		SEL pssSel = @selector(preferredStatusBarStyle);
-		Method psm = class_getInstanceMethod(vcCls, pssSel);
-		if (psm) SPEHPatchInstanceMethod(vcCls, pssSel, (IMP)SPEHPreferredStatusBarStyleHook, &gOrigPreferredStatusBarStyle);
-
-		SPEHLog(@"[darkbar] installed: setBg=%s statusStyle=%s",
-				gOrigUIViewSetBg ? "ok" : "FAILED",
-				gOrigPreferredStatusBarStyle ? "ok" : "FAILED");
-	} @catch (NSException *e) {
-		SPEHLog(@"[darkbar] install 异常 %@", e.reason);
-	}
 }
 
 // 历史踩坑（0.8.0，保留警示）：webView 已存在后改 webView.configuration /
@@ -1300,7 +1154,6 @@ static void SPEHWVDidMoveToWindowHook(UIView *self, SEL _cmd)
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 			SPEHApplyOpenInAppJS(weakSelf);
 			SPEHApplyDarkModeJS(weakSelf);
-			SPEHScanAndDarkenBarsFromWindow();   // 0.11.0 原生栏兜底
 		});
 	}
 }
@@ -1323,7 +1176,6 @@ static void SPEHTabDidFinishNavigationHook(id self, SEL _cmd, id webView, id nav
 			dispatch_get_main_queue(), ^{
 				SPEHApplyOpenInAppJS(weakWV);
 				SPEHApplyDarkModeJS(weakWV);
-				SPEHScanAndDarkenBarsFromWindow();   // 0.11.0 原生栏兜底
 			});
 	}
 }
@@ -1850,7 +1702,6 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 		SPEHInstallOpenInAppHooks();
 		SPEHInstallDarkStartHooks();   // 0.11.0：documentStart 注入，消除闪白
 		SPEHInstallAppLinkHooks();
-		SPEHInstallNativeDarkBarHooks();  // 0.11.0：状态栏/收缩地址栏变黑
 		SPEHInstallURLBarSwipeHooks();
 	}
 }
