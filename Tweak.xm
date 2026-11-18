@@ -1,4 +1,4 @@
-// Safari16Enhance 0.13.5 - iOS 16 Safari 增强
+// Safari16Enhance 0.13.6 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.13.5"
+#define SPEH_VERSION "0.13.6"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -1550,6 +1550,61 @@ static void SPEHGrTouchesBeganHook(id self, SEL _cmd, NSSet *touches, UIEvent *e
 	}
 }
 
+// 0.13.6 布满方案：hook SFCapsuleView 的 setFrame:，系统每次布局时改写三个胶囊的呈现：
+//   居中那个 → 横向铺满整条地址栏（x=0, width=屏宽），隐藏取消
+//   左右邻居 → hidden=YES + 关交互（看不见、hitTest 也不命中，物理上消掉边缘切页落点）
+// 拦截 setFrame 的参数再调原始 IMP，避免「改完又被系统 layout 改回去」的反复横跳。
+static IMP gOrigCapsuleSetFrame = NULL;
+#ifndef SPEH_NO_LOG
+static int gFillLogN = 0;
+#endif
+
+static void SPEHCapsuleSetFrameHook(id self, SEL _cmd, CGRect f)
+{
+	UIView *cap = (UIView *)self;
+	CGRect nf = f;
+	BOOL isCenter = NO, isSide = NO;
+
+	do {
+		if (!SPEHURLBarSwipeKillEnabled()) break;
+		// 只认贴屏幕底部、高度像一条胶囊、宽度接近屏宽的视图（排除总览态缩略胶囊）
+		if (f.size.height < 28 || f.size.height > 70) break;
+		CGFloat winW = [UIScreen mainScreen].bounds.size.width;
+		CGFloat winH = [UIScreen mainScreen].bounds.size.height;
+		if (f.size.width < winW * 0.5 || f.size.width > winW * 1.2) break;
+		if (f.origin.y < winH - 200) break;
+
+		CGFloat cx = CGRectGetMidX(f);
+		if (fabs(cx - winW / 2.0) < winW * 0.15) {
+			isCenter = YES;
+			nf = CGRectMake(0, f.origin.y, winW, f.size.height);
+		} else {
+			isSide = YES;
+		}
+	} while (0);
+
+#ifndef SPEH_NO_LOG
+	if (gFillLogN < 30 && (isCenter || isSide)) {
+		gFillLogN++;
+		SPEHLog(@"[urlprobe] fillBar %@ f=(%.0f,%.0f,%.0f,%.0f) -> (%.0f,%.0f,%.0f,%.0f)",
+				isCenter ? @"FILL" : @"SIDE-HIDE",
+				f.origin.x, f.origin.y, f.size.width, f.size.height,
+				nf.origin.x, nf.origin.y, nf.size.width, nf.size.height);
+	}
+#endif
+
+	if (isCenter) {
+		if ([cap isHidden]) [cap setHidden:NO];
+	} else if (isSide) {
+		if (![cap isHidden]) [cap setHidden:YES];
+		if ([cap isUserInteractionEnabled]) [cap setUserInteractionEnabled:NO];
+	}
+
+	if (gOrigCapsuleSetFrame) {
+		((void (*)(id, SEL, CGRect))gOrigCapsuleSetFrame)(self, _cmd, nf);
+	}
+}
+
 static IMP gOrigCapsuleHitTest = NULL;
 static int gCapsuleLogN = 0;
 
@@ -1635,6 +1690,10 @@ static void SPEHInstallURLBarSwipeHooks(void)
 	SPEHPatchInstanceMethod(capCls, NSSelectorFromString(@"hitTest:withEvent:"),
 		(IMP)SPEHCapsuleViewHitTestHook, &gOrigCapsuleHitTest);
 
+	// 0.13.6：布满方案 —— hook setFrame:，中间胶囊铺满、左右邻居隐藏
+	SPEHPatchInstanceMethod(capCls, NSSelectorFromString(@"setFrame:"),
+		(IMP)SPEHCapsuleSetFrameHook, &gOrigCapsuleSetFrame);
+
 	// 0.13.5：单击边缘切页的真正拦截 —— hook 手势层 touchesBegan，边缘 tap 吞掉。
 	Class grCls = [UIGestureRecognizer class];
 	SEL tbSel = NSSelectorFromString(@"touchesBegan:withEvent:");
@@ -1642,9 +1701,10 @@ static void SPEHInstallURLBarSwipeHooks(void)
 		SPEHPatchInstanceMethod(grCls, tbSel, (IMP)SPEHGrTouchesBeganHook, &gOrigGRTouchesBegan);
 	}
 
-	SPEHLog(@"[urlswipe] hooks addGesture=%s panSetTrans=%s capsuleHitTest=%s grTouchesBegan=%s cls=%d",
+	SPEHLog(@"[urlswipe] hooks addGesture=%s panSetTrans=%s capsuleHitTest=%s capsuleSetFrame=%s grTouchesBegan=%s cls=%d",
 			gOrigAddGesture ? "ok" : "FAIL", gOrigPanSetTranslation ? "ok" : "FAIL",
-			gOrigCapsuleHitTest ? "ok" : "FAIL", gOrigGRTouchesBegan ? "ok" : "FAIL", capCls ? 1 : 0);
+			gOrigCapsuleHitTest ? "ok" : "FAIL", gOrigCapsuleSetFrame ? "ok" : "FAIL",
+			gOrigGRTouchesBegan ? "ok" : "FAIL", capCls ? 1 : 0);
 }
 
 // 找到胶囊栏，把它所有 pan 打上标记；之后 setTranslation 里只吃掉横向分量，
