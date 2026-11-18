@@ -6,11 +6,21 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15
+    # 2026-11-18: arm64 (macos-15) 池子容量紧张、长时间 queued，改用 Intel 官方 label：
+    # 4 vCPU / 14GB RAM（arm64 是 3 vCPU / 7GB），可用到 2027-08。
+    # Theos 交叉编译到 iPhoneOS SDK 与 runner 自身架构无关，产物仍是 arm64。
+    runs-on: macos-15-intel
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Show runner info
+        run: |
+          uname -a
+          sw_vers
+          echo "arch=$(uname -m) cpu=$(sysctl -n hw.ncpu) mem=$(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 ))GB"
+          df -h /
 
       # roothide REQUIRES the roothide theos fork; upstream theos does not
       # know the roothide package scheme.
