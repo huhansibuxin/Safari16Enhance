@@ -1,4 +1,4 @@
-// Safari16Enhance 0.13.1 - iOS 16 Safari 增强
+// Safari16Enhance 0.13.2 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.13.1"
+#define SPEH_VERSION "0.13.2"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -631,6 +631,21 @@ static NSString *SPEHOpenInAppJS(void)
 			 "if(!window.__speh)window.__speh={ready:0,click:0,s:0,dirty:1};"
 			 "var first=!window.__speh.ready;window.__speh.ready=1;"
 			 "var r={m:0,e:0,link:0};"
+			 // 0.13.2：App 引流卡片特征词（Bing / 起点通用），MO 即时拆除与全树扫描共用
+			 "var KWS=['App 内打开','App内打开','在App内打开','在 App 内打开','打开App','打开 App','open in app','Open in App','OPEN IN APP',"
+			 "'继续搜索','搜你所想','搜你所想，有求必应','搜你所想,有求必应','微软必应APP','使用必应应用搜索','在必应应用中打开',"
+			 "'继续浏览精彩内容','在此处浏览','起点读书APP','海量好书','新人免费','免费读'];"
+			 // 把含特征词的节点整块拆掉：向上找 fixed/absolute/sticky 或全宽容器，排除 body/script
+			 "var rip=function(node){try{var bx=node,dp=0,root=null;"
+			 "while(bx&&bx.nodeType===1&&dp<10){var bs=getComputedStyle(bx);"
+			 "if(bs.position==='fixed'||bs.position==='sticky'||bs.position==='absolute'){root=bx;break;}"
+			 "if(bx.getBoundingClientRect().width>=Math.max(240,window.innerWidth*0.6)){root=bx;break;}"
+			 "bx=bx.parentNode;dp++;}"
+			 "if(!root)root=node;if(root===document.body||root===document.documentElement)root=node;"
+			 "if(root.parentNode){root.parentNode.removeChild(root);r.e++;}}catch(q){}};"
+			 // 只看新增节点的 textContent，命中特征词才 rip；不做全树遍历，开销与节点数成正比
+			 "var hitKw=function(txt){if(!txt||txt.length>200)return false;for(var z=0;z<KWS.length;z++)"
+			 "if(txt.indexOf(KWS[z])>=0)return true;return false;};"
 			 // ① 删 apple-itunes-app / smartbanner meta（Smart App Banner 的触发源头）
 			 "var killMeta=function(){var ms=document.querySelectorAll('meta[name=apple-itunes-app],meta[name=smartbanner]');"
 			 "for(var i=0;i<ms.length;i++){try{ms[i].parentNode.removeChild(ms[i]);r.m++;}catch(q){}}};"
@@ -638,9 +653,15 @@ static NSString *SPEHOpenInAppJS(void)
 			 // meta 可能在文档开始时还没解析出来：只观察新插入的 META 节点，不做整树遍历
 			 "if(!window.__speh.mo){try{var mo=new MutationObserver(function(muts){window.__speh.dirty=1;"
 			 "for(var a=0;a<muts.length;a++){var ad=muts[a].addedNodes;"
-			 "for(var b=0;b<ad.length;b++){var n=ad[b];if(!n||n.tagName!=='META')continue;"
+			 "for(var b=0;b<ad.length;b++){var n=ad[b];if(!n)continue;"
+			 // 文本节点：nodeValue 是纯文本，匹配命中就连父节点一起拆（最廉价路径）
+			 "if(n.nodeType===3){if(hitKw(n.nodeValue))rip(n.parentElement||n);continue;}"
+			 "if(n.nodeType!==1)continue;"
 			 "var nm=String((n.getAttribute&&n.getAttribute('name'))||'').toLowerCase();"
-			 "if(nm==='apple-itunes-app'||nm==='smartbanner'){try{n.parentNode.removeChild(n);}catch(q){}}}}});"
+			 "if(nm==='apple-itunes-app'||nm==='smartbanner'){try{n.parentNode.removeChild(n);}catch(q){}}"
+			 // 0.13.2：只查新增节点自身短文本，超过 60 个直接子元素的容器跳过（卡片不会有）：
+			 // 不遍历整棵子树、不对每个后代取 textContent，避免重 DOM 页面 O(n^2) 卡主线程。
+			 "if(n.childElementCount>60)continue;if(hitKw(n.textContent))rip(n);}}});"
 			 // 0.9.8：同时观察 style/class 属性变化——浮层若是预置节点靠 CSS 显示（非动态插入），
 			 // childList 捕获不到，必须靠 attributes 置脏，否则 dirty 方案会漏卡片。回调仅置标志，开销极小。
 			 "mo.observe(document.documentElement||document,{childList:true,subtree:true,attributes:true,attributeFilter:['style','class']});"
@@ -659,7 +680,7 @@ static NSString *SPEHOpenInAppJS(void)
 			 "while(t&&t.tagName!=='A'){t=t.parentNode;}if(!t)return;"
 			 "var h=t.getAttribute&&t.getAttribute('href');if(!ok(h)){"
 			 "e.preventDefault();e.stopPropagation();window.__speh.s=(window.__speh.s||0)+1;}}catch(x){}},true);}"
-			 // ④B 0.13.1：Bing 搜索结果页的「继续搜索 / 微软必应APP / 浏览器 继续」卡片
+			 // ④B 0.13.2：Bing 搜索结果页的「继续搜索 / 微软必应APP / 浏览器 继续」卡片
 			 //   Bing 的 OpalUpsell:ContinueSearch 脚本给 #b_results li a 挂冒泡 click，
 			 //   先 preventDefault 再 CSPopupView.show()，点「继续」才 location.href 跳转。
 			 //   对策：在 document 捕获阶段只 stopPropagation、**不** preventDefault ——
@@ -679,25 +700,15 @@ static NSString *SPEHOpenInAppJS(void)
 			 "}catch(x){}},true);}"
 			 // ⑤ 清网页自绘的「App 内打开」浮层（中英双关键字 + 只认 fixed/sticky/absolute + 宽度够宽）
 			 // 0.9.8：DOM 无变动时跳过全树扫描；卡片延迟插入会由 MutationObserver 重新置脏，不漏（JS 内不用 // 注释以免吃掉拼接行）
-			 // 0.13.1：加入 Bing 卡片特征词（继续搜索 / 搜你所想 / 微软必应APP 等），
+			 // 0.13.2：加入 Bing 卡片特征词（继续搜索 / 搜你所想 / 微软必应APP 等），
 			 //   并把「找到文本节点后向上爬到全宽定位容器再删」补上 —— 原来只删文本节点本身，
 			 //   Bing 的标题在内层小元素、宽度判定永远不过。同时排除 SCRIPT/STYLE，避免误删脚本。
 			 "if(window.__speh.dirty){"
-			 "var kws=['App 内打开','App内打开','在App内打开','在 App 内打开','打开App','打开 App','open in app','Open in App','OPEN IN APP',"
-			 "'继续搜索','搜你所想','搜你所想，有求必应','搜你所想,有求必应','微软必应APP','使用必应应用搜索','在必应应用中打开'];"
-			 "var els=document.querySelectorAll('body *');var wlim=Math.max(240,window.innerWidth*0.6);"
+			 "var els=document.querySelectorAll('body *');"
 			 "for(var j=0;j<els.length;j++){var el=els[j];if(!el.parentNode)continue;"
 			 "var tg=el.tagName;if(tg==='SCRIPT'||tg==='STYLE'||tg==='NOSCRIPT'||tg==='TEMPLATE')continue;"
-			 "var t=(el.textContent||'').replace(/^\\s+|\\s+$/g,'');if(!t||t.length>120)continue;"
-			 "var hit=false;for(var k=0;k<kws.length;k++){if(t.indexOf(kws[k])>=0){hit=true;break;}}"
-			 "if(!hit)continue;"
-			 "var box=el,dep2=0,root=null;"
-			 "while(box&&box.nodeType===1&&dep2<10){var bcs=getComputedStyle(box);"
-			 "if(bcs.position==='fixed'||bcs.position==='sticky'||bcs.position==='absolute'){root=box;break;}"
-			 "if(box.getBoundingClientRect().width>=wlim){root=box;break;}"
-			 "box=box.parentNode;dep2++;}"
-			 "if(!root)root=el;if(root===document.body||root===document.documentElement)root=el;"
-			 "if(root.parentNode){root.parentNode.removeChild(root);r.e++;}}"
+			 "var t=(el.textContent||'').replace(/^\\s+|\\s+$/g,'');if(!t||t.length>200)continue;"
+			 "if(hitKw(t)){rip(el);}}"
 			 "window.__speh.dirty=0;r.scan=1;}"
 			 "return 'first='+(first?1:0)+' meta='+r.m+' el='+r.e+' link='+r.link"
 			 "+' scan='+r.scan+' click='+window.__speh.click+' s='+(window.__speh.s||0)"
@@ -825,7 +836,7 @@ static void SPEHApplyOpenInAppJSAttempt(id webView, int attempt)
 			if (meta > 0 || elems > 0 || blocked > 0) {
 				SPEHLog(@"[openinapp] 清理 meta=%d el=%d 已拦点击=%d", meta, elems, blocked);
 			}
-			// 0.13.1：Bing 结果页「继续搜索」卡片的压制计数（捕获阶段 stopPropagation 命中）
+			// 0.13.2：Bing 结果页「继续搜索」卡片的压制计数（捕获阶段 stopPropagation 命中）
 			if (bingCs > 0) {
 				SPEHLog(@"[openinapp] Bing 结果页点击压制 累计=%d", bingCs);
 			}
