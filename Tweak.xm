@@ -1,4 +1,4 @@
-// Safari16Enhance 0.13.8 - iOS 16 Safari 增强
+// Safari16Enhance 0.13.9 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.13.8"
+#define SPEH_VERSION "0.13.9"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -1045,8 +1045,8 @@ static void SPEHWVDidMoveToWindowHook(UIView *self, SEL _cmd)
 
 	__weak UIView *weakSelf = self;
 
-	// 地址栏手势不再按窗口树遍历（0.13.8 改为 hook 真实类 SFCapsuleCollectionView，
-	// 类初始化即生效，与 WKWebView 何时挂载无关）。
+	// 地址栏手势不再按窗口树遍历（0.13.9 的 hook 全挂在真实类 SFCapsuleCollectionView 上，
+	// 类加载即生效，与 WKWebView 何时挂载无关）。
 
 	// 装 banner 的精准 hook：只装一次（TabDocument 是单例级，重复装会重复 hook）
 	if (first && SPEHSmartBannerKillEnabled()) {
@@ -1366,218 +1366,253 @@ static void SPEHInstallAppLinkHooks(void)
 // 为什么删：这套只为「返回后滑不动」的 SPA 站点（元宝）加的，而且左滑手势返回
 // 根本不走 -[WKWebView goBack]，对它本来就没生效。留着只是多 5 个 WKWebView hook 面。
 
-// MARK: - 禁用底部地址栏左右滑动切页
+// MARK: - 底部地址栏：按真实类名精准禁用（0.13.9）
 //
-// 老板实测：在底部输入网址/搜索的地址栏上左右滑，会切到上一页/下一页，极易误触。
-// 做法：hook -[UIView addGestureRecognizer:]，只对「地址栏/工具栏」这一类 host 上的
-// 滑动手势生效（UISwipeGestureRecognizer，以及 URL 输入区上的 UIPanGestureRecognizer），
-// 直接不挂 + 置 disabled。页面滚动用的是 WKWebView 内部 scrollView 的 pan，
-// 不经过这里，所以不影响网页滚动。
+// 老板实测：在底部地址栏左右滑、或点左右露出一小截的相邻页，都会切上一页/下一页。
+// 目标：只禁这两条，宽度/外观保持系统原样，中间的当前页点照常能用，上拉标签页不受影响。
+//
+// 真实结构（0.13.7 真机运行时视图树 dump，不是猜的）：
+//   d=0 SFCapsuleView            f=(20,807,390,44)  gr=[]
+//   d=1 SFCapsuleCollectionView  f=(0,0,430,932)    gr=[UITap, UIPan, UIPan]
+//   d=2 UIView                   f=(0,0,430,932)    gr=[UIPan]
+//
+// 0.13.8 失败原因（0.13.8 日志实证）：只在 SFCapsuleCollectionView.layoutSubviews 里
+// 关 scrollEnabled、只 hook UITapGestureRecognizer 的 setState:，两条运行时日志都是零条 ——
+//   ① 这个容器在窗口挂载后并不走 layoutSubviews，钩子等于没装；
+//   ② 手势识别器的状态迁移走的是私有路径，公共 setState: 收不到内部调用。
+// 所以 0.13.9 改成「每条路径都给一个一定会被调用的真实入口」，并各带首次命中日志，
+// 日志里哪一条打出来就说明哪一条在生效。全部按类名精确匹配，不用位置兜底。
 
 static BOOL SPEHURLBarSwipeKillEnabled(void) { return SPEHBoolPref(@"killURLBarSwipe", YES); }
 
-static BOOL SPEHHostLooksLikeURLBar(NSString *cls)
+static Class gCapsuleCVClass = NULL;    // SFCapsuleCollectionView（胶囊分页容器）
+static Class gCapsuleViewClass = NULL;  // SFCapsuleView（单个胶囊）
+
+static IMP gOrigCapCVDidMoveToWindow = NULL;
+static IMP gOrigCapCVLayout = NULL;
+static IMP gOrigScrollSetEnabled = NULL;
+static IMP gOrigPanSetTranslation = NULL;
+static IMP gOrigGRShouldReceiveTouch = NULL;
+static IMP gOrigTapSetState = NULL;
+static IMP gOrigTapPrivateSetState = NULL;
+
+// 该视图是否属于底部胶囊地址栏体系（容器或单个胶囊）
+static BOOL SPEHIsCapsuleView(UIView *v)
 {
-	if (!cls.length) return NO;
-	static NSString *const kws[] = { @"URL", @"Address", @"UnifiedBar", @"Toolbar", @"TextBar", @"LocationBar" };
-	for (unsigned i = 0; i < sizeof(kws) / sizeof(kws[0]); i++) {
-		if ([cls rangeOfString:kws[i]].location != NSNotFound) return YES;
+	if (!v) return NO;
+	if (gCapsuleCVClass && [v isKindOfClass:gCapsuleCVClass]) return YES;
+	if (gCapsuleViewClass && [v isKindOfClass:gCapsuleViewClass]) return YES;
+	return NO;
+}
+
+// 滑动用的更宽一档判定：0.13.7 dump 里胶囊容器的父 UIView 上也挂着一颗 UIPan，
+// 横向拖拽可能由它驱动，所以「本身是胶囊体系」或「直接子视图就是胶囊体系」都算。
+// 仍是按类判定，不看坐标。
+static BOOL SPEHIsCapsuleHostDeep(UIView *v)
+{
+	if (!v) return NO;
+	if (SPEHIsCapsuleView(v)) return YES;
+	for (UIView *s in [v subviews]) {
+		if (SPEHIsCapsuleView(s)) return YES;
 	}
 	return NO;
 }
 
-static IMP gOrigAddGesture = NULL;
-
-// 0.9.5：addGestureRecognizer: 是 UIView 级别的全局 hook，Safari 里调用非常频繁。
-// 原来每次都调 NSStringFromClass + 最多 8 次 rangeOfString 做类名匹配 —— 现在按 Class 缓存结果，
-// 命中缓存后只剩一次字典查表（探针关闭时连类名字符串都不构造）。
-// flags: bit0 = 类名像地址栏；bit1 = 类名含 URL / Address（pan 只在这些类上禁）
-static NSMutableDictionary *gHostClsFlags = nil;
-
-static int SPEHHostClsFlags(Class c)
+// 从任意胶囊体系视图往上找胶囊容器当几何参照
+static UIView *SPEHCapsuleContainerOf(UIView *v)
 {
-	if (!c) return 0;
-	// 0.9.8 优化：addGestureRecognizer: 偶发非主线程调用，NSMutableDictionary 读写加锁。
-	// 同样用固定 token 做锁；命中缓存后一次字典查表即返回，锁粒度极小。
-	static dispatch_once_t onceToken;
-	static id hostLock = nil;
-	dispatch_once(&onceToken, ^{
-		gHostClsFlags = [NSMutableDictionary dictionary];
-		hostLock = [NSObject new];
-	});
-	@synchronized (hostLock) {
-		NSValue *key = [NSValue valueWithPointer:(__bridge const void *)c];
-		NSNumber *cached = gHostClsFlags[key];
-		if (cached) return cached.intValue;
-
-		NSString *name = NSStringFromClass(c);
-		int flags = 0;
-		if (SPEHHostLooksLikeURLBar(name)) flags |= 1;
-		if ([name rangeOfString:@"URL"].location != NSNotFound ||
-			[name rangeOfString:@"Address"].location != NSNotFound) flags |= 2;
-
-		if (gHostClsFlags.count > 300) [gHostClsFlags removeAllObjects];
-		gHostClsFlags[key] = @(flags);
-		return flags;
+	UIView *cur = v;
+	for (int i = 0; cur && i < 6; i++) {
+		if (gCapsuleCVClass && [cur isKindOfClass:gCapsuleCVClass]) return cur;
+		cur = [cur superview];
 	}
+	return v;
 }
 
-static void SPEHEnhanceAddGestureHook(UIView *self, SEL _cmd, UIGestureRecognizer *gr)
+// 触点是否落在「侧边（非居中当前页）胶囊」上。
+// 判定依据是真实子视图几何：触点命中哪个 SFCapsuleView，就看那个胶囊中心离屏幕中心多远。
+static BOOL SPEHPointOnSideCapsule(UIView *host, CGPoint pInHost)
 {
-	// 先按手势类型快速过滤（绝大多数调用在这里就返回，开销可忽略），
-	// 再做类名匹配（已按 Class 缓存）。
-	if (gr &&
-		([gr isKindOfClass:[UISwipeGestureRecognizer class]] ||
-		 [gr isKindOfClass:[UIPanGestureRecognizer class]]) &&
-		SPEHURLBarSwipeKillEnabled()) {
-		@try {
-			Class hostC = object_getClass(self);
-			int flags = SPEHHostClsFlags(hostC);
-			if (flags & 1) {
-				BOOL isSwipe = [gr isKindOfClass:[UISwipeGestureRecognizer class]];
-				// pan 只在明确的地址输入控件上禁，避免误伤工具栏其它交互
-				BOOL isPanOnURL = [gr isKindOfClass:[UIPanGestureRecognizer class]] && (flags & 2);
-
-				if (isSwipe || isPanOnURL) {
-					gr.enabled = NO;
-					if (SPEHProbeEnabled()) {
-						SPEHLog(@"[urlswipe] 已禁用 %@ on %@",
-								NSStringFromClass(object_getClass(gr)), NSStringFromClass(hostC));
-					}
-					return;   // 不转发 = 手势根本没挂上
-				}
-			}
-			if (SPEHProbeEnabled() && [gr isKindOfClass:[UISwipeGestureRecognizer class]]) {
-				// 只记一次，用来确认地址栏的真实类名（下一版可按真名收紧）
-				static NSMutableSet *seen = nil;
-				static dispatch_once_t once;
-				dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
-				NSString *key = [NSString stringWithFormat:@"%@|%ld", NSStringFromClass(hostC),
-					(long)((UISwipeGestureRecognizer *)gr).direction];
-				if (![seen containsObject:key] && seen.count < 40) {
-					[seen addObject:key];
-					SPEHLog(@"[urlswipe] 探针 swipe 挂到 %@ direction=%ld（未拦截）",
-							NSStringFromClass(hostC), (long)((UISwipeGestureRecognizer *)gr).direction);
-				}
-			}
-		} @catch (NSException *e) { }
-	}
-	if (gOrigAddGesture) ((void (*)(id, SEL, id))gOrigAddGesture)(self, _cmd, gr);
-}
-
-// MARK: - 底部地址栏：精准命中真实控件（0.13.8）
-//
-// 以下结构全部来自真机运行时视图树 dump（0.13.7 日志），不是猜的：
-//   d=0 SFCapsuleView            f=(20,807,390,44)  gr=[]
-//   d=1 SFCapsuleCollectionView  f=(0,0,430,932)    gr=[UITapGestureRecognizer,
-//                                                      UIPanGestureRecognizer,
-//                                                      UIPanGestureRecognizer]
-//   d=2 UIView                   f=(0,0,430,932)    gr=[UIPanGestureRecognizer]
-//
-// 两条路径的真实归属，全部按「类名精确匹配」处理，不用坐标位置兜底：
-//   ① 左右滑切页 = SFCapsuleCollectionView 自身的横向滚动（它继承 UIScrollView）
-//      ⇒ 直接 scrollEnabled=NO。只禁用户拖动，程序化切页和上拉展开都不受影响。
-//   ② 单击切页   = 挂在同一个 SFCapsuleCollectionView 上的 UITapGestureRecognizer
-//      ⇒ 识别瞬间判断落点，落在居中胶囊（当前页）之外就置 Failed，action 不执行。
-//      （0.13.5 曾 hook UIGestureRecognizer 的 touchesBegan，日志零命中 —— 手势识别器
-//        不走 UIResponder 的 touchesBegan，该路线已证伪并删除。）
-//
-// 宽度保持系统原样：不改 frame、不 hidden，左右照常露出。
-
-static Class gCapsuleCVClass = NULL;    // SFCapsuleCollectionView
-static Class gCapsuleViewClass = NULL;  // SFCapsuleView
-static IMP gOrigCapCVLayout = NULL;
-static IMP gOrigTapSetState = NULL;
-
-// 判定这次 tap 是否落在「非居中的侧边胶囊」上。
-// 用真实子视图几何：触点落在哪个 SFCapsuleView 内，就看那个胶囊中心离屏幕中心多远。
-static BOOL SPEHTapHitsSideCapsule(UIGestureRecognizer *gr, UIView *cv)
-{
+	UIView *cv = SPEHCapsuleContainerOf(host);
 	UIWindow *win = [cv window];
 	if (!win) return NO;
-	CGPoint p = [gr locationInView:win];
 	CGFloat winW = [win bounds].size.width;
 	if (winW <= 0) return NO;
+
+	CGPoint pWin = [host convertPoint:pInHost toView:win];
+	CGPoint pCv  = [cv convertPoint:pWin fromView:win];
+
 	BOOL onCenter = NO, onSide = NO;
 	for (UIView *s in [cv subviews]) {
 		if (gCapsuleViewClass && ![s isKindOfClass:gCapsuleViewClass]) continue;
+		CGRect f = [s frame];
+		if (f.size.width <= 0 || f.size.height <= 0) continue;
+		if (!CGRectContainsPoint(f, pCv)) continue;
 		CGRect wf = [s convertRect:[s bounds] toView:win];
-		if (wf.size.width <= 0 || wf.size.height <= 0) continue;
-		if (!CGRectContainsPoint(wf, p)) continue;
 		if (fabs(CGRectGetMidX(wf) - winW / 2.0) < winW * 0.15) onCenter = YES;
 		else onSide = YES;
 	}
 	return (onSide && !onCenter);
 }
 
-// ② 单击：tap 进入 Began/Ended 时判定，命中侧边胶囊就改置 Failed（action 不执行、不切页）
-static void SPEHTapSetStateHook(id self, SEL _cmd, NSInteger state)
+// ① 滑动 · 第 1 层：容器挂到窗口就把自身横向滚动关掉（didMoveToWindow 必然被调用）
+static void SPEHForceDisableCapsuleScroll(UIScrollView *cv, const char *tag)
 {
-	// 1 = Began, 3 = Ended（双保险：极少数实现会在 Ended 才触发 action）
-	if ((state == 1 || state == 3) && gCapsuleCVClass && SPEHURLBarSwipeKillEnabled()) {
-		@try {
-			UIGestureRecognizer *gr = (UIGestureRecognizer *)self;
-			if ([gr isKindOfClass:[UITapGestureRecognizer class]]) {
-				UIView *host = [gr view];
-				if (host && [host isKindOfClass:gCapsuleCVClass] &&
-					SPEHTapHitsSideCapsule(gr, host)) {
-					SPEHLog(@"[urlswipe] 精准拦截 侧边胶囊单击 state=%ld -> Failed", (long)state);
-					state = 5;   // UIGestureRecognizerStateFailed
-				}
-			}
-		} @catch (NSException *e) { }
-	}
-	if (gOrigTapSetState) ((void (*)(id, SEL, NSInteger))gOrigTapSetState)(self, _cmd, state);
-}
-
-// ① 滑动：SFCapsuleCollectionView 就是胶囊分页容器，关掉它的用户滚动即可
-static void SPEHCapsuleCVLayoutHook(id self, SEL _cmd)
-{
-	if (gOrigCapCVLayout) ((void (*)(id, SEL))gOrigCapCVLayout)(self, _cmd);
-
+	(void)tag;
 	if (!SPEHURLBarSwipeKillEnabled()) return;
-	UIScrollView *cv = (UIScrollView *)self;
+	if (![cv isKindOfClass:[UIScrollView class]]) return;
 	@try {
 		if (cv.scrollEnabled) {
 			cv.scrollEnabled = NO;
 #ifndef SPEH_NO_LOG
-			static int logged = 0;
-			if (logged < 8) {
-				logged++;
-				SPEHLog(@"[urlswipe] 精准禁用胶囊横向滚动 contentW=%.0f boundsW=%.0f",
-						cv.contentSize.width, cv.bounds.size.width);
+			static int n = 0;
+			if (n < 10) {
+				n++;
+				SPEHLog(@"[urlswipe] ① 精准 %s: scrollEnabled -> NO contentW=%.0f boundsW=%.0f",
+						tag, cv.contentSize.width, cv.bounds.size.width);
 			}
 #endif
 		}
 	} @catch (NSException *e) { }
 }
 
+static void SPEHCapCVDidMoveToWindowHook(id self, SEL _cmd)
+{
+	if (gOrigCapCVDidMoveToWindow)
+		((void (*)(id, SEL))gOrigCapCVDidMoveToWindow)(self, _cmd);
+	SPEHForceDisableCapsuleScroll((UIScrollView *)self, "didMoveToWindow");
+}
+
+static void SPEHCapCVLayoutHook(id self, SEL _cmd)
+{
+	if (gOrigCapCVLayout) ((void (*)(id, SEL))gOrigCapCVLayout)(self, _cmd);
+	SPEHForceDisableCapsuleScroll((UIScrollView *)self, "layoutSubviews");
+}
+
+// ① 滑动 · 第 2 层：任何把 scrollEnabled 改回 YES 的调用都按回 NO（只认胶囊容器类）
+static void SPEHScrollSetEnabledHook(UIScrollView *self, SEL _cmd, BOOL enabled)
+{
+	if (enabled && gCapsuleCVClass && SPEHURLBarSwipeKillEnabled() &&
+		[self isKindOfClass:gCapsuleCVClass]) {
+#ifndef SPEH_NO_LOG
+		static int n = 0;
+		if (n < 5) {
+			n++;
+			SPEHLog(@"[urlswipe] ① 精准 拦截系统 setScrollEnabled:YES -> 保持 NO");
+		}
+#endif
+		enabled = NO;
+	}
+	if (gOrigScrollSetEnabled)
+		((void (*)(id, SEL, BOOL))gOrigScrollSetEnabled)(self, _cmd, enabled);
+}
+
+// ① 滑动 · 第 3 层：横向分量清零，纵向保留（上拉展开标签页不受影响）
+static void SPEHPanSetTranslationHook(UIPanGestureRecognizer *self, SEL _cmd, CGPoint t, UIView *view)
+{
+	if (SPEHURLBarSwipeKillEnabled() && t.x != 0.0 && SPEHIsCapsuleHostDeep([self view])) {
+#ifndef SPEH_NO_LOG
+		static int n = 0;
+		if (n < 6) {
+			n++;
+			SPEHLog(@"[urlswipe] ① 精准 pan 横向清零 (%.1f,%.1f) on %@",
+					t.x, t.y, NSStringFromClass(object_getClass([self view])));
+		}
+#endif
+		t.x = 0.0;
+	}
+	if (gOrigPanSetTranslation)
+		((void (*)(id, SEL, CGPoint, UIView *))gOrigPanSetTranslation)(self, _cmd, t, view);
+}
+
+// ② 单击 · 主入口：手势识别器接收触摸的唯一开关，落在侧边胶囊上就不接
+static BOOL SPEHGRShouldReceiveTouchHook(id self, SEL _cmd, UITouch *touch)
+{
+	if (gCapsuleCVClass && SPEHURLBarSwipeKillEnabled()) {
+		@try {
+			UIGestureRecognizer *gr = (UIGestureRecognizer *)self;
+			UIView *host = [gr view];
+			if ([gr isKindOfClass:[UITapGestureRecognizer class]] && SPEHIsCapsuleView(host)) {
+				CGPoint p = [touch locationInView:host];
+				if (SPEHPointOnSideCapsule(host, p)) {
+#ifndef SPEH_NO_LOG
+					static int n = 0;
+					if (n < 10) {
+						n++;
+						SPEHLog(@"[urlswipe] ② 精准 侧边胶囊单击 x=%.0f host=%@ -> 不接收触摸",
+								p.x, NSStringFromClass(object_getClass(host)));
+					}
+#endif
+					return NO;
+				}
+			}
+		} @catch (NSException *e) { }
+	}
+	if (gOrigGRShouldReceiveTouch)
+		return ((BOOL (*)(id, SEL, id))gOrigGRShouldReceiveTouch)(self, _cmd, touch);
+	return YES;
+}
+
+// ② 单击 · 兜底：状态机直接置 Failed（action 不执行）。setState: 与私有 _setState: 共用
+static void SPEHTapStateHook(id self, SEL _cmd, NSInteger state)
+{
+	IMP orig = (sel_isEqual(_cmd, @selector(setState:))) ? gOrigTapSetState : gOrigTapPrivateSetState;
+
+	if ((state == 1 || state == 3) && gCapsuleCVClass && SPEHURLBarSwipeKillEnabled()) {
+		@try {
+			UIGestureRecognizer *gr = (UIGestureRecognizer *)self;
+			UIView *host = [gr view];
+			if ([gr isKindOfClass:[UITapGestureRecognizer class]] && SPEHIsCapsuleView(host)) {
+				CGPoint p = [gr locationInView:host];
+				if (SPEHPointOnSideCapsule(host, p)) {
+#ifndef SPEH_NO_LOG
+					static int n = 0;
+					if (n < 10) {
+						n++;
+						SPEHLog(@"[urlswipe] ② 精准 侧边胶囊单击 state=%ld -> Failed", (long)state);
+					}
+#endif
+					state = 5;   // UIGestureRecognizerStateFailed
+				}
+			}
+		} @catch (NSException *e) { }
+	}
+	if (orig) ((void (*)(id, SEL, NSInteger))orig)(self, _cmd, state);
+}
+
 static void SPEHInstallURLBarSwipeHooks(void)
 {
 	if (!SPEHURLBarSwipeKillEnabled()) { SPEHLog(@"[urlswipe] disabled by prefs"); return; }
 
-	// 兜底层：手势被 add 到地址栏类视图时就掐掉 swipe（按 Class 缓存，开销已忽略）
-	SPEHPatchInstanceMethod([UIView class], NSSelectorFromString(@"addGestureRecognizer:"),
-		(IMP)SPEHEnhanceAddGestureHook, &gOrigAddGesture);
-
-	// 精准层：目标类名全部来自真机视图树 dump
 	gCapsuleCVClass   = NSClassFromString(@"SFCapsuleCollectionView");
 	gCapsuleViewClass = NSClassFromString(@"SFCapsuleView");
 
-	// ① 滑动：胶囊分页容器自身关闭横向滚动
+	// ① 滑动：容器自身关横向滚动（挂窗口 / 布局 / 被改回 YES 三个入口都堵）
 	if (gCapsuleCVClass) {
+		SPEHPatchInstanceMethod(gCapsuleCVClass, NSSelectorFromString(@"didMoveToWindow"),
+			(IMP)SPEHCapCVDidMoveToWindowHook, &gOrigCapCVDidMoveToWindow);
 		SPEHPatchInstanceMethod(gCapsuleCVClass, NSSelectorFromString(@"layoutSubviews"),
-			(IMP)SPEHCapsuleCVLayoutHook, &gOrigCapCVLayout);
+			(IMP)SPEHCapCVLayoutHook, &gOrigCapCVLayout);
 	}
+	SPEHPatchInstanceMethod([UIScrollView class], NSSelectorFromString(@"setScrollEnabled:"),
+		(IMP)SPEHScrollSetEnabledHook, &gOrigScrollSetEnabled);
+	SPEHPatchInstanceMethod([UIPanGestureRecognizer class], NSSelectorFromString(@"setTranslation:inView:"),
+		(IMP)SPEHPanSetTranslationHook, &gOrigPanSetTranslation);
 
-	// ② 单击：只 patch UITapGestureRecognizer 的 setState:（范围最小），
-	//    hook 内再用 host == SFCapsuleCollectionView 精确比对，其它 tap 一律直通。
+	// ② 单击：先掐识别器收触摸（主），再掐状态机（兜底）
+	SPEHPatchInstanceMethod([UIGestureRecognizer class], NSSelectorFromString(@"_shouldReceiveTouch:"),
+		(IMP)SPEHGRShouldReceiveTouchHook, &gOrigGRShouldReceiveTouch);
 	SPEHPatchInstanceMethod([UITapGestureRecognizer class], NSSelectorFromString(@"setState:"),
-		(IMP)SPEHTapSetStateHook, &gOrigTapSetState);
+		(IMP)SPEHTapStateHook, &gOrigTapSetState);
+	SPEHPatchInstanceMethod([UITapGestureRecognizer class], NSSelectorFromString(@"_setState:"),
+		(IMP)SPEHTapStateHook, &gOrigTapPrivateSetState);
 
-	SPEHLog(@"[urlswipe] hooks addGesture=%s capCV=%d capView=%d cvLayout=%s tapSetState=%s",
-			gOrigAddGesture ? "ok" : "FAIL", gCapsuleCVClass ? 1 : 0, gCapsuleViewClass ? 1 : 0,
-			gOrigCapCVLayout ? "ok" : "FAIL", gOrigTapSetState ? "ok" : "FAIL");
+	SPEHLog(@"[urlswipe] 0.13.9 安装 capCV=%d capView=%d didMoveToWin=%s cvLayout=%s scrollSet=%s panSet=%s shouldRecv=%s tapSetState=%s tap_privSetState=%s",
+			gCapsuleCVClass ? 1 : 0, gCapsuleViewClass ? 1 : 0,
+			gOrigCapCVDidMoveToWindow ? "ok" : "FAIL", gOrigCapCVLayout ? "ok" : "FAIL",
+			gOrigScrollSetEnabled ? "ok" : "FAIL", gOrigPanSetTranslation ? "ok" : "FAIL",
+			gOrigGRShouldReceiveTouch ? "ok" : "FAIL", gOrigTapSetState ? "ok" : "FAIL",
+			gOrigTapPrivateSetState ? "ok" : "FAIL");
 }
 
 // MARK: - 入口
