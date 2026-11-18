@@ -1,4 +1,4 @@
-// Safari16Enhance 0.13.9 - iOS 16 Safari 增强
+// Safari16Enhance 0.14.0 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.13.9"
+#define SPEH_VERSION "0.14.0"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -1366,7 +1366,7 @@ static void SPEHInstallAppLinkHooks(void)
 // 为什么删：这套只为「返回后滑不动」的 SPA 站点（元宝）加的，而且左滑手势返回
 // 根本不走 -[WKWebView goBack]，对它本来就没生效。留着只是多 5 个 WKWebView hook 面。
 
-// MARK: - 底部地址栏：按真实类名精准禁用（0.13.9）
+// MARK: - 底部地址栏：按真实类名精准禁用（0.14.0）
 //
 // 老板实测：在底部地址栏左右滑、或点左右露出一小截的相邻页，都会切上一页/下一页。
 // 目标：只禁这两条，宽度/外观保持系统原样，中间的当前页点照常能用，上拉标签页不受影响。
@@ -1376,12 +1376,16 @@ static void SPEHInstallAppLinkHooks(void)
 //   d=1 SFCapsuleCollectionView  f=(0,0,430,932)    gr=[UITap, UIPan, UIPan]
 //   d=2 UIView                   f=(0,0,430,932)    gr=[UIPan]
 //
-// 0.13.8 失败原因（0.13.8 日志实证）：只在 SFCapsuleCollectionView.layoutSubviews 里
-// 关 scrollEnabled、只 hook UITapGestureRecognizer 的 setState:，两条运行时日志都是零条 ——
-//   ① 这个容器在窗口挂载后并不走 layoutSubviews，钩子等于没装；
-//   ② 手势识别器的状态迁移走的是私有路径，公共 setState: 收不到内部调用。
-// 所以 0.13.9 改成「每条路径都给一个一定会被调用的真实入口」，并各带首次命中日志，
-// 日志里哪一条打出来就说明哪一条在生效。全部按类名精确匹配，不用位置兜底。
+// 0.13.9 真机日志给出的准确链路（8/8 单击命中、滑动未命中）：
+//   · 单击 = 容器上的 UITapGestureRecognizer：hook setState: 收到 state=3(Ended) 改 5(Failed)
+//     ⇒ action 不执行 ⇒ 不切页。有效。
+//   · 滑动 = 同一容器上的 UIPanGestureRecognizer，但它不读 translationInView: —— 0.13.9 把
+//     横向分量清零后照样切页（日志里 pan 横向清零只被调用 2 次、数值 6pt 内），
+//     说明切页由 pan 自己的状态机驱动，不在 translation 上。
+//   · scrollEnabled 那几层（didMoveToWindow / layoutSubviews / setScrollEnabled:）日志全空，
+//     滑动根本不是滚动偏移驱动的，已在 0.14.0 删掉多余的两层。
+// 所以 0.14.0：两条手势各自掐自己的状态机 —— tap 用 setState:，pan 用 setState: 判横向占优即 Failed。
+// 全部按类名精确匹配，不用位置兜底。
 
 static BOOL SPEHURLBarSwipeKillEnabled(void) { return SPEHBoolPref(@"killURLBarSwipe", YES); }
 
@@ -1389,12 +1393,8 @@ static Class gCapsuleCVClass = NULL;    // SFCapsuleCollectionView（胶囊分�
 static Class gCapsuleViewClass = NULL;  // SFCapsuleView（单个胶囊）
 
 static IMP gOrigCapCVDidMoveToWindow = NULL;
-static IMP gOrigCapCVLayout = NULL;
-static IMP gOrigScrollSetEnabled = NULL;
-static IMP gOrigPanSetTranslation = NULL;
-static IMP gOrigGRShouldReceiveTouch = NULL;
 static IMP gOrigTapSetState = NULL;
-static IMP gOrigTapPrivateSetState = NULL;
+static IMP gOrigPanSetState = NULL;
 
 // 该视图是否属于底部胶囊地址栏体系（容器或单个胶囊）
 static BOOL SPEHIsCapsuleView(UIView *v)
@@ -1455,109 +1455,39 @@ static BOOL SPEHPointOnSideCapsule(UIView *host, CGPoint pInHost)
 	return (onSide && !onCenter);
 }
 
-// ① 滑动 · 第 1 层：容器挂到窗口就把自身横向滚动关掉（didMoveToWindow 必然被调用）
-static void SPEHForceDisableCapsuleScroll(UIScrollView *cv, const char *tag)
-{
-	(void)tag;
-	if (!SPEHURLBarSwipeKillEnabled()) return;
-	if (![cv isKindOfClass:[UIScrollView class]]) return;
-	@try {
-		if (cv.scrollEnabled) {
-			cv.scrollEnabled = NO;
-#ifndef SPEH_NO_LOG
-			static int n = 0;
-			if (n < 10) {
-				n++;
-				SPEHLog(@"[urlswipe] ① 精准 %s: scrollEnabled -> NO contentW=%.0f boundsW=%.0f",
-						tag, cv.contentSize.width, cv.bounds.size.width);
-			}
-#endif
-		}
-	} @catch (NSException *e) { }
-}
-
+// ① 滑动 · 容器挂到窗口时顺手关掉自身横向滚动（仅作兜底，0.13.9 日志里这层从未触发，
+//    因为实测滑动不由滚动偏移驱动；保留它只为挡住少数走拖动滚动的路径）
 static void SPEHCapCVDidMoveToWindowHook(id self, SEL _cmd)
 {
 	if (gOrigCapCVDidMoveToWindow)
 		((void (*)(id, SEL))gOrigCapCVDidMoveToWindow)(self, _cmd);
-	SPEHForceDisableCapsuleScroll((UIScrollView *)self, "didMoveToWindow");
-}
 
-static void SPEHCapCVLayoutHook(id self, SEL _cmd)
-{
-	if (gOrigCapCVLayout) ((void (*)(id, SEL))gOrigCapCVLayout)(self, _cmd);
-	SPEHForceDisableCapsuleScroll((UIScrollView *)self, "layoutSubviews");
-}
-
-// ① 滑动 · 第 2 层：任何把 scrollEnabled 改回 YES 的调用都按回 NO（只认胶囊容器类）
-static void SPEHScrollSetEnabledHook(UIScrollView *self, SEL _cmd, BOOL enabled)
-{
-	if (enabled && gCapsuleCVClass && SPEHURLBarSwipeKillEnabled() &&
-		[self isKindOfClass:gCapsuleCVClass]) {
+	if (!SPEHURLBarSwipeKillEnabled()) return;
+	@try {
 #ifndef SPEH_NO_LOG
-		static int n = 0;
-		if (n < 5) {
-			n++;
-			SPEHLog(@"[urlswipe] ① 精准 拦截系统 setScrollEnabled:YES -> 保持 NO");
-		}
-#endif
-		enabled = NO;
-	}
-	if (gOrigScrollSetEnabled)
-		((void (*)(id, SEL, BOOL))gOrigScrollSetEnabled)(self, _cmd, enabled);
-}
-
-// ① 滑动 · 第 3 层：横向分量清零，纵向保留（上拉展开标签页不受影响）
-static void SPEHPanSetTranslationHook(UIPanGestureRecognizer *self, SEL _cmd, CGPoint t, UIView *view)
-{
-	if (SPEHURLBarSwipeKillEnabled() && t.x != 0.0 && SPEHIsCapsuleHostDeep([self view])) {
-#ifndef SPEH_NO_LOG
-		static int n = 0;
-		if (n < 6) {
-			n++;
-			SPEHLog(@"[urlswipe] ① 精准 pan 横向清零 (%.1f,%.1f) on %@",
-					t.x, t.y, NSStringFromClass(object_getClass([self view])));
-		}
-#endif
-		t.x = 0.0;
-	}
-	if (gOrigPanSetTranslation)
-		((void (*)(id, SEL, CGPoint, UIView *))gOrigPanSetTranslation)(self, _cmd, t, view);
-}
-
-// ② 单击 · 主入口：手势识别器接收触摸的唯一开关，落在侧边胶囊上就不接
-static BOOL SPEHGRShouldReceiveTouchHook(id self, SEL _cmd, UITouch *touch)
-{
-	if (gCapsuleCVClass && SPEHURLBarSwipeKillEnabled()) {
-		@try {
-			UIGestureRecognizer *gr = (UIGestureRecognizer *)self;
-			UIView *host = [gr view];
-			if ([gr isKindOfClass:[UITapGestureRecognizer class]] && SPEHIsCapsuleView(host)) {
-				CGPoint p = [touch locationInView:host];
-				if (SPEHPointOnSideCapsule(host, p)) {
-#ifndef SPEH_NO_LOG
-					static int n = 0;
-					if (n < 10) {
-						n++;
-						SPEHLog(@"[urlswipe] ② 精准 侧边胶囊单击 x=%.0f host=%@ -> 不接收触摸",
-								p.x, NSStringFromClass(object_getClass(host)));
-					}
-#endif
-					return NO;
-				}
+		static int seen = 0;
+		if (seen < 3) {
+			seen++;
+			UIScrollView *sv = (UIScrollView *)self;
+			NSMutableString *grs = [NSMutableString string];
+			for (UIGestureRecognizer *g in [self gestureRecognizers]) {
+				if (grs.length) [grs appendString:@","];
+				[grs appendString:NSStringFromClass(object_getClass(g))];
 			}
-		} @catch (NSException *e) { }
-	}
-	if (gOrigGRShouldReceiveTouch)
-		return ((BOOL (*)(id, SEL, id))gOrigGRShouldReceiveTouch)(self, _cmd, touch);
-	return YES;
+			SPEHLog(@"[urlswipe] ① 容器挂窗口 scrollEnabled=%d contentW=%.0f gr=[%@]",
+					sv.scrollEnabled ? 1 : 0, sv.contentSize.width, grs);
+		}
+#endif
+		if ([self isKindOfClass:[UIScrollView class]] && ((UIScrollView *)self).scrollEnabled) {
+			((UIScrollView *)self).scrollEnabled = NO;
+		}
+	} @catch (NSException *e) { }
 }
 
-// ② 单击 · 兜底：状态机直接置 Failed（action 不执行）。setState: 与私有 _setState: 共用
+// ② 单击：挂在胶囊容器上的 UITapGestureRecognizer，识别到 Ended 时改置 Failed，切页 action 不执行。
+//    0.13.9 真机日志实证这条链路有效（state=3 -> Failed，8/8 命中）。
 static void SPEHTapStateHook(id self, SEL _cmd, NSInteger state)
 {
-	IMP orig = (sel_isEqual(_cmd, @selector(setState:))) ? gOrigTapSetState : gOrigTapPrivateSetState;
-
 	if ((state == 1 || state == 3) && gCapsuleCVClass && SPEHURLBarSwipeKillEnabled()) {
 		@try {
 			UIGestureRecognizer *gr = (UIGestureRecognizer *)self;
@@ -1569,7 +1499,8 @@ static void SPEHTapStateHook(id self, SEL _cmd, NSInteger state)
 					static int n = 0;
 					if (n < 10) {
 						n++;
-						SPEHLog(@"[urlswipe] ② 精准 侧边胶囊单击 state=%ld -> Failed", (long)state);
+						SPEHLog(@"[urlswipe] ② 侧边胶囊单击 x=%.0f host=%@ state=%ld -> Failed",
+								p.x, NSStringFromClass(object_getClass(host)), (long)state);
 					}
 #endif
 					state = 5;   // UIGestureRecognizerStateFailed
@@ -1577,7 +1508,40 @@ static void SPEHTapStateHook(id self, SEL _cmd, NSInteger state)
 			}
 		} @catch (NSException *e) { }
 	}
-	if (orig) ((void (*)(id, SEL, NSInteger))orig)(self, _cmd, state);
+	if (gOrigTapSetState) ((void (*)(id, SEL, NSInteger))gOrigTapSetState)(self, _cmd, state);
+}
+
+// ① 滑动：同一个容器上的 UIPanGestureRecognizer。
+//    0.13.9 日志实证它不读 translationInView:（清零后照样切页），所以必须掐状态机：
+//    拖动到 Changed 时判方向，横向占优就直接置 Failed，Safari 的 pan 处理器收不到 Ended，不会切页。
+//    纵向占优（上拉展开标签页）完全放行。
+static void SPEHPanStateHook(id self, SEL _cmd, NSInteger state)
+{
+	if ((state == 2 || state == 3) && gCapsuleCVClass && SPEHURLBarSwipeKillEnabled()) {
+		@try {
+			UIPanGestureRecognizer *gr = (UIPanGestureRecognizer *)self;
+			UIView *host = [gr view];
+			if (SPEHIsCapsuleHostDeep(host)) {
+				CGPoint t = [gr translationInView:host];
+				CGPoint v = [gr velocityInView:host];
+				BOOL horiz = (fabs(v.x) > fabs(v.y) * 1.2 && fabs(v.x) > 80.0) ||
+							 (fabs(t.x) > fabs(t.y) * 1.2 && fabs(t.x) > 5.0);
+				if (horiz) {
+#ifndef SPEH_NO_LOG
+					static int n = 0;
+					if (n < 12) {
+						n++;
+						SPEHLog(@"[urlswipe] ① 横向拖动 t=(%.1f,%.1f) v=(%.0f,%.0f) host=%@ state=%ld -> Failed",
+								t.x, t.y, v.x, v.y,
+								NSStringFromClass(object_getClass(host)), (long)state);
+					}
+#endif
+					state = 5;
+				}
+			}
+		} @catch (NSException *e) { }
+	}
+	if (gOrigPanSetState) ((void (*)(id, SEL, NSInteger))gOrigPanSetState)(self, _cmd, state);
 }
 
 static void SPEHInstallURLBarSwipeHooks(void)
@@ -1587,32 +1551,22 @@ static void SPEHInstallURLBarSwipeHooks(void)
 	gCapsuleCVClass   = NSClassFromString(@"SFCapsuleCollectionView");
 	gCapsuleViewClass = NSClassFromString(@"SFCapsuleView");
 
-	// ① 滑动：容器自身关横向滚动（挂窗口 / 布局 / 被改回 YES 三个入口都堵）
+	// 兜底层：容器挂窗口时关横向滚动
 	if (gCapsuleCVClass) {
 		SPEHPatchInstanceMethod(gCapsuleCVClass, NSSelectorFromString(@"didMoveToWindow"),
 			(IMP)SPEHCapCVDidMoveToWindowHook, &gOrigCapCVDidMoveToWindow);
-		SPEHPatchInstanceMethod(gCapsuleCVClass, NSSelectorFromString(@"layoutSubviews"),
-			(IMP)SPEHCapCVLayoutHook, &gOrigCapCVLayout);
 	}
-	SPEHPatchInstanceMethod([UIScrollView class], NSSelectorFromString(@"setScrollEnabled:"),
-		(IMP)SPEHScrollSetEnabledHook, &gOrigScrollSetEnabled);
-	SPEHPatchInstanceMethod([UIPanGestureRecognizer class], NSSelectorFromString(@"setTranslation:inView:"),
-		(IMP)SPEHPanSetTranslationHook, &gOrigPanSetTranslation);
 
-	// ② 单击：先掐识别器收触摸（主），再掐状态机（兜底）
-	SPEHPatchInstanceMethod([UIGestureRecognizer class], NSSelectorFromString(@"_shouldReceiveTouch:"),
-		(IMP)SPEHGRShouldReceiveTouchHook, &gOrigGRShouldReceiveTouch);
+	// 主拦截层：两条手势各自掐自己的状态机（单击 = tap、滑动 = pan）
 	SPEHPatchInstanceMethod([UITapGestureRecognizer class], NSSelectorFromString(@"setState:"),
 		(IMP)SPEHTapStateHook, &gOrigTapSetState);
-	SPEHPatchInstanceMethod([UITapGestureRecognizer class], NSSelectorFromString(@"_setState:"),
-		(IMP)SPEHTapStateHook, &gOrigTapPrivateSetState);
+	SPEHPatchInstanceMethod([UIPanGestureRecognizer class], NSSelectorFromString(@"setState:"),
+		(IMP)SPEHPanStateHook, &gOrigPanSetState);
 
-	SPEHLog(@"[urlswipe] 0.13.9 安装 capCV=%d capView=%d didMoveToWin=%s cvLayout=%s scrollSet=%s panSet=%s shouldRecv=%s tapSetState=%s tap_privSetState=%s",
+	SPEHLog(@"[urlswipe] 0.14.0 安装 capCV=%d capView=%d didMoveToWin=%s tapSetState=%s panSetState=%s",
 			gCapsuleCVClass ? 1 : 0, gCapsuleViewClass ? 1 : 0,
-			gOrigCapCVDidMoveToWindow ? "ok" : "FAIL", gOrigCapCVLayout ? "ok" : "FAIL",
-			gOrigScrollSetEnabled ? "ok" : "FAIL", gOrigPanSetTranslation ? "ok" : "FAIL",
-			gOrigGRShouldReceiveTouch ? "ok" : "FAIL", gOrigTapSetState ? "ok" : "FAIL",
-			gOrigTapPrivateSetState ? "ok" : "FAIL");
+			gOrigCapCVDidMoveToWindow ? "ok" : "FAIL",
+			gOrigTapSetState ? "ok" : "FAIL", gOrigPanSetState ? "ok" : "FAIL");
 }
 
 // MARK: - 入口
