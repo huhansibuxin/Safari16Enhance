@@ -1438,17 +1438,6 @@ static BOOL SPEHIsCapsuleHostDeep(UIView *v)
 	return NO;
 }
 
-// 从任意胶囊体系视图往上找胶囊容器当几何参照
-static UIView *SPEHCapsuleContainerOf(UIView *v)
-{
-	UIView *cur = v;
-	for (int i = 0; cur && i < 6; i++) {
-		if (gCapsuleCVClass && [cur isKindOfClass:gCapsuleCVClass]) return cur;
-		cur = [cur superview];
-	}
-	return v;
-}
-
 // 一次触摸是否落在「该拦的区域」里（0.14.3）。
 //
 // 判定全部基于真实子视图几何，不看硬编码坐标：
