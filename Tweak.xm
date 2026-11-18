@@ -1,4 +1,4 @@
-// Safari16Enhance 0.13.3 - iOS 16 Safari 增强
+// Safari16Enhance 0.13.4 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.13.3"
+#define SPEH_VERSION "0.13.4"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -631,10 +631,11 @@ static NSString *SPEHOpenInAppJS(void)
 			 "if(!window.__speh)window.__speh={ready:0,click:0,s:0,dirty:1};"
 			 "var first=!window.__speh.ready;window.__speh.ready=1;"
 			 "var r={m:0,e:0,link:0};"
-			 // 0.13.3：App 引流卡片特征词（Bing / 起点通用），MO 即时拆除与全树扫描共用
+			 // 0.13.4：App 引流卡片特征词（Bing / 起点通用），MO 即时拆除与全树扫描共用
 			 "var KWS=['App 内打开','App内打开','在App内打开','在 App 内打开','打开App','打开 App','open in app','Open in App','OPEN IN APP',"
 			 "'继续搜索','搜你所想','搜你所想，有求必应','搜你所想,有求必应','微软必应APP','使用必应应用搜索','在必应应用中打开',"
-			 "'继续浏览精彩内容','在此处浏览','起点读书APP','海量好书','新人免费','免费读'];"
+			 "'继续浏览精彩内容','在此处浏览','起点读书APP','海量好书','新人免费','免费读',"
+			 "'打开稀土掘金','稀土掘金APP','去APP查看','去App查看','在APP中打开','在App中打开','APP内打开','继续浏览'];"
 			 // 把含特征词的节点整块拆掉：向上找 fixed/absolute/sticky 或全宽容器，排除 body/script
 			 "var rip=function(node){try{var bx=node,dp=0,root=null;"
 			 "while(bx&&bx.nodeType===1&&dp<10){var bs=getComputedStyle(bx);"
@@ -659,7 +660,7 @@ static NSString *SPEHOpenInAppJS(void)
 			 "if(n.nodeType!==1)continue;"
 			 "var nm=String((n.getAttribute&&n.getAttribute('name'))||'').toLowerCase();"
 			 "if(nm==='apple-itunes-app'||nm==='smartbanner'){try{n.parentNode.removeChild(n);}catch(q){}}"
-			 // 0.13.3：只查新增节点自身短文本，超过 60 个直接子元素的容器跳过（卡片不会有）：
+			 // 0.13.4：只查新增节点自身短文本，超过 60 个直接子元素的容器跳过（卡片不会有）：
 			 // 不遍历整棵子树、不对每个后代取 textContent，避免重 DOM 页面 O(n^2) 卡主线程。
 			 "if(n.childElementCount>60)continue;if(hitKw(n.textContent))rip(n);}}});"
 			 // 0.9.8：同时观察 style/class 属性变化——浮层若是预置节点靠 CSS 显示（非动态插入），
@@ -680,7 +681,7 @@ static NSString *SPEHOpenInAppJS(void)
 			 "while(t&&t.tagName!=='A'){t=t.parentNode;}if(!t)return;"
 			 "var h=t.getAttribute&&t.getAttribute('href');if(!ok(h)){"
 			 "e.preventDefault();e.stopPropagation();window.__speh.s=(window.__speh.s||0)+1;}}catch(x){}},true);}"
-			 // ④B 0.13.3：Bing 搜索结果页的「继续搜索 / 微软必应APP / 浏览器 继续」卡片
+			 // ④B 0.13.4：Bing 搜索结果页的「继续搜索 / 微软必应APP / 浏览器 继续」卡片
 			 //   Bing 的 OpalUpsell:ContinueSearch 脚本给 #b_results li a 挂冒泡 click，
 			 //   先 preventDefault 再 CSPopupView.show()，点「继续」才 location.href 跳转。
 			 //   对策：在 document 捕获阶段只 stopPropagation、**不** preventDefault ——
@@ -700,7 +701,7 @@ static NSString *SPEHOpenInAppJS(void)
 			 "}catch(x){}},true);}"
 			 // ⑤ 清网页自绘的「App 内打开」浮层（中英双关键字 + 只认 fixed/sticky/absolute + 宽度够宽）
 			 // 0.9.8：DOM 无变动时跳过全树扫描；卡片延迟插入会由 MutationObserver 重新置脏，不漏（JS 内不用 // 注释以免吃掉拼接行）
-			 // 0.13.3：加入 Bing 卡片特征词（继续搜索 / 搜你所想 / 微软必应APP 等），
+			 // 0.13.4：加入 Bing 卡片特征词（继续搜索 / 搜你所想 / 微软必应APP 等），
 			 //   并把「找到文本节点后向上爬到全宽定位容器再删」补上 —— 原来只删文本节点本身，
 			 //   Bing 的标题在内层小元素、宽度判定永远不过。同时排除 SCRIPT/STYLE，避免误删脚本。
 			 "if(window.__speh.dirty){"
@@ -836,7 +837,7 @@ static void SPEHApplyOpenInAppJSAttempt(id webView, int attempt)
 			if (meta > 0 || elems > 0 || blocked > 0) {
 				SPEHLog(@"[openinapp] 清理 meta=%d el=%d 已拦点击=%d", meta, elems, blocked);
 			}
-			// 0.13.3：Bing 结果页「继续搜索」卡片的压制计数（捕获阶段 stopPropagation 命中）
+			// 0.13.4：Bing 结果页「继续搜索」卡片的压制计数（捕获阶段 stopPropagation 命中）
 			if (bingCs > 0) {
 				SPEHLog(@"[openinapp] Bing 结果页点击压制 累计=%d", bingCs);
 			}
@@ -1453,7 +1454,7 @@ static void SPEHEnhanceAddGestureHook(UIView *self, SEL _cmd, UIGestureRecognize
 	if (gOrigAddGesture) ((void (*)(id, SEL, id))gOrigAddGesture)(self, _cmd, gr);
 }
 
-// MARK: - 0.13.3 底部地址栏「单击边缘露出的相邻地址」切页精确拦截
+// MARK: - 0.13.4 底部地址栏「单击边缘露出的相邻地址」切页精确拦截
 //
 // 左右滑切页已由上面的胶囊栏 pan / scrollEnabled 禁用（老板实测生效），这部分一行不动。
 // 剩下的漏洞：当前胶囊左/右会露出一小截相邻标签的地址，点那一小截仍会切页。
@@ -1463,54 +1464,51 @@ static void SPEHEnhanceAddGestureHook(UIView *self, SEL _cmd, UIGestureRecognize
 // 点中间的当前页照常进编辑；上拉开标签页的 pan 起点在中间，不受影响。
 // 不用私有 delegate 方法名，避免误伤；只认贴屏底部、高度像胶囊栏的 collectionView。
 
-static IMP gOrigCapsuleCVHitTest = NULL;
+// 0.13.4 真机视图树实证（0.13.4 日志）：底部地址栏根本不是 UICollectionView，
+// 而是三个并排的 SFCapsuleView：
+//   当前页 frame=(36,807,358,44)   左邻=(-330,807,358,44)   右邻=(402,807,64,44)
+// 点左/右露出的那一小截，命中的就是那两个侧边 SFCapsuleView，切页由它内部处理。
+// 所以正确做法是 hook SFCapsuleView 自身：用 view 在 window 里的中心 x 判定 ——
+// 居中的当前胶囊（delta 小）放行进编辑/上拉；两侧的（delta 大）吞掉点击不切页。
+
+static IMP gOrigCapsuleHitTest = NULL;
 static int gCapsuleLogN = 0;
 
-static UIView *SPEHCapsuleCVHitTestHook(id self, SEL _cmd, CGPoint point, UIEvent *event)
+static UIView *SPEHCapsuleViewHitTestHook(id self, SEL _cmd, CGPoint point, UIEvent *event)
 {
 	UIView *hit = nil;
-	if (gOrigCapsuleCVHitTest) {
-		hit = ((UIView *(*)(id, SEL, CGPoint, UIEvent *))gOrigCapsuleCVHitTest)(self, _cmd, point, event);
+	if (gOrigCapsuleHitTest) {
+		hit = ((UIView *(*)(id, SEL, CGPoint, UIEvent *))gOrigCapsuleHitTest)(self, _cmd, point, event);
 	}
 	if (!SPEHURLBarSwipeKillEnabled() || !hit) return hit;
 
-	UICollectionView *cv = (UICollectionView *)self;
-	UIWindow *win = [cv window];
+	UIView *cap = (UIView *)self;
+	UIWindow *win = [cap window];
 	if (!win) return hit;
 
-	CGRect f = [cv frame];
+	CGRect f = [cap frame];
 	CGFloat winH = [win bounds].size.height;
 	CGFloat winW = [win bounds].size.width;
-	// 快速过滤：只认贴屏幕底部、高度像一条胶囊栏、宽度够宽的 collectionView
+	// 只认贴屏幕底部、高度像胶囊、宽度不是整屏的 SFCapsuleView
 	if (f.size.height <= 0 || f.size.height > 100 ||
-		f.origin.y < winH - 130 || f.size.width < winW * 0.5) return hit;
+		f.origin.y < winH - 130 || f.size.width >= winW * 0.98) return hit;
 
-	NSIndexPath *ip = nil;
-	UICollectionViewLayoutAttributes *attr = nil;
-	@try {
-		ip = [cv indexPathForItemAtPoint:point];
-		if (ip) attr = [cv layoutAttributesForItemAtIndexPath:ip];
-	} @catch (NSException *e) { return hit; }
-	if (!ip || !attr) return hit;
+	// 拿这个胶囊在 window 里的真实中心 x（不依赖 frame 的父坐标）
+	CGPoint wc = [cap convertPoint:CGPointMake(CGRectGetMidX([cap bounds]), CGRectGetMidY([cap bounds]))
+						   toView:win];
+	CGFloat delta = fabs(wc.x - winW / 2.0);
+	CGFloat lim   = winW * 0.35;
 
-	CGFloat cellCx = CGRectGetMidX([attr frame]);
-	CGFloat visCx  = [cv contentOffset].x + CGRectGetMidX([cv bounds]);
-	CGFloat delta  = fabs(cellCx - visCx);
-	CGFloat lim    = CGRectGetWidth([cv bounds]) * 0.4;
-
-	// 每次命中底部 collectionView 的点击都记一条（withlog 版全打，nolog 版编译掉）
-	if (gCapsuleLogN < 20) {
+	if (gCapsuleLogN < 24) {
 		gCapsuleLogN++;
-		SPEHLog(@"[urlprobe] cvHit cv=%@ hit=%@ item=%ld cellCx=%.0f visCx=%.0f delta=%.0f lim=%.0f %@",
-			NSStringFromClass(object_getClass(cv)), NSStringFromClass(object_getClass(hit)),
-			(long)[ip item], cellCx, visCx, delta, lim,
+		SPEHLog(@"[urlprobe] capHit f=(%.0f,%.0f,%.0f,%.0f) winCx=%.0f delta=%.0f lim=%.0f %@",
+			f.origin.x, f.origin.y, f.size.width, f.size.height, wc.x, delta, lim,
 			delta > lim ? @"=> BLOCK" : @"=> pass");
 	}
 
 	if (delta > lim) {
-		// 返回 cv 自身吞掉事件：到不了 cell ⇒ 不触发 didSelect ⇒ 不切页；
-		// 同时不返回 nil（nil 会穿透到下层 WKWebView，反而误触网页链接）。
-		return cv;
+		// 侧边胶囊：返回自身吞掉事件（不返回 nil，避免穿透 WKWebView 误触网页）
+		return cap;
 	}
 	return hit;
 }
@@ -1552,15 +1550,15 @@ static void SPEHInstallURLBarSwipeHooks(void)
 	SPEHPatchInstanceMethod([UIPanGestureRecognizer class], NSSelectorFromString(@"setTranslation:inView:"),
 		(IMP)SPEHPanSetTranslationHook, &gOrigPanSetTranslation);
 
-	// 0.13.3：单击边缘切页拦截 + 探测。
-	// 拦截点在 UICollectionView 的 hitTest（只认底部胶囊 collectionView）；
-	// 探测点 SPEHDumpBarViews 在地址栏挂窗后 dump 真实视图树。
-	SPEHPatchInstanceMethod([UICollectionView class], NSSelectorFromString(@"hitTest:withEvent:"),
-		(IMP)SPEHCapsuleCVHitTestHook, &gOrigCapsuleCVHitTest);
+	// 0.13.4：单击边缘切页拦截。真机证实控件是 SFCapsuleView（非 UICollectionView），
+	// hook 它的 hitTest:withEvent:，侧边胶囊点击吞掉、居中胶囊放行。
+	Class capCls = NSClassFromString(@"SFCapsuleView");
+	SPEHPatchInstanceMethod(capCls, NSSelectorFromString(@"hitTest:withEvent:"),
+		(IMP)SPEHCapsuleViewHitTestHook, &gOrigCapsuleHitTest);
 
-	SPEHLog(@"[urlswipe] hooks addGesture=%s panSetTrans=%s cvHitTest=%s",
+	SPEHLog(@"[urlswipe] hooks addGesture=%s panSetTrans=%s capsuleHitTest=%s cls=%d",
 			gOrigAddGesture ? "ok" : "FAIL", gOrigPanSetTranslation ? "ok" : "FAIL",
-			gOrigCapsuleCVHitTest ? "ok" : "FAIL");
+			gOrigCapsuleHitTest ? "ok" : "FAIL", capCls ? 1 : 0);
 }
 
 // 找到胶囊栏，把它所有 pan 打上标记；之后 setTranslation 里只吃掉横向分量，
@@ -1636,7 +1634,7 @@ static void SPEHNeutralizeURLBarSwipe(UIView *anchor, NSString *tag)
 		gKilledRecognizers = 0;
 		SPEHKillBarSwipes(root, winH, 0);
 #ifndef SPEH_NO_LOG
-		// 0.13.3：探测版只 dump 一次真实底部视图树，确认控件到底是哪个类
+		// 0.13.4：探测版只 dump 一次真实底部视图树，确认控件到底是哪个类
 		static BOOL dumped = NO;
 		if (!dumped) {
 			dumped = YES;
