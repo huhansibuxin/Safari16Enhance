@@ -1,4 +1,4 @@
-// Safari16Enhance 0.13.6 - iOS 16 Safari 增强
+// Safari16Enhance 0.13.7 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.13.6"
+#define SPEH_VERSION "0.13.7"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -1550,58 +1550,90 @@ static void SPEHGrTouchesBeganHook(id self, SEL _cmd, NSSet *touches, UIEvent *e
 	}
 }
 
-// 0.13.6 布满方案：hook SFCapsuleView 的 setFrame:，系统每次布局时改写三个胶囊的呈现：
-//   居中那个 → 横向铺满整条地址栏（x=0, width=屏宽），隐藏取消
-//   左右邻居 → hidden=YES + 关交互（看不见、hitTest 也不命中，物理上消掉边缘切页落点）
-// 拦截 setFrame 的参数再调原始 IMP，避免「改完又被系统 layout 改回去」的反复横跳。
-static IMP gOrigCapsuleSetFrame = NULL;
+// 0.13.7 布满方案 v2：0.13.6 证明在 setFrame: 改 frame 会被父容器重新布局覆盖，
+// 左右胶囊也根本不走 setFrame:（日志零条 SIDE-HIDE）。改为 hook layoutSubviews：
+// 父布局完成后再改自身 frame，覆盖不会立刻回写。
+//   居中胶囊 → 横向铺满整条地址栏（x=0, width=屏宽）
+//   左右邻居 → hidden=YES + 关交互（物理上消掉边缘切页落点）
+static IMP gOrigCapsuleLayout = NULL;
 #ifndef SPEH_NO_LOG
 static int gFillLogN = 0;
+static int gAncDumped = 0;
+static void SPEHDumpAncestors(UIView *v)
+{
+	UIView *cur = v;
+	int d = 0;
+	while (cur && d < 12) {
+		NSString *cls = NSStringFromClass(object_getClass(cur));
+		CGRect f = [cur frame];
+		NSMutableString *grs = [NSMutableString string];
+		for (UIGestureRecognizer *g in [cur gestureRecognizers]) {
+			if (grs.length) [grs appendString:@","];
+			[grs appendString:NSStringFromClass(object_getClass(g))];
+		}
+		NSString *extra = @"";
+		if ([cur isKindOfClass:[UIScrollView class]]) {
+			UIScrollView *sv = (UIScrollView *)cur;
+			extra = [NSString stringWithFormat:@" content=(%.0f,%.0f) off=(%.0f,%.0f) paging=%d clips=%d",
+					 sv.contentSize.width, sv.contentSize.height, sv.contentOffset.x, sv.contentOffset.y,
+					 sv.pagingEnabled, sv.clipsToBounds];
+		}
+		SPEHLog(@"[urlprobe] anc d=%d %@ f=(%.0f,%.0f,%.0f,%.0f) clips=%d gr=[%@]%@",
+				d, cls, f.origin.x, f.origin.y, f.size.width, f.size.height, cur.clipsToBounds, grs, extra);
+		cur = [cur superview];
+		d++;
+	}
+}
 #endif
 
-static void SPEHCapsuleSetFrameHook(id self, SEL _cmd, CGRect f)
+static void SPEHCapsuleLayoutHook(id self, SEL _cmd)
 {
+	if (gOrigCapsuleLayout) {
+		((void (*)(id, SEL))gOrigCapsuleLayout)(self, _cmd);
+	}
+	if (!SPEHURLBarSwipeKillEnabled()) return;
+
 	UIView *cap = (UIView *)self;
-	CGRect nf = f;
-	BOOL isCenter = NO, isSide = NO;
+	UIWindow *win = [cap window];
+	if (!win) return;
 
-	do {
-		if (!SPEHURLBarSwipeKillEnabled()) break;
-		// 只认贴屏幕底部、高度像一条胶囊、宽度接近屏宽的视图（排除总览态缩略胶囊）
-		if (f.size.height < 28 || f.size.height > 70) break;
-		CGFloat winW = [UIScreen mainScreen].bounds.size.width;
-		CGFloat winH = [UIScreen mainScreen].bounds.size.height;
-		if (f.size.width < winW * 0.5 || f.size.width > winW * 1.2) break;
-		if (f.origin.y < winH - 200) break;
+	CGRect f = [cap frame];
+	CGFloat winW = [win bounds].size.width;
+	CGFloat winH = [win bounds].size.height;
+	// 只认贴屏幕底部、高度像一条胶囊、宽度接近屏宽的视图
+	if (f.size.height < 28 || f.size.height > 70) return;
+	if (f.size.width < winW * 0.5 || f.size.width > winW * 1.2) return;
+	if (f.origin.y < winH - 200) return;
 
-		CGFloat cx = CGRectGetMidX(f);
-		if (fabs(cx - winW / 2.0) < winW * 0.15) {
-			isCenter = YES;
-			nf = CGRectMake(0, f.origin.y, winW, f.size.height);
-		} else {
-			isSide = YES;
-		}
-	} while (0);
+	CGPoint wc = [cap convertPoint:CGPointMake(CGRectGetMidX([cap bounds]), CGRectGetMidY([cap bounds]))
+						   toView:win];
+	CGFloat delta = fabs(wc.x - winW / 2.0);
+	BOOL isCenter = (delta < winW * 0.15);
 
 #ifndef SPEH_NO_LOG
-	if (gFillLogN < 30 && (isCenter || isSide)) {
+	if (isCenter && gAncDumped < 1) {
+		gAncDumped++;
+		SPEHLog(@"[urlprobe] === capsule ancestor chain ===");
+		SPEHDumpAncestors(cap);
+	}
+	if (gFillLogN < 40) {
 		gFillLogN++;
-		SPEHLog(@"[urlprobe] fillBar %@ f=(%.0f,%.0f,%.0f,%.0f) -> (%.0f,%.0f,%.0f,%.0f)",
-				isCenter ? @"FILL" : @"SIDE-HIDE",
-				f.origin.x, f.origin.y, f.size.width, f.size.height,
-				nf.origin.x, nf.origin.y, nf.size.width, nf.size.height);
+		SPEHLog(@"[urlprobe] layoutCap %@ f=(%.0f,%.0f,%.0f,%.0f) wc=%.0f delta=%.0f",
+				isCenter ? @"CENTER" : @"SIDE", f.origin.x, f.origin.y, f.size.width, f.size.height, wc.x, delta);
 	}
 #endif
 
 	if (isCenter) {
+		CGRect nf = CGRectMake(0, f.origin.y, winW, f.size.height);
+		if (!CGRectEqualToRect(f, nf)) {
+			// 已移除 setFrame hook，这里 setFrame 不会递归；即便触发重布局，
+			// 下一次进来 f 已等于 nf，CGRectEqualToRect 成立即收敛。
+			[cap setFrame:nf];
+		}
 		if ([cap isHidden]) [cap setHidden:NO];
-	} else if (isSide) {
+	} else {
 		if (![cap isHidden]) [cap setHidden:YES];
 		if ([cap isUserInteractionEnabled]) [cap setUserInteractionEnabled:NO];
-	}
-
-	if (gOrigCapsuleSetFrame) {
-		((void (*)(id, SEL, CGRect))gOrigCapsuleSetFrame)(self, _cmd, nf);
 	}
 }
 
@@ -1690,9 +1722,10 @@ static void SPEHInstallURLBarSwipeHooks(void)
 	SPEHPatchInstanceMethod(capCls, NSSelectorFromString(@"hitTest:withEvent:"),
 		(IMP)SPEHCapsuleViewHitTestHook, &gOrigCapsuleHitTest);
 
-	// 0.13.6：布满方案 —— hook setFrame:，中间胶囊铺满、左右邻居隐藏
-	SPEHPatchInstanceMethod(capCls, NSSelectorFromString(@"setFrame:"),
-		(IMP)SPEHCapsuleSetFrameHook, &gOrigCapsuleSetFrame);
+	// 0.13.7：布满方案 v2 —— 0.13.6 证明 setFrame 会被父布局覆盖、左右胶囊不走 setFrame，
+	// 改为 hook layoutSubviews（父布局完成后改自身 frame），中间铺满、左右隐藏。
+	SPEHPatchInstanceMethod(capCls, NSSelectorFromString(@"layoutSubviews"),
+		(IMP)SPEHCapsuleLayoutHook, &gOrigCapsuleLayout);
 
 	// 0.13.5：单击边缘切页的真正拦截 —— hook 手势层 touchesBegan，边缘 tap 吞掉。
 	Class grCls = [UIGestureRecognizer class];
@@ -1701,9 +1734,9 @@ static void SPEHInstallURLBarSwipeHooks(void)
 		SPEHPatchInstanceMethod(grCls, tbSel, (IMP)SPEHGrTouchesBeganHook, &gOrigGRTouchesBegan);
 	}
 
-	SPEHLog(@"[urlswipe] hooks addGesture=%s panSetTrans=%s capsuleHitTest=%s capsuleSetFrame=%s grTouchesBegan=%s cls=%d",
+	SPEHLog(@"[urlswipe] hooks addGesture=%s panSetTrans=%s capsuleHitTest=%s capsuleLayout=%s grTouchesBegan=%s cls=%d",
 			gOrigAddGesture ? "ok" : "FAIL", gOrigPanSetTranslation ? "ok" : "FAIL",
-			gOrigCapsuleHitTest ? "ok" : "FAIL", gOrigCapsuleSetFrame ? "ok" : "FAIL",
+			gOrigCapsuleHitTest ? "ok" : "FAIL", gOrigCapsuleLayout ? "ok" : "FAIL",
 			gOrigGRTouchesBegan ? "ok" : "FAIL", capCls ? 1 : 0);
 }
 
