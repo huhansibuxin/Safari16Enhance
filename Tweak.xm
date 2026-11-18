@@ -1,4 +1,4 @@
-// Safari16Enhance 0.14.1 - iOS 16 Safari 增强
+// Safari16Enhance 0.14.2 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.14.1"
+#define SPEH_VERSION "0.14.2"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -1366,7 +1366,7 @@ static void SPEHInstallAppLinkHooks(void)
 // 为什么删：这套只为「返回后滑不动」的 SPA 站点（元宝）加的，而且左滑手势返回
 // 根本不走 -[WKWebView goBack]，对它本来就没生效。留着只是多 5 个 WKWebView hook 面。
 
-// MARK: - 底部地址栏：按真实类名精准禁用（0.14.1）
+// MARK: - 底部地址栏：按真实类名精准禁用（0.14.2）
 //
 // 老板实测：在底部地址栏左右滑、或点相邻页露出的那一小截、或点两者之间那条空白缝，都会切上一页/下一页。
 // 目标：只禁这几条，宽度/外观保持系统原样，中间的当前页点照常能用，上拉标签页不受影响。
@@ -1388,6 +1388,12 @@ static void SPEHInstallAppLinkHooks(void)
 //   · 相邻页胶囊与当前页胶囊的 frame 有重叠区，重叠处被 `onSide && !onCenter` 判成放行。
 //   改为反向判定：胶囊那一整条横带里，只要不在当前页胶囊内部就一律拦（详见 SPEHTapShouldBlock）。
 // 全部按类名 + 真实子视图几何精确匹配，不用硬编码坐标。
+//
+// 0.14.2 性能：这两条 hook 挂在全局手势类上，全机每次 tap / pan 都会进来。原先把偏好读取
+// （CFPreferencesCopyAppValue，跨进程 plist 查表）放在「是否胶囊体系」判定之前，等于每次触摸都
+// 白读一次偏好；pan 还会在每个 Changed 帧（60Hz）重新扫一遍子视图。现在改为：
+//   · 先做 isKindOfClass 廉价判定，命中胶囊体系才读偏好；
+//   · pan 的「胶囊归属 + 偏好」只在 Began 算一次，结果缓存到识别器上，之后每帧只读一个 NSNumber。
 
 static BOOL SPEHURLBarSwipeKillEnabled(void) { return SPEHBoolPref(@"killURLBarSwipe", YES); }
 
@@ -1487,11 +1493,13 @@ static BOOL SPEHTapShouldBlock(UIView *host, CGPoint pInHost, BOOL *outBlank)
 //    0.13.9 真机日志实证这条链路有效（state=3 -> Failed，8/8 命中）。
 static void SPEHTapStateHook(id self, SEL _cmd, NSInteger state)
 {
-	if ((state == 1 || state == 3) && gCapsuleCVClass && SPEHURLBarSwipeKillEnabled()) {
+	if ((state == 1 || state == 3) && gCapsuleCVClass) {
 		@try {
 			UIGestureRecognizer *gr = (UIGestureRecognizer *)self;
 			UIView *host = [gr view];
-			if ([gr isKindOfClass:[UITapGestureRecognizer class]] && SPEHIsCapsuleView(host)) {
+			// 顺序很重要：先做两次 isKindOfClass（纳秒级），只有确实是胶囊体系才去读偏好
+			if ([gr isKindOfClass:[UITapGestureRecognizer class]] && SPEHIsCapsuleView(host) &&
+				SPEHURLBarSwipeKillEnabled()) {
 				CGPoint p = [gr locationInView:host];
 				BOOL blank = NO;
 				if (SPEHTapShouldBlock(host, p, &blank)) {
@@ -1516,13 +1524,37 @@ static void SPEHTapStateHook(id self, SEL _cmd, NSInteger state)
 //    0.13.9 日志实证它不读 translationInView:（清零后照样切页），所以必须掐状态机：
 //    拖动到 Changed 时判方向，横向占优就直接置 Failed，Safari 的 pan 处理器收不到 Ended，不会切页。
 //    纵向占优（上拉展开标签页）完全放行。
+// 每帧（Changed）都要判方向，所以「是否胶囊体系 + 偏好是否开启」只在 Began 算一次，
+// 结果缓存到识别器自身；之后每帧只读一个 NSNumber，避免 60Hz 扫子视图 + 读 CFPreferences。
+static char kPanCapsuleFlag = 0;
+static NSNumber *SPEHFlagNS(BOOL v)
+{
+	static NSNumber *yes = nil, *no = nil;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{ yes = @YES; no = @NO; });
+	return v ? yes : no;
+}
+
+static BOOL SPEHPanCapsuleCached(UIPanGestureRecognizer *gr, BOOL recompute)
+{
+	NSNumber *flag = objc_getAssociatedObject(gr, &kPanCapsuleFlag);
+	if (flag && !recompute) return flag.boolValue;
+	// 先做廉价类判定，命中才读偏好
+	BOOL isCap = SPEHIsCapsuleHostDeep([gr view]) && SPEHURLBarSwipeKillEnabled();
+	objc_setAssociatedObject(gr, &kPanCapsuleFlag, SPEHFlagNS(isCap), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+	return isCap;
+}
+
 static void SPEHPanStateHook(id self, SEL _cmd, NSInteger state)
 {
-	if ((state == 2 || state == 3) && gCapsuleCVClass && SPEHURLBarSwipeKillEnabled()) {
+	if (gCapsuleCVClass && state == 1) {
+		@try { SPEHPanCapsuleCached((UIPanGestureRecognizer *)self, YES); } @catch (NSException *e) { }
+	}
+	if ((state == 2 || state == 3) && gCapsuleCVClass) {
 		@try {
 			UIPanGestureRecognizer *gr = (UIPanGestureRecognizer *)self;
 			UIView *host = [gr view];
-			if (SPEHIsCapsuleHostDeep(host)) {
+			if (SPEHPanCapsuleCached(gr, NO)) {
 				CGPoint t = [gr translationInView:host];
 				CGPoint v = [gr velocityInView:host];
 				BOOL horiz = (fabs(v.x) > fabs(v.y) * 1.2 && fabs(v.x) > 80.0) ||
