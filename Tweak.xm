@@ -1,4 +1,4 @@
-// Safari16Enhance 0.14.0 - iOS 16 Safari 增强
+// Safari16Enhance 0.14.1 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.14.0"
+#define SPEH_VERSION "0.14.1"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -1366,33 +1366,34 @@ static void SPEHInstallAppLinkHooks(void)
 // 为什么删：这套只为「返回后滑不动」的 SPA 站点（元宝）加的，而且左滑手势返回
 // 根本不走 -[WKWebView goBack]，对它本来就没生效。留着只是多 5 个 WKWebView hook 面。
 
-// MARK: - 底部地址栏：按真实类名精准禁用（0.14.0）
+// MARK: - 底部地址栏：按真实类名精准禁用（0.14.1）
 //
-// 老板实测：在底部地址栏左右滑、或点左右露出一小截的相邻页，都会切上一页/下一页。
-// 目标：只禁这两条，宽度/外观保持系统原样，中间的当前页点照常能用，上拉标签页不受影响。
+// 老板实测：在底部地址栏左右滑、或点相邻页露出的那一小截、或点两者之间那条空白缝，都会切上一页/下一页。
+// 目标：只禁这几条，宽度/外观保持系统原样，中间的当前页点照常能用，上拉标签页不受影响。
 //
 // 真实结构（0.13.7 真机运行时视图树 dump，不是猜的）：
 //   d=0 SFCapsuleView            f=(20,807,390,44)  gr=[]
 //   d=1 SFCapsuleCollectionView  f=(0,0,430,932)    gr=[UITap, UIPan, UIPan]
 //   d=2 UIView                   f=(0,0,430,932)    gr=[UIPan]
 //
-// 0.13.9 真机日志给出的准确链路（8/8 单击命中、滑动未命中）：
-//   · 单击 = 容器上的 UITapGestureRecognizer：hook setState: 收到 state=3(Ended) 改 5(Failed)
-//     ⇒ action 不执行 ⇒ 不切页。有效。
-//   · 滑动 = 同一容器上的 UIPanGestureRecognizer，但它不读 translationInView: —— 0.13.9 把
-//     横向分量清零后照样切页（日志里 pan 横向清零只被调用 2 次、数值 6pt 内），
-//     说明切页由 pan 自己的状态机驱动，不在 translation 上。
-//   · scrollEnabled 那几层（didMoveToWindow / layoutSubviews / setScrollEnabled:）日志全空，
-//     滑动根本不是滚动偏移驱动的，已在 0.14.0 删掉多余的两层。
-// 所以 0.14.0：两条手势各自掐自己的状态机 —— tap 用 setState:，pan 用 setState: 判横向占优即 Failed。
-// 全部按类名精确匹配，不用位置兜底。
+// 0.14.0 真机日志（单击 10 命中 / 滑动 12 命中 / 滚动层 0 命中）确定唯一有效链路：
+//   · 单击 = 容器上的 UITapGestureRecognizer → hook setState:，收到 state=3(Ended) 改 5(Failed)
+//     ⇒ action 不执行 ⇒ 不切页。
+//   · 滑动 = 同一容器上的 UIPanGestureRecognizer → hook setState:，Changed/Ended 判横向占优即 Failed。
+//     它不读 translationInView:（0.13.9 清零横向分量后照样切页），所以只能掐状态机。
+//   · scrollEnabled 那几层（didMoveToWindow / layoutSubviews / setScrollEnabled: / translation）日志全空，
+//     滑动不是滚动偏移驱动，已全部删除。
+// 0.14.1 补的缺口：0.14.0 的点击判定要求「必须落在某个侧边胶囊 frame 内」，于是
+//   · 当前页与相邻页之间那条不属于任何控件的空白缝被放行（老板实测点它照样切页）；
+//   · 相邻页胶囊与当前页胶囊的 frame 有重叠区，重叠处被 `onSide && !onCenter` 判成放行。
+//   改为反向判定：胶囊那一整条横带里，只要不在当前页胶囊内部就一律拦（详见 SPEHTapShouldBlock）。
+// 全部按类名 + 真实子视图几何精确匹配，不用硬编码坐标。
 
 static BOOL SPEHURLBarSwipeKillEnabled(void) { return SPEHBoolPref(@"killURLBarSwipe", YES); }
 
 static Class gCapsuleCVClass = NULL;    // SFCapsuleCollectionView（胶囊分页容器）
 static Class gCapsuleViewClass = NULL;  // SFCapsuleView（单个胶囊）
 
-static IMP gOrigCapCVDidMoveToWindow = NULL;
 static IMP gOrigTapSetState = NULL;
 static IMP gOrigPanSetState = NULL;
 
@@ -1429,10 +1430,22 @@ static UIView *SPEHCapsuleContainerOf(UIView *v)
 	return v;
 }
 
-// 触点是否落在「侧边（非居中当前页）胶囊」上。
-// 判定依据是真实子视图几何：触点命中哪个 SFCapsuleView，就看那个胶囊中心离屏幕中心多远。
-static BOOL SPEHPointOnSideCapsule(UIView *host, CGPoint pInHost)
+// 一次点击是否要拦（0.14.1 修正）。
+//
+// 0.14.0 的写法是「触点必须落在某个侧边胶囊的 frame 内」才拦，实测漏了两处：
+//   · 当前页胶囊与相邻页胶囊之间那条不属于任何控件的空白缝 —— 两个条件都不成立被放行，
+//     而容器上的 tap 照样识别 ⇒ 点缝里也能切页（老板实测）；
+//   · 相邻页胶囊的 frame 与当前页胶囊的 frame 存在重叠区，重叠处 onCenter 与 onSide 同时为真，
+//     被 `onSide && !onCenter` 判成放行。
+// 现在改为反向判定：胶囊所在的那一整条横带里，只要没落在「居中当前页胶囊」内部就一律拦，
+// 相邻页露出的一截、中间那条空白缝、重叠区全部覆盖；当前页胶囊内部照常进编辑。
+// 仍然只按真实子视图几何判定，不看硬编码坐标。
+//
+// outBlank：命中处是否不在任何胶囊 frame 内（即那条空白缝），仅用于日志区分。
+static BOOL SPEHTapShouldBlock(UIView *host, CGPoint pInHost, BOOL *outBlank)
 {
+	if (outBlank) *outBlank = NO;
+
 	UIView *cv = SPEHCapsuleContainerOf(host);
 	UIWindow *win = [cv window];
 	if (!win) return NO;
@@ -1442,46 +1455,32 @@ static BOOL SPEHPointOnSideCapsule(UIView *host, CGPoint pInHost)
 	CGPoint pWin = [host convertPoint:pInHost toView:win];
 	CGPoint pCv  = [cv convertPoint:pWin fromView:win];
 
-	BOOL onCenter = NO, onSide = NO;
+	CGRect band = CGRectNull;
+	CGRect centerRect = CGRectNull;
+	BOOL inAnyCapsule = NO;
+	CGFloat bestDelta = CGFLOAT_MAX;
+
 	for (UIView *s in [cv subviews]) {
 		if (gCapsuleViewClass && ![s isKindOfClass:gCapsuleViewClass]) continue;
 		CGRect f = [s frame];
 		if (f.size.width <= 0 || f.size.height <= 0) continue;
-		if (!CGRectContainsPoint(f, pCv)) continue;
+		band = CGRectIsNull(band) ? f : CGRectUnion(band, f);
+		if (CGRectContainsPoint(f, pCv)) inAnyCapsule = YES;
 		CGRect wf = [s convertRect:[s bounds] toView:win];
-		if (fabs(CGRectGetMidX(wf) - winW / 2.0) < winW * 0.15) onCenter = YES;
-		else onSide = YES;
+		CGFloat d = fabs(CGRectGetMidX(wf) - winW / 2.0);
+		if (d < winW * 0.15 && d < bestDelta) { bestDelta = d; centerRect = f; }
 	}
-	return (onSide && !onCenter);
-}
 
-// ① 滑动 · 容器挂到窗口时顺手关掉自身横向滚动（仅作兜底，0.13.9 日志里这层从未触发，
-//    因为实测滑动不由滚动偏移驱动；保留它只为挡住少数走拖动滚动的路径）
-static void SPEHCapCVDidMoveToWindowHook(id self, SEL _cmd)
-{
-	if (gOrigCapCVDidMoveToWindow)
-		((void (*)(id, SEL))gOrigCapCVDidMoveToWindow)(self, _cmd);
+	if (CGRectIsNull(band) || CGRectIsNull(centerRect)) return NO;
 
-	if (!SPEHURLBarSwipeKillEnabled()) return;
-	@try {
-#ifndef SPEH_NO_LOG
-		static int seen = 0;
-		if (seen < 3) {
-			seen++;
-			UIScrollView *sv = (UIScrollView *)self;
-			NSMutableString *grs = [NSMutableString string];
-			for (UIGestureRecognizer *g in [self gestureRecognizers]) {
-				if (grs.length) [grs appendString:@","];
-				[grs appendString:NSStringFromClass(object_getClass(g))];
-			}
-			SPEHLog(@"[urlswipe] ① 容器挂窗口 scrollEnabled=%d contentW=%.0f gr=[%@]",
-					sv.scrollEnabled ? 1 : 0, sv.contentSize.width, grs);
-		}
-#endif
-		if ([self isKindOfClass:[UIScrollView class]] && ((UIScrollView *)self).scrollEnabled) {
-			((UIScrollView *)self).scrollEnabled = NO;
-		}
-	} @catch (NSException *e) { }
+	// 当前页胶囊内部：放行（点它进编辑，是正常操作）
+	if (CGRectContainsPoint(centerRect, pCv)) return NO;
+
+	// 只在胶囊那一行的高度范围内才拦，避免影响网页区域的点击
+	if (pCv.y < CGRectGetMinY(band) - 2.0 || pCv.y > CGRectGetMaxY(band) + 2.0) return NO;
+
+	if (outBlank) *outBlank = !inAnyCapsule;
+	return YES;
 }
 
 // ② 单击：挂在胶囊容器上的 UITapGestureRecognizer，识别到 Ended 时改置 Failed，切页 action 不执行。
@@ -1494,13 +1493,15 @@ static void SPEHTapStateHook(id self, SEL _cmd, NSInteger state)
 			UIView *host = [gr view];
 			if ([gr isKindOfClass:[UITapGestureRecognizer class]] && SPEHIsCapsuleView(host)) {
 				CGPoint p = [gr locationInView:host];
-				if (SPEHPointOnSideCapsule(host, p)) {
+				BOOL blank = NO;
+				if (SPEHTapShouldBlock(host, p, &blank)) {
 #ifndef SPEH_NO_LOG
 					static int n = 0;
-					if (n < 10) {
+					if (n < 12) {
 						n++;
-						SPEHLog(@"[urlswipe] ② 侧边胶囊单击 x=%.0f host=%@ state=%ld -> Failed",
-								p.x, NSStringFromClass(object_getClass(host)), (long)state);
+						SPEHLog(@"[urlswipe] ② 单击拦截 x=%.0f y=%.0f 空白缝=%d host=%@ state=%ld -> Failed",
+								p.x, p.y, blank ? 1 : 0,
+								NSStringFromClass(object_getClass(host)), (long)state);
 					}
 #endif
 					state = 5;   // UIGestureRecognizerStateFailed
@@ -1551,21 +1552,16 @@ static void SPEHInstallURLBarSwipeHooks(void)
 	gCapsuleCVClass   = NSClassFromString(@"SFCapsuleCollectionView");
 	gCapsuleViewClass = NSClassFromString(@"SFCapsuleView");
 
-	// 兜底层：容器挂窗口时关横向滚动
-	if (gCapsuleCVClass) {
-		SPEHPatchInstanceMethod(gCapsuleCVClass, NSSelectorFromString(@"didMoveToWindow"),
-			(IMP)SPEHCapCVDidMoveToWindowHook, &gOrigCapCVDidMoveToWindow);
-	}
-
-	// 主拦截层：两条手势各自掐自己的状态机（单击 = tap、滑动 = pan）
+	// 全部拦截只挂在两条手势的状态机上（0.14.0 日志实证：这一步是唯一有效链路，其余层零命中已删）
+	//   单击 = UITapGestureRecognizer setState:
+	//   滑动 = UIPanGestureRecognizer setState:
 	SPEHPatchInstanceMethod([UITapGestureRecognizer class], NSSelectorFromString(@"setState:"),
 		(IMP)SPEHTapStateHook, &gOrigTapSetState);
 	SPEHPatchInstanceMethod([UIPanGestureRecognizer class], NSSelectorFromString(@"setState:"),
 		(IMP)SPEHPanStateHook, &gOrigPanSetState);
 
-	SPEHLog(@"[urlswipe] 0.14.0 安装 capCV=%d capView=%d didMoveToWin=%s tapSetState=%s panSetState=%s",
+	SPEHLog(@"[urlswipe] 0.14.1 安装 capCV=%d capView=%d tapSetState=%s panSetState=%s",
 			gCapsuleCVClass ? 1 : 0, gCapsuleViewClass ? 1 : 0,
-			gOrigCapCVDidMoveToWindow ? "ok" : "FAIL",
 			gOrigTapSetState ? "ok" : "FAIL", gOrigPanSetState ? "ok" : "FAIL");
 }
 
