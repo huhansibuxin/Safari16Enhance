@@ -1,4 +1,4 @@
-// Safari16Enhance 0.14.2 - iOS 16 Safari 增强
+// Safari16Enhance 0.14.3 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.14.2"
+#define SPEH_VERSION "0.14.3"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -1034,6 +1034,10 @@ static void SPEHInstallSmartAppBannerPreciseHooks(void)
 
 static IMP gOrigWVDidMoveToWindow = NULL;
 
+// 定义在地址栏模块（文件后部）；WKWebView 挂载时 SafariFramework 已基本加载完成，
+// 这里补装一次容器 hitTest hook，避免只靠地址栏模块的短轮询。
+static void SPEHInstallCapCVHitTestHook(void);
+
 static void SPEHWVDidMoveToWindowHook(UIView *self, SEL _cmd)
 {
 	if (gOrigWVDidMoveToWindow) ((void (*)(id, SEL))gOrigWVDidMoveToWindow)(self, _cmd);
@@ -1045,8 +1049,9 @@ static void SPEHWVDidMoveToWindowHook(UIView *self, SEL _cmd)
 
 	__weak UIView *weakSelf = self;
 
-	// 地址栏手势不再按窗口树遍历（0.13.9 的 hook 全挂在真实类 SFCapsuleCollectionView 上，
-	// 类加载即生效，与 WKWebView 何时挂载无关）。
+	// 地址栏：容器 hitTest hook 打在真实类 SFCapsuleCollectionView 上。该类属于 SafariFramework，
+	// 加载时机晚于本 tweak，所以每次 webview 挂载时补装一次（函数内部幂等，装过即返回）。
+	SPEHInstallCapCVHitTestHook();
 
 	// 装 banner 的精准 hook：只装一次（TabDocument 是单例级，重复装会重复 hook）
 	if (first && SPEHSmartBannerKillEnabled()) {
@@ -1366,7 +1371,7 @@ static void SPEHInstallAppLinkHooks(void)
 // 为什么删：这套只为「返回后滑不动」的 SPA 站点（元宝）加的，而且左滑手势返回
 // 根本不走 -[WKWebView goBack]，对它本来就没生效。留着只是多 5 个 WKWebView hook 面。
 
-// MARK: - 底部地址栏：按真实类名精准禁用（0.14.2）
+// MARK: - 底部地址栏：按真实类名精准禁用（0.14.3）
 //
 // 老板实测：在底部地址栏左右滑、或点相邻页露出的那一小截、或点两者之间那条空白缝，都会切上一页/下一页。
 // 目标：只禁这几条，宽度/外观保持系统原样，中间的当前页点照常能用，上拉标签页不受影响。
@@ -1386,8 +1391,17 @@ static void SPEHInstallAppLinkHooks(void)
 // 0.14.1 补的缺口：0.14.0 的点击判定要求「必须落在某个侧边胶囊 frame 内」，于是
 //   · 当前页与相邻页之间那条不属于任何控件的空白缝被放行（老板实测点它照样切页）；
 //   · 相邻页胶囊与当前页胶囊的 frame 有重叠区，重叠处被 `onSide && !onCenter` 判成放行。
-//   改为反向判定：胶囊那一整条横带里，只要不在当前页胶囊内部就一律拦（详见 SPEHTapShouldBlock）。
+//   改为反向判定：胶囊那一整条横带里，只要不在当前页胶囊内部就一律拦（详见 SPEHBlockZone）。
 // 全部按类名 + 真实子视图几何精确匹配，不用硬编码坐标。
+//
+// 0.14.3 结构改造（老板要求尽量不要 hook 全局类）：单击不再 hook 全局 UITapGestureRecognizer，
+//   改为只 hook SFCapsuleCollectionView 自己的 hitTest:withEvent: —— 命中拦截区域就返回一个
+//   挂在 window 上的遮挡视图（它不是容器的后代），容器上的 tap/pan 都收不到这次触摸，因此
+//   不切页，也不会穿透到下层 WKWebView 误触网页链接。全机其它 tap 手势彻底不受影响。
+//   滑动仍保留一条全局 UIPanGestureRecognizer hook：Safari 已占用其 delegate，横向/纵向方向判定
+//   只能在状态机这一层做，实例级无可替代入口；钩子首帧就做廉价类判定，非胶囊体系直接返回。
+//   同时把拦截区域在垂直方向上下各放宽 20pt（kPadY）：覆盖老板实测漏掉的「左右露出那一节
+//   上方一点点」窄带 —— 那条缝不属于任何胶囊，但容器 tap 照样识别，点下去仍会切页。
 //
 // 0.14.2 性能：这两条 hook 挂在全局手势类上，全机每次 tap / pan 都会进来。原先把偏好读取
 // （CFPreferencesCopyAppValue，跨进程 plist 查表）放在「是否胶囊体系」判定之前，等于每次触摸都
@@ -1400,7 +1414,6 @@ static BOOL SPEHURLBarSwipeKillEnabled(void) { return SPEHBoolPref(@"killURLBarS
 static Class gCapsuleCVClass = NULL;    // SFCapsuleCollectionView（胶囊分页容器）
 static Class gCapsuleViewClass = NULL;  // SFCapsuleView（单个胶囊）
 
-static IMP gOrigTapSetState = NULL;
 static IMP gOrigPanSetState = NULL;
 
 // 该视图是否属于底部胶囊地址栏体系（容器或单个胶囊）
@@ -1436,30 +1449,32 @@ static UIView *SPEHCapsuleContainerOf(UIView *v)
 	return v;
 }
 
-// 一次点击是否要拦（0.14.1 修正）。
+// 一次触摸是否落在「该拦的区域」里（0.14.3）。
 //
-// 0.14.0 的写法是「触点必须落在某个侧边胶囊的 frame 内」才拦，实测漏了两处：
-//   · 当前页胶囊与相邻页胶囊之间那条不属于任何控件的空白缝 —— 两个条件都不成立被放行，
-//     而容器上的 tap 照样识别 ⇒ 点缝里也能切页（老板实测）；
-//   · 相邻页胶囊的 frame 与当前页胶囊的 frame 存在重叠区，重叠处 onCenter 与 onSide 同时为真，
-//     被 `onSide && !onCenter` 判成放行。
-// 现在改为反向判定：胶囊所在的那一整条横带里，只要没落在「居中当前页胶囊」内部就一律拦，
-// 相邻页露出的一截、中间那条空白缝、重叠区全部覆盖；当前页胶囊内部照常进编辑。
-// 仍然只按真实子视图几何判定，不看硬编码坐标。
+// 判定全部基于真实子视图几何，不看硬编码坐标：
+//   band       = 所有 SFCapsuleView 子视图 frame 的并集（容器坐标系）；
+//   centerRect = 中心离屏幕中线最近、且偏离小于 15% 屏宽的那个胶囊 = 当前页胶囊。
 //
-// outBlank：命中处是否不在任何胶囊 frame 内（即那条空白缝），仅用于日志区分。
-static BOOL SPEHTapShouldBlock(UIView *host, CGPoint pInHost, BOOL *outBlank)
+// 0.14.1 只按「胶囊那一行的高度」判（上下各留 2pt），老板实测还漏了：
+//   左右两侧露出的相邻页胶囊**上方那一点点窄带** —— 它不属于任何胶囊、也不在那一行内，
+//   但容器上的 tap 照样识别，点下去还是切上一页/下一页。
+// 0.14.3 把 band 在垂直方向上下各放宽 kPadY（覆盖上方那条窄带与下方同理），
+// 规则不变：放宽后的带内、只要不在当前页胶囊内部，就一律拦。
+//
+// outBlank：触点不在任何胶囊 frame 内（空白缝 / 上下窄带），仅用于日志区分；
+// outAbove：触点位于胶囊那一行的上方（老板这次指的漏点），仅用于日志区分。
+static BOOL SPEHBlockZone(UIView *cv, CGPoint pInCv, BOOL *outBlank, BOOL *outAbove)
 {
 	if (outBlank) *outBlank = NO;
+	if (outAbove) *outAbove = NO;
 
-	UIView *cv = SPEHCapsuleContainerOf(host);
 	UIWindow *win = [cv window];
 	if (!win) return NO;
 	CGFloat winW = [win bounds].size.width;
 	if (winW <= 0) return NO;
 
-	CGPoint pWin = [host convertPoint:pInHost toView:win];
-	CGPoint pCv  = [cv convertPoint:pWin fromView:win];
+	// 上下各放宽这么多：覆盖老板说的「左右露出那一节上方一点点」那条窄带
+	const CGFloat kPadY = 20.0;
 
 	CGRect band = CGRectNull;
 	CGRect centerRect = CGRectNull;
@@ -1471,53 +1486,90 @@ static BOOL SPEHTapShouldBlock(UIView *host, CGPoint pInHost, BOOL *outBlank)
 		CGRect f = [s frame];
 		if (f.size.width <= 0 || f.size.height <= 0) continue;
 		band = CGRectIsNull(band) ? f : CGRectUnion(band, f);
-		if (CGRectContainsPoint(f, pCv)) inAnyCapsule = YES;
+		if (CGRectContainsPoint(f, pInCv)) inAnyCapsule = YES;
 		CGRect wf = [s convertRect:[s bounds] toView:win];
 		CGFloat d = fabs(CGRectGetMidX(wf) - winW / 2.0);
 		if (d < winW * 0.15 && d < bestDelta) { bestDelta = d; centerRect = f; }
 	}
-
 	if (CGRectIsNull(band) || CGRectIsNull(centerRect)) return NO;
 
-	// 当前页胶囊内部：放行（点它进编辑，是正常操作）
-	if (CGRectContainsPoint(centerRect, pCv)) return NO;
+	CGRect zone = CGRectInset(band, 0, -kPadY);
+	if (!CGRectContainsPoint(zone, pInCv)) return NO;
 
-	// 只在胶囊那一行的高度范围内才拦，避免影响网页区域的点击
-	if (pCv.y < CGRectGetMinY(band) - 2.0 || pCv.y > CGRectGetMaxY(band) + 2.0) return NO;
+	// 当前页胶囊内部：放行（点它进编辑，是正常操作）
+	if (CGRectContainsPoint(centerRect, pInCv)) return NO;
 
 	if (outBlank) *outBlank = !inAnyCapsule;
+	if (outAbove) *outAbove = (pInCv.y < CGRectGetMinY(band));
 	return YES;
 }
 
-// ② 单击：挂在胶囊容器上的 UITapGestureRecognizer，识别到 Ended 时改置 Failed，切页 action 不执行。
-//    0.13.9 真机日志实证这条链路有效（state=3 -> Failed，8/8 命中）。
-static void SPEHTapStateHook(id self, SEL _cmd, NSInteger state)
+// 吞触摸用的遮挡视图。
+//
+// 它只作为 hitTest 的返回值出现：自身 hitTest 返回 nil，所以正常 hit-test 永远轮不到它
+// （只能被我们显式返回）。它挂在 window 上、不是胶囊容器的后代 ⇒ 容器上的 UITap/UIPan
+// 都收不到这次触摸 ⇒ 不切页；同时也挡住了穿透到下层 WKWebView 的误触网页链接。
+@interface SPEHTouchShield : UIView
+@end
+
+@implementation SPEHTouchShield
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event { return nil; }
+@end
+
+static UIView *gTouchShield = nil;
+
+static UIView *SPEHShieldForWindow(UIWindow *win)
 {
-	if ((state == 1 || state == 3) && gCapsuleCVClass) {
-		@try {
-			UIGestureRecognizer *gr = (UIGestureRecognizer *)self;
-			UIView *host = [gr view];
-			// 顺序很重要：先做两次 isKindOfClass（纳秒级），只有确实是胶囊体系才去读偏好
-			if ([gr isKindOfClass:[UITapGestureRecognizer class]] && SPEHIsCapsuleView(host) &&
-				SPEHURLBarSwipeKillEnabled()) {
-				CGPoint p = [gr locationInView:host];
-				BOOL blank = NO;
-				if (SPEHTapShouldBlock(host, p, &blank)) {
-#ifndef SPEH_NO_LOG
-					static int n = 0;
-					if (n < 12) {
-						n++;
-						SPEHLog(@"[urlswipe] ② 单击拦截 x=%.0f y=%.0f 空白缝=%d host=%@ state=%ld -> Failed",
-								p.x, p.y, blank ? 1 : 0,
-								NSStringFromClass(object_getClass(host)), (long)state);
-					}
-#endif
-					state = 5;   // UIGestureRecognizerStateFailed
-				}
-			}
-		} @catch (NSException *e) { }
+	if (gTouchShield && gTouchShield.superview != win) {
+		[gTouchShield removeFromSuperview];
+		gTouchShield = nil;
 	}
-	if (gOrigTapSetState) ((void (*)(id, SEL, NSInteger))gOrigTapSetState)(self, _cmd, state);
+	if (!gTouchShield) {
+		SPEHTouchShield *sh = [[SPEHTouchShield alloc] initWithFrame:[win bounds]];
+		sh.backgroundColor = [UIColor clearColor];
+		sh.userInteractionEnabled = YES;
+		sh.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+		[win insertSubview:sh atIndex:0];   // 最底层：正常 hit-test 不会先命中它
+		gTouchShield = sh;
+	}
+	return gTouchShield;
+}
+
+// ② 单击（0.14.3 起实例级，不再 hook 全局 UITapGestureRecognizer）。
+//
+// 挂在 SFCapsuleCollectionView 自己的 hitTest:withEvent: 上：命中拦截区域就返回遮挡视图。
+// 返回的视图不是容器的后代 ⇒ 容器上那颗 UITapGestureRecognizer 的 _shouldReceiveTouch:
+// 直接判否 ⇒ 手势不识别 ⇒ 切页 action 不执行。只 hook 这一个私有类，全机其它 tap 手势
+// 完全不受影响（0.14.2 那版是 hook 全局 UIGestureRecognizer，每次触摸都进钩子）。
+static IMP gOrigCapCVHitTest = NULL;
+
+static UIView *SPECapCVHitTestHook(UIView *self, SEL _cmd, CGPoint point, UIEvent *event)
+{
+	UIView *hit = nil;
+	if (gOrigCapCVHitTest) {
+		hit = ((UIView *(*)(id, SEL, CGPoint, UIEvent *))gOrigCapCVHitTest)(self, _cmd, point, event);
+	}
+	if (!hit || !gCapsuleCVClass) return hit;
+
+	@try {
+		// 先做区域判定（纯几何、纳秒级），命中才去读偏好（CFPreferences 跨进程查表）
+		BOOL blank = NO, above = NO;
+		if (!SPEHBlockZone(self, point, &blank, &above)) return hit;
+		if (!SPEHURLBarSwipeKillEnabled()) return hit;
+
+		UIWindow *win = [self window];
+		if (!win) return hit;
+#ifndef SPEH_NO_LOG
+		static int n = 0;
+		if (n < 12) {
+			n++;
+			SPEHLog(@"[urlswipe] ② 触摸拦截 x=%.0f y=%.0f 空白缝=%d 上方=%d -> 吞触摸（不进容器手势）",
+					point.x, point.y, blank ? 1 : 0, above ? 1 : 0);
+		}
+#endif
+		return SPEHShieldForWindow(win);
+	} @catch (NSException *e) { }
+	return hit;
 }
 
 // ① 滑动：同一个容器上的 UIPanGestureRecognizer。
@@ -1577,6 +1629,36 @@ static void SPEHPanStateHook(id self, SEL _cmd, NSInteger state)
 	if (gOrigPanSetState) ((void (*)(id, SEL, NSInteger))gOrigPanSetState)(self, _cmd, state);
 }
 
+// 容器类的 hitTest:withEvent: 只有在 SafariFramework 加载后才拿得到，
+// 而本 tweak 的 ctor 早于它，所以这里做「拿到类才打补丁 + 短轮询」：
+// 每次只做一次 NSClassFromString，命中即停，最多 10 秒。
+static BOOL gCapCVHitTestPatched = NO;
+
+static void SPEHInstallCapCVHitTestHook(void)
+{
+	if (gCapCVHitTestPatched) return;
+	if (!gCapsuleCVClass) gCapsuleCVClass = NSClassFromString(@"SFCapsuleCollectionView");
+	if (!gCapsuleViewClass) gCapsuleViewClass = NSClassFromString(@"SFCapsuleView");
+	if (!gCapsuleCVClass) return;
+	SPEHPatchInstanceMethod(gCapsuleCVClass, NSSelectorFromString(@"hitTest:withEvent:"),
+		(IMP)SPECapCVHitTestHook, &gOrigCapCVHitTest);
+	if (gOrigCapCVHitTest) {
+		gCapCVHitTestPatched = YES;
+		SPEHLog(@"[urlswipe] ② 容器 hitTest hook 已装（capCV=%@ capView=%@）",
+				NSStringFromClass(gCapsuleCVClass),
+				gCapsuleViewClass ? NSStringFromClass(gCapsuleViewClass) : @"nil");
+	}
+}
+
+static void SPEHRetryCapCVHitTestHook(int tries)
+{
+	if (gCapCVHitTestPatched || tries <= 0) return;
+	SPEHInstallCapCVHitTestHook();
+	if (gCapCVHitTestPatched) return;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+		dispatch_get_main_queue(), ^{ SPEHRetryCapCVHitTestHook(tries - 1); });
+}
+
 static void SPEHInstallURLBarSwipeHooks(void)
 {
 	if (!SPEHURLBarSwipeKillEnabled()) { SPEHLog(@"[urlswipe] disabled by prefs"); return; }
@@ -1584,17 +1666,20 @@ static void SPEHInstallURLBarSwipeHooks(void)
 	gCapsuleCVClass   = NSClassFromString(@"SFCapsuleCollectionView");
 	gCapsuleViewClass = NSClassFromString(@"SFCapsuleView");
 
-	// 全部拦截只挂在两条手势的状态机上（0.14.0 日志实证：这一步是唯一有效链路，其余层零命中已删）
-	//   单击 = UITapGestureRecognizer setState:
-	//   滑动 = UIPanGestureRecognizer setState:
-	SPEHPatchInstanceMethod([UITapGestureRecognizer class], NSSelectorFromString(@"setState:"),
-		(IMP)SPEHTapStateHook, &gOrigTapSetState);
+	// ① 单击（0.14.3 起）：只 hook SFCapsuleCollectionView 自己的 hitTest:withEvent:，
+	//    不再 hook 全局 UITapGestureRecognizer —— 全机其它 tap 手势彻底不受影响。
+	//    类可能尚未加载（SafariFramework 晚于本 tweak），所以带 10 秒短轮询补齐。
+	SPEHInstallCapCVHitTestHook();
+	if (!gCapCVHitTestPatched) SPEHRetryCapCVHitTestHook(40);
+
+	// ② 滑动：UIPanGestureRecognizer 的状态机是唯一能按方向判定的入口（Safari 已占用其 delegate，
+	//    实例级无法替代），这条保留为全局 hook，但首帧就做廉价类判定，非胶囊体系直接返回。
 	SPEHPatchInstanceMethod([UIPanGestureRecognizer class], NSSelectorFromString(@"setState:"),
 		(IMP)SPEHPanStateHook, &gOrigPanSetState);
 
-	SPEHLog(@"[urlswipe] 0.14.1 安装 capCV=%d capView=%d tapSetState=%s panSetState=%s",
+	SPEHLog(@"[urlswipe] 0.14.3 安装 capCV=%d capView=%d capCVHitTest=%s panSetState=%s",
 			gCapsuleCVClass ? 1 : 0, gCapsuleViewClass ? 1 : 0,
-			gOrigTapSetState ? "ok" : "FAIL", gOrigPanSetState ? "ok" : "FAIL");
+			gOrigCapCVHitTest ? "ok" : "延迟等类加载", gOrigPanSetState ? "ok" : "FAIL");
 }
 
 // MARK: - 入口
