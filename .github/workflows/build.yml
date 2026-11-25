@@ -117,7 +117,12 @@ jobs:
             'didFinishNavigation' \
             'killURLBarSwipe' \
             'didMoveToWindow' \
-            'Documents' ; do
+            'Documents' \
+            'ChatSwipe+KbDock' \
+            'ChatSwipe.log' \
+            'UIKeyboardDockView' \
+            'kb_selectAll' \
+            'canPerformAction:withSender:' ; do
             if ! echo "$STRINGS" | grep -qF "$NEEDLE"; then
               echo "::error::required string missing from dylib: $NEEDLE"
               exit 1
@@ -139,22 +144,6 @@ jobs:
           sys.exit(0 if ok else 1)
           PY
 
-      - name: Verify ChatSwipe dylib
-        run: |
-          CS=$(find .theos -name 'ChatSwipe.dylib' -type f -not -path '*.dSYM*' | head -1)
-          if [ -z "$CS" ] || [ ! -f "$CS" ]; then
-            echo "::error::ChatSwipe.dylib not found (双 tweak 目标未生效)"
-            exit 1
-          fi
-          echo "== $CS =="
-          CS_STRINGS=$(strings -a "$CS")
-          for NEEDLE in 'ChatSwipe+KbDock 0.15.0 已加载' 'ChatSwipe.log' 'UIKeyboardDockView'                         'chatswipe_handlePan:' 'canPerformAction:withSender:' 'Documents' ; do
-            if ! echo "$CS_STRINGS" | grep -qF "$NEEDLE"; then
-              echo "::error::ChatSwipe 必需字符串缺失: $NEEDLE"
-              exit 1
-            fi
-          done
-          echo "OK: ChatSwipe 滑动 + 菜单精简 + KbDock 键盘条 三部分均在"
           echo "OK: chinese alert keywords embedded"
           echo "== deb =="
           ls -l packages/

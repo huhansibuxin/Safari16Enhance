@@ -1671,11 +1671,454 @@ static void SPEHInstallURLBarSwipeHooks(void)
 			gOrigCapCVHitTest ? "ok" : "延迟等类加载", gOrigPanSetState ? "ok" : "FAIL");
 }
 
+// MARK: - ChatSwipe + KbDock（0.15.0 并入，与本插件同 dylib、同二进制）
+//
+// 需求：一个 dylib 里带两套功能，不是两个 dylib。
+//   · 目标是 com.apple.mobilesafari  → 只装上面 Safari 增强那一整套（行为与 0.14.3 完全一致）
+//   · 目标是 微信/QQ/Telegram/抖音   → 只装本模块（输入框左滑清空、右滑粘贴、菜单精简、键盘三按钮）
+// 分流在 %ctor 里按 bundle id 判定，两套 hook 不会交叉装进对方进程。
+//
+// 功能与阈值来自 chatswipe 仓库「键盘注入」分支 v1.7.0（合并版），逻辑未改写；
+// 仅把 Logos 写法换成显式 MSHookMessageEx 安装，便于「按进程条件安装」。
+
+static BOOL     gCSEnabled           = YES;   // 总开关
+static BOOL     gCSClearEnabled      = YES;   // 左滑清空
+static BOOL     gCSPasteEnabled      = YES;   // 右滑粘贴
+static CGFloat  gCSThreshold         = 45.0;  // 触发所需最小水平位移(pt)
+static BOOL     gCSMenuFilterEnabled = YES;   // 编辑菜单精简（只留 全选/复制/粘贴）
+
+// ---- 日志：写目标 App 自身沙盒 Documents/ChatSwipe.log ----
+// （不是 TMPDIR、不是 /var/tmp —— 注入 App 必须写自己的沙盒，否则静默失败）
+#ifndef SPEH_NO_LOG
+static const char *CSLogPath(void)
+{
+	static char path[512];
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		const char *home = getenv("HOME");
+		if (!home || !home[0]) { path[0] = '\0'; return; }
+		snprintf(path, sizeof(path), "%s/Documents/ChatSwipe.log", home);
+	});
+	return path;
+}
+
+static void CSLog(NSString *fmt, ...)
+{
+	const char *p = CSLogPath();
+	if (!p || !p[0]) return;
+
+	// 超 1MB 轮转一次，长期使用不撑大沙盒
+	struct stat st;
+	if (stat(p, &st) == 0 && st.st_size > 1024 * 1024) {
+		NSString *cur = [NSString stringWithUTF8String:p];
+		NSString *old = [cur stringByAppendingString:@".1"];
+		[[NSFileManager defaultManager] removeItemAtPath:old error:nil];
+		[[NSFileManager defaultManager] moveItemAtPath:cur toPath:old error:nil];
+	}
+
+	va_list ap;
+	va_start(ap, fmt);
+	NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+	va_end(ap);
+
+	time_t t = time(NULL);
+	struct tm tmv;
+	localtime_r(&t, &tmv);
+	char ts[32];
+	strftime(ts, sizeof(ts), "%m-%d %H:%M:%S", &tmv);
+
+	FILE *f = fopen(p, "a");
+	if (f) {
+		fprintf(f, "[%s] %s\n", ts, msg.UTF8String ?: "");
+		fclose(f);
+	}
+}
+#else
+#define CSLog(...) do {} while (0)
+#endif
+
+// ---- 编辑菜单三件套 ----
+static BOOL CSAllowedAction(SEL action)
+{
+	return action == @selector(selectAll:) || action == @selector(copy:) || action == @selector(paste:);
+}
+
+static void CSLoadConfig(void)
+{
+	@try {
+		// 先读目标 App 自己的沙盒 Documents（沙盒内唯一可读可写处），
+		// 再退回全局路径兼容原生 TrollFools 用法；两处都没有则用默认值（全开）。
+		NSMutableArray *cands = [NSMutableArray array];
+		const char *home = getenv("HOME");
+		if (home && home[0]) {
+			[cands addObject:[NSString stringWithFormat:@"%s/Documents/chatswipe.plist", home]];
+		}
+		[cands addObject:@"/var/mobile/Documents/chatswipe.plist"];
+		NSDictionary *cfg = nil;
+		for (NSString *p in cands) {
+			cfg = [NSDictionary dictionaryWithContentsOfFile:p];
+			if (cfg) { CSLog(@"配置来源 %@", p); break; }
+		}
+		if (!cfg) return;
+		if (cfg[@"Enabled"])           gCSEnabled           = [cfg[@"Enabled"] boolValue];
+		if (cfg[@"ClearEnabled"])      gCSClearEnabled      = [cfg[@"ClearEnabled"] boolValue];
+		if (cfg[@"PasteEnabled"])      gCSPasteEnabled      = [cfg[@"PasteEnabled"] boolValue];
+		if (cfg[@"Threshold"])         gCSThreshold         = [cfg[@"Threshold"] floatValue];
+		if (cfg[@"MenuFilterEnabled"]) gCSMenuFilterEnabled = [cfg[@"MenuFilterEnabled"] boolValue];
+		CSLog(@"config Enabled=%d clear=%d paste=%d menu=%d th=%.0f",
+			  gCSEnabled, gCSClearEnabled, gCSPasteEnabled, gCSMenuFilterEnabled, gCSThreshold);
+	} @catch (NSException *e) { }
+}
+
+// ---- 共享 pan delegate（同时识别，不抢输入框原有的手势） ----
+@interface CSPanDelegate : NSObject <UIGestureRecognizerDelegate>
+@end
+@implementation CSPanDelegate
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
+shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other
+{
+	return YES;
+}
+@end
+static CSPanDelegate *gCSPanDelegate = nil;
+
+// pan 的 target 用独立对象持弱引用：UIGestureRecognizer 不 retain target，
+// 所以 target 必须由输入框自己（associated object）持有，否则会被提前释放。
+// 不用 category —— dylib 里 category 有被 dead_strip 丢掉的风险。
+@interface CSPanTarget : NSObject
+@property (nonatomic, weak) UIView *host;
+- (void)handlePan:(UIPanGestureRecognizer *)pan;
+@end
+
+static const void *kCSPanTargetKey = &kCSPanTargetKey;
+
+static void CSClear(UIView *view);
+static void CSPaste(UIView *view);
+
+// ---- 给输入框挂 pan（每个输入框只挂一次） ----
+static void CSAttach(UIView *view)
+{
+	if (!gCSEnabled || !view) return;
+	if ([view isKindOfClass:[UITextView class]]) {
+		if (!((UITextView *)view).isEditable) return;
+	} else if ([view isKindOfClass:[UITextField class]]) {
+		UITextField *tf = (UITextField *)view;
+		if (tf.secureTextEntry || !tf.enabled) return;
+	} else {
+		return;
+	}
+	static const void *kAttached = &kAttached;
+	if (objc_getAssociatedObject(view, kAttached)) return;
+	objc_setAssociatedObject(view, kAttached, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+	CSPanTarget *target = [CSPanTarget new];
+	target.host = view;
+	UIPanGestureRecognizer *pan =
+		[[UIPanGestureRecognizer alloc] initWithTarget:target action:@selector(handlePan:)];
+	pan.cancelsTouchesInView = NO;
+	pan.delaysTouchesBegan  = NO;
+	if (!gCSPanDelegate) gCSPanDelegate = [[CSPanDelegate alloc] init];
+	pan.delegate = gCSPanDelegate;
+	// target 由输入框持有（手势不 retain target，否则 target 立刻释放、手势失效）
+	objc_setAssociatedObject(view, kCSPanTargetKey, target, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+	[view addGestureRecognizer:pan];
+}
+
+@implementation CSPanTarget
+- (void)handlePan:(UIPanGestureRecognizer *)pan
+{
+	if (pan.state != UIGestureRecognizerStateEnded) return;
+	UIView *view = self.host ?: pan.view;
+	if (!view) return;
+
+	CGPoint t = [pan translationInView:view];
+	if (fabs(t.x) <= fabs(t.y)) return;          // 纵向占优：不动（避免和上下滑动冲突）
+	if (fabs(t.x) < gCSThreshold) return;        // 位移不足：不动
+	if (t.x < 0) {
+		if (!gCSClearEnabled) return;
+		CSLog(@"左滑清空 dx=%.0f", t.x);
+		CSClear(view);
+	} else {
+		if (!gCSPasteEnabled) return;
+		CSLog(@"右滑粘贴 dx=%.0f", t.x);
+		CSPaste(view);
+	}
+}
+@end
+
+static void CSClear(UIView *view)
+{
+	@try {
+		if ([view isKindOfClass:[UITextView class]]) {
+			UITextView *tv = (UITextView *)view;
+			UITextRange *all = [tv textRangeFromPosition:tv.beginningOfDocument toPosition:tv.endOfDocument];
+			if (all) [tv replaceRange:all withText:@""];
+		} else if ([view isKindOfClass:[UITextField class]]) {
+			UITextField *tf = (UITextField *)view;
+			UITextRange *all = [tf textRangeFromPosition:tf.beginningOfDocument toPosition:tf.endOfDocument];
+			if (all) [tf replaceRange:all withText:@""];
+			[tf sendActionsForControlEvents:UIControlEventEditingChanged];
+		}
+	} @catch (NSException *e) { }
+}
+
+static void CSPaste(UIView *view)
+{
+	@try {
+		NSString *pb = [UIPasteboard generalPasteboard].string;
+		if (!pb || pb.length == 0) return;
+		if ([view isKindOfClass:[UITextView class]]) {
+			UITextView *tv = (UITextView *)view;
+			UITextRange *r = tv.selectedTextRange
+				?: [tv textRangeFromPosition:tv.endOfDocument toPosition:tv.endOfDocument];
+			if (r) [tv replaceRange:r withText:pb];
+		} else if ([view isKindOfClass:[UITextField class]]) {
+			UITextField *tf = (UITextField *)view;
+			UITextRange *r = tf.selectedTextRange
+				?: [tf textRangeFromPosition:tf.endOfDocument toPosition:tf.endOfDocument];
+			if (r) [tf replaceRange:r withText:pb];
+			[tf sendActionsForControlEvents:UIControlEventEditingChanged];
+		}
+	} @catch (NSException *e) { }
+}
+
+// ---- 输入框 hook（becomeFirstResponder / didMoveToWindow / canPerformAction:withSender:） ----
+static IMP gOSTVBecome = NULL;
+static IMP gOSTFBecome = NULL;
+static IMP gOSTVDidMove = NULL;
+static IMP gOSTFDidMove = NULL;
+static IMP gOSTVPerform = NULL;
+static IMP gOSTFPerform = NULL;
+
+static BOOL CSTVBecome(id self, SEL _cmd)
+{
+	BOOL r = gOSTVBecome ? ((BOOL (*)(id, SEL))gOSTVBecome)(self, _cmd) : NO;
+	if (r) CSAttach((UIView *)self);
+	return r;
+}
+
+static BOOL CSTFBecome(id self, SEL _cmd)
+{
+	BOOL r = gOSTFBecome ? ((BOOL (*)(id, SEL))gOSTFBecome)(self, _cmd) : NO;
+	if (r) CSAttach((UIView *)self);
+	return r;
+}
+
+static void CSTVDidMoveToWindow(id self, SEL _cmd)
+{
+	if (gOSTVDidMove) ((void (*)(id, SEL))gOSTVDidMove)(self, _cmd);
+	if ([(UIView *)self window]) CSAttach((UIView *)self);
+}
+
+static void CSTFDidMoveToWindow(id self, SEL _cmd)
+{
+	if (gOSTFDidMove) ((void (*)(id, SEL))gOSTFDidMove)(self, _cmd);
+	if ([(UIView *)self window]) CSAttach((UIView *)self);
+}
+
+static BOOL CSTVPerform(id self, SEL _cmd, SEL action, id sender)
+{
+	if (!gCSMenuFilterEnabled)
+		return gOSTVPerform ? ((BOOL (*)(id, SEL, SEL, id))gOSTVPerform)(self, _cmd, action, sender) : YES;
+	if (CSAllowedAction(action)) return YES;
+	return NO;
+}
+
+static BOOL CSTFPerform(id self, SEL _cmd, SEL action, id sender)
+{
+	BOOL (*orig)(id, SEL, SEL, id) = (BOOL (*)(id, SEL, SEL, id))gOSTFPerform;
+	if (!gCSMenuFilterEnabled) return orig ? orig(self, _cmd, action, sender) : YES;
+	// 密码框不强制复制/全选（防泄密），但粘贴仍允许
+	if ((action == @selector(copy:) || action == @selector(selectAll:)) &&
+		((UITextField *)self).secureTextEntry) {
+		return orig ? orig(self, _cmd, action, sender) : YES;
+	}
+	if (CSAllowedAction(action)) return YES;
+	return NO;
+}
+
+// ---- KbDock：键盘底部三按钮（全选并自动复制 / 复制 / 粘贴） ----
+// 图标：三个都只用 2 个点，靠摆放方向区分（全选 2 / 复制 0 / 粘贴 1），渲染一次后缓存。
+static CGFloat const kCSDotD   = 1.5;
+static CGFloat const kCSDotGap = 5.5;
+
+static UIImage *CSDotsIcon(NSInteger kind)
+{
+	static UIImage *cache[3] = {nil, nil, nil};
+	if (kind >= 0 && kind < 3 && cache[kind]) return cache[kind];
+
+	const CGFloat side = 26.0;
+	UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
+	UIGraphicsImageRenderer *renderer =
+		[[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(side, side) format:fmt];
+
+	UIImage *img = [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+		[[UIColor blackColor] setFill];
+		CGFloat c = side / 2.0;
+		CGFloat h = kCSDotGap / 2.0;
+		CGPoint p1, p2;
+		if (kind == 0)      { p1 = CGPointMake(c, c - h);     p2 = CGPointMake(c, c + h); }
+		else if (kind == 1) { p1 = CGPointMake(c - h, c - h); p2 = CGPointMake(c + h, c + h); }
+		else                { p1 = CGPointMake(c + h, c - h); p2 = CGPointMake(c - h, c + h); }
+		[[UIBezierPath bezierPathWithOvalInRect:
+			CGRectMake(p1.x - kCSDotD / 2.0, p1.y - kCSDotD / 2.0, kCSDotD, kCSDotD)] fill];
+		[[UIBezierPath bezierPathWithOvalInRect:
+			CGRectMake(p2.x - kCSDotD / 2.0, p2.y - kCSDotD / 2.0, kCSDotD, kCSDotD)] fill];
+	}];
+
+	UIImage *out = [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+	if (kind >= 0 && kind < 3) cache[kind] = out;
+	return out;
+}
+
+static UIButton *CSMakeButton(UIImage *icon, id target, SEL action)
+{
+	UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+	[b setImage:icon forState:UIControlStateNormal];
+	b.tintColor = [UIColor labelColor];
+	b.translatesAutoresizingMaskIntoConstraints = NO;
+	[b.widthAnchor constraintEqualToConstant:44].active = YES;   // 热区 44x44
+	[b.heightAnchor constraintEqualToConstant:44].active = YES;
+	[b addTarget:target action:action forControlEvents:UIControlEventTouchUpInside];
+	return b;
+}
+
+static void CSKbHaptic(void)
+{
+	// 复用同一个发生器，避免每次点击新建 + prepare
+	static UIImpactFeedbackGenerator *g = nil;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		g = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+		[g prepare];
+	});
+	[g impactOccurred];
+}
+
+static void CSKbSelectAll(id self, SEL _cmd)
+{
+	CSKbHaptic();
+	CSLog(@"键盘条 全选并复制");
+	UIApplication *app = [UIApplication sharedApplication];
+	[app sendAction:@selector(selectAll:) to:nil from:nil forEvent:nil];
+	// 全选后延后一个 runloop 复制，确保 selection 已提交
+	dispatch_async(dispatch_get_main_queue(), ^{
+		[app sendAction:@selector(copy:) to:nil from:nil forEvent:nil];
+	});
+}
+
+static void CSKbCopy(id self, SEL _cmd)
+{
+	CSKbHaptic();
+	CSLog(@"键盘条 复制");
+	[[UIApplication sharedApplication] sendAction:@selector(copy:) to:nil from:nil forEvent:nil];
+}
+
+static void CSKbPaste(id self, SEL _cmd)
+{
+	CSKbHaptic();
+	CSLog(@"键盘条 粘贴");
+	[[UIApplication sharedApplication] sendAction:@selector(paste:) to:nil from:nil forEvent:nil];
+}
+
+static IMP gOSKbLayout = NULL;
+
+static void CSKbLayout(UIView *self, SEL _cmd)
+{
+	if (gOSKbLayout) ((void (*)(id, SEL))gOSKbLayout)(self, _cmd);
+
+	if ([self viewWithTag:9999]) return;   // 只装配一次
+
+	UIStackView *stackView = [[UIStackView alloc] initWithFrame:CGRectZero];
+	stackView.tag = 9999;
+	stackView.axis = UILayoutConstraintAxisHorizontal;
+	stackView.distribution = UIStackViewDistributionEqualSpacing;
+	stackView.alignment = UIStackViewAlignmentCenter;
+	stackView.translatesAutoresizingMaskIntoConstraints = NO;
+
+	[stackView addArrangedSubview:CSMakeButton(CSDotsIcon(2), self, @selector(kb_selectAll))];
+	[stackView addArrangedSubview:CSMakeButton(CSDotsIcon(0), self, @selector(kb_copy))];
+	[stackView addArrangedSubview:CSMakeButton(CSDotsIcon(1), self, @selector(kb_paste))];
+
+	[self addSubview:stackView];
+	[NSLayoutConstraint activateConstraints:@[
+		[stackView.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+		[stackView.bottomAnchor   constraintEqualToAnchor:self.bottomAnchor constant:-23],
+		[stackView.widthAnchor    constraintEqualToAnchor:self.widthAnchor multiplier:0.55],
+	]];
+	CSLog(@"KbDock 键盘条已装配");
+}
+
+// ---- 本模块注入目标 ----
+static BOOL SPEHIsChatSwipeHost(void)
+{
+	NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+	if (!bid) return NO;
+	static NSString *const hosts[] = {
+		@"com.tencent.xin",        // 微信
+		@"com.tencent.mqq",        // QQ
+		@"ph.telegra.Telegraph",   // Telegram
+		@"com.ss.iphone.ugc.Aweme" // 抖音
+	};
+	for (size_t i = 0; i < sizeof(hosts) / sizeof(hosts[0]); i++) {
+		if ([bid isEqualToString:hosts[i]]) return YES;
+	}
+	return NO;
+}
+
+static void SPEHInstallChatSwipeModule(void)
+{
+	CSLoadConfig();
+	CSLog(@"ChatSwipe+KbDock " SPEH_VERSION " 已加载 pid=%d bundle=%@",
+		  getpid(), [[NSBundle mainBundle] bundleIdentifier]);
+
+	// 输入框：becomeFirstResponder（首次聚焦）+ didMoveToWindow（已存在实例）
+	SPEHPatchInstanceMethod([UITextView class], NSSelectorFromString(@"becomeFirstResponder"),
+		(IMP)CSTVBecome, &gOSTVBecome);
+	SPEHPatchInstanceMethod([UITextField class], NSSelectorFromString(@"becomeFirstResponder"),
+		(IMP)CSTFBecome, &gOSTFBecome);
+	SPEHPatchInstanceMethod([UITextView class], NSSelectorFromString(@"didMoveToWindow"),
+		(IMP)CSTVDidMoveToWindow, &gOSTVDidMove);
+	SPEHPatchInstanceMethod([UITextField class], NSSelectorFromString(@"didMoveToWindow"),
+		(IMP)CSTFDidMoveToWindow, &gOSTFDidMove);
+	SPEHPatchInstanceMethod([UITextView class], NSSelectorFromString(@"canPerformAction:withSender:"),
+		(IMP)CSTVPerform, &gOSTVPerform);
+	SPEHPatchInstanceMethod([UITextField class], NSSelectorFromString(@"canPerformAction:withSender:"),
+		(IMP)CSTFPerform, &gOSTFPerform);
+
+	// 键盘底栏：UIKeyboardDockView（UIKit 私有类，进程启动即可用）
+	Class dock = NSClassFromString(@"UIKeyboardDockView");
+	if (dock) {
+		SPEHPatchInstanceMethod(dock, NSSelectorFromString(@"layoutSubviews"),
+			(IMP)CSKbLayout, &gOSKbLayout);
+		class_addMethod(dock, NSSelectorFromString(@"kb_selectAll"), (IMP)CSKbSelectAll, "v@:");
+		class_addMethod(dock, NSSelectorFromString(@"kb_copy"),      (IMP)CSKbCopy,      "v@:");
+		class_addMethod(dock, NSSelectorFromString(@"kb_paste"),     (IMP)CSKbPaste,     "v@:");
+		CSLog(@"KbDock hook=ok");
+	} else {
+		CSLog(@"KbDock hook=FAIL（UIKeyboardDockView 不存在）");
+	}
+
+	CSLog(@"ChatSwipe hooks: tvBecome=%s tfBecome=%s tvMenu=%s tfMenu=%s kbDock=%s",
+		  gOSTVBecome ? "ok" : "FAIL", gOSTFBecome ? "ok" : "FAIL",
+		  gOSTVPerform ? "ok" : "FAIL", gOSTFPerform ? "ok" : "FAIL",
+		  gOSKbLayout ? "ok" : "FAIL");
+}
+
 // MARK: - 入口
 
 %ctor
 {
 	@autoreleasepool {
+		// 单 dylib 双功能，按注入目标分流，两套 hook 绝不交叉安装：
+		//   com.apple.mobilesafari  → Safari 增强（原有全部拦截）
+		//   微信 / QQ / Telegram / 抖音 → ChatSwipe + KbDock
+		NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+		if (![bid isEqualToString:@"com.apple.mobilesafari"]) {
+			if (SPEHIsChatSwipeHost()) SPEHInstallChatSwipeModule();
+			return;
+		}
+
 		if (!SPEHEnabled()) return;
 
 		SPEHLog(@"==============================================");
