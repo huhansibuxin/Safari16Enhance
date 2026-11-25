@@ -25,6 +25,9 @@
 #import <substrate.h>
 #import <unistd.h>
 #import <math.h>
+#import <sys/stat.h>
+#import <time.h>
+#import <stdio.h>
 
 #define SPEH_VERSION "0.15.0"
 
