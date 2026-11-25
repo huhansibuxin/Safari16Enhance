@@ -1,4 +1,4 @@
-// Safari16Enhance 0.14.3 - iOS 16 Safari 增强
+// Safari16Enhance 0.15.0 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -26,7 +26,7 @@
 #import <unistd.h>
 #import <math.h>
 
-#define SPEH_VERSION "0.14.3"
+#define SPEH_VERSION "0.15.0"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"

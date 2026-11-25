@@ -138,6 +138,23 @@ jobs:
                   ok = False
           sys.exit(0 if ok else 1)
           PY
+
+      - name: Verify ChatSwipe dylib
+        run: |
+          CS=$(find .theos -name 'ChatSwipe.dylib' -type f -not -path '*.dSYM*' | head -1)
+          if [ -z "$CS" ] || [ ! -f "$CS" ]; then
+            echo "::error::ChatSwipe.dylib not found (双 tweak 目标未生效)"
+            exit 1
+          fi
+          echo "== $CS =="
+          CS_STRINGS=$(strings -a "$CS")
+          for NEEDLE in 'ChatSwipe+KbDock 0.15.0 已加载' 'ChatSwipe.log' 'UIKeyboardDockView'                         'chatswipe_handlePan:' 'canPerformAction:withSender:' 'Documents' ; do
+            if ! echo "$CS_STRINGS" | grep -qF "$NEEDLE"; then
+              echo "::error::ChatSwipe 必需字符串缺失: $NEEDLE"
+              exit 1
+            fi
+          done
+          echo "OK: ChatSwipe 滑动 + 菜单精简 + KbDock 键盘条 三部分均在"
           echo "OK: chinese alert keywords embedded"
           echo "== deb =="
           ls -l packages/
@@ -145,14 +162,14 @@ jobs:
       - name: Save and upload diagnostic deb
         run: |
           mkdir -p artifacts
-          cp packages/*.deb artifacts/Safari16Enhance-0.14.3-withlog.deb
+          cp packages/*.deb artifacts/Safari16Enhance-0.15.0-withlog.deb
           ls -l artifacts/
 
       - name: Upload diagnostic deb
         uses: actions/upload-artifact@v4
         with:
           name: Safari16Enhance-roothide-withlog
-          path: artifacts/Safari16Enhance-0.14.3-withlog.deb
+          path: artifacts/Safari16Enhance-0.15.0-withlog.deb
           if-no-files-found: error
 
       - name: Build no-log variant
@@ -160,10 +177,10 @@ jobs:
           rm -f packages/*.deb
           make clean
           cp control control.bak
-          sed -i '' 's/^Version: 0.14.3$/Version: 0.14.3-nolog/' control
+          sed -i '' 's/^Version: 0.15.0$/Version: 0.15.0-nolog/' control
           SPEH_NO_LOG=1 make package
           cp control.bak control
-          cp packages/*.deb artifacts/Safari16Enhance-0.14.3-nolog.deb
+          cp packages/*.deb artifacts/Safari16Enhance-0.15.0-nolog.deb
           ls -l artifacts/
 
       - name: Verify no-log variant
@@ -193,5 +210,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Safari16Enhance-roothide-nolog
-          path: artifacts/Safari16Enhance-0.14.3-nolog.deb
+          path: artifacts/Safari16Enhance-0.15.0-nolog.deb
           if-no-files-found: error
