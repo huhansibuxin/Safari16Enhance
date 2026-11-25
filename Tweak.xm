@@ -2072,8 +2072,8 @@ static BOOL SPEHIsChatSwipeHost(void)
 static void SPEHInstallChatSwipeModule(void)
 {
 	CSLoadConfig();
-	CSLog(@"ChatSwipe+KbDock " SPEH_VERSION " 已加载 pid=%d bundle=%@",
-		  getpid(), [[NSBundle mainBundle] bundleIdentifier]);
+	CSLog(@"ChatSwipe+KbDock loaded ver=%s pid=%d bundle=%@",
+		  SPEH_VERSION, getpid(), [[NSBundle mainBundle] bundleIdentifier]);
 
 	// 输入框：becomeFirstResponder（首次聚焦）+ didMoveToWindow（已存在实例）
 	SPEHPatchInstanceMethod([UITextView class], NSSelectorFromString(@"becomeFirstResponder"),
