@@ -1,4 +1,4 @@
-// Safari16Enhance 0.15.0 - iOS 16 Safari 增强
+// Safari16Enhance 0.15.1 - iOS 16 Safari 增强
 //
 // 实测结论链（每条都来自真机日志，不是推测）：
 //   阅读器：三个真实方法已确认，白名单精准命中有效
@@ -29,7 +29,7 @@
 #import <time.h>
 #import <stdio.h>
 
-#define SPEH_VERSION "0.15.0"
+#define SPEH_VERSION "0.15.1"
 
 // CFSTR 只接受 C 字符串字面量，故偏好域用 C 字符串宏
 #define SPEH_PREF_DOMAIN_CSTR "com.huhansibuxin.safari16enhance"
@@ -1674,15 +1674,14 @@ static void SPEHInstallURLBarSwipeHooks(void)
 			gOrigCapCVHitTest ? "ok" : "延迟等类加载", gOrigPanSetState ? "ok" : "FAIL");
 }
 
-// MARK: - ChatSwipe + KbDock（0.15.0 并入，与本插件同 dylib、同二进制）
+// MARK: - ChatSwipe + KbDock（0.15.1 并入本插件，跟随 Safari 一起注入）
 //
-// 需求：一个 dylib 里带两套功能，不是两个 dylib。
-//   · 目标是 com.apple.mobilesafari  → 只装上面 Safari 增强那一整套（行为与 0.14.3 完全一致）
-//   · 目标是 微信/QQ/Telegram/抖音   → 只装本模块（输入框左滑清空、右滑粘贴、菜单精简、键盘三按钮）
-// 分流在 %ctor 里按 bundle id 判定，两套 hook 不会交叉装进对方进程。
+// 定位：本插件是「Safari 16 专用」插件，Filter 只列 com.apple.mobilesafari。
+// ChatSwipe 的全部功能（输入框左滑清空 / 右滑粘贴 / 编辑菜单精简 / 键盘三按钮）
+// 作为本插件的一部分，在同一进程（Safari）内一并安装，不再分流到任何其他 App。
 //
 // 功能与阈值来自 chatswipe 仓库「键盘注入」分支 v1.7.0（合并版），逻辑未改写；
-// 仅把 Logos 写法换成显式 MSHookMessageEx 安装，便于「按进程条件安装」。
+// 仅把 Logos 写法换成显式方法替换安装，便于按需装配。
 
 static BOOL     gCSEnabled           = YES;   // 总开关
 static BOOL     gCSClearEnabled      = YES;   // 左滑清空
@@ -2052,23 +2051,7 @@ static void CSKbLayout(UIView *self, SEL _cmd)
 	CSLog(@"KbDock 键盘条已装配");
 }
 
-// ---- 本模块注入目标 ----
-static BOOL SPEHIsChatSwipeHost(void)
-{
-	NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-	if (!bid) return NO;
-	static NSString *const hosts[] = {
-		@"com.tencent.xin",        // 微信
-		@"com.tencent.mqq",        // QQ
-		@"ph.telegra.Telegraph",   // Telegram
-		@"com.ss.iphone.ugc.Aweme" // 抖音
-	};
-	for (size_t i = 0; i < sizeof(hosts) / sizeof(hosts[0]); i++) {
-		if ([bid isEqualToString:hosts[i]]) return YES;
-	}
-	return NO;
-}
-
+// ---- 安装入口（本插件只注入 MobileSafari，ChatSwipe 功能随之一起装进 Safari） ----
 static void SPEHInstallChatSwipeModule(void)
 {
 	CSLoadConfig();
@@ -2113,15 +2096,9 @@ static void SPEHInstallChatSwipeModule(void)
 %ctor
 {
 	@autoreleasepool {
-		// 单 dylib 双功能，按注入目标分流，两套 hook 绝不交叉安装：
-		//   com.apple.mobilesafari  → Safari 增强（原有全部拦截）
-		//   微信 / QQ / Telegram / 抖音 → ChatSwipe + KbDock
-		NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-		if (![bid isEqualToString:@"com.apple.mobilesafari"]) {
-			if (SPEHIsChatSwipeHost()) SPEHInstallChatSwipeModule();
-			return;
-		}
-
+		// 本插件只注入 MobileSafari（Filter 亦只列这一个 bundle）。
+		// ChatSwipe + KbDock 作为本插件的一部分，一并装进 Safari 进程，
+		// 不再分流到任何其他 App —— 这是针对 Safari 的插件，不注入别处。
 		if (!SPEHEnabled()) return;
 
 		SPEHLog(@"==============================================");
@@ -2140,5 +2117,8 @@ static void SPEHInstallChatSwipeModule(void)
 		SPEHInstallOpenInAppHooks();
 		SPEHInstallAppLinkHooks();
 		SPEHInstallURLBarSwipeHooks();
+
+		// 合并进来的 ChatSwipe + KbDock（输入框滑动、菜单精简、键盘三按钮）
+		SPEHInstallChatSwipeModule();
 	}
 }

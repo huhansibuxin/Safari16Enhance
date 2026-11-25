@@ -1,1 +1,1 @@
-{ Filter = { Bundles = ( "com.apple.mobilesafari", "com.tencent.xin", "com.tencent.mqq", "ph.telegra.Telegraph", "com.ss.iphone.ugc.Aweme" ); }; }
+{ Filter = { Bundles = ( "com.apple.mobilesafari" ); }; }
